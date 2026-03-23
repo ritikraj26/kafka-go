@@ -9,12 +9,14 @@ import (
 type response struct {
 	message_size   int32
 	correlation_id int32
+	error_code     int16
 }
 
-func NewResponse(correlationID int32) *response {
+func NewResponse(messageSize int32, correlationID int32, errorCode int16) *response {
 	return &response{
-		message_size:   4,
+		message_size:   messageSize,
 		correlation_id: correlationID,
+		error_code:     errorCode,
 	}
 }
 
@@ -27,6 +29,10 @@ func (r *response) Serialize() ([]byte, error) {
 
 	if err := binary.Write(buf, binary.BigEndian, r.correlation_id); err != nil {
 		return nil, fmt.Errorf("Failed to write correlation_id: %w", err)
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, r.error_code); err != nil {
+		return nil, fmt.Errorf("Failed to write error_code: %w", err)
 	}
 
 	return buf.Bytes(), nil
