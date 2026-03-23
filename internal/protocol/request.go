@@ -17,8 +17,19 @@ func NewRequestHeader() *RequestHeader {
 	return &RequestHeader{}
 }
 
-func (r *RequestHeader) CorrelationID() int32 {
+func (r *RequestHeader) GetCorrelationID() int32 {
 	return r.correlation_id
+}
+
+func (r *RequestHeader) GetMessageSize() int32 {
+	return r.message_size
+}
+
+func (r *RequestHeader) GetErrorCode() int16 {
+	if r.api_version < 0 || r.api_version > 4 {
+		return ErrUnsupportedVersion
+	}
+	return ErrNone
 }
 
 func (r *RequestHeader) ReadFrom(conn net.Conn) error {
