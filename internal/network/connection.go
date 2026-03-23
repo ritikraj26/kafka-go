@@ -18,7 +18,7 @@ func handleConnection(conn net.Conn) {
 	}
 
 	// Prepare the response
-	response := protocol.NewResponse(requestHeader.CorrelationID())
+	response := protocol.NewResponse(requestHeader.GetMessageSize(), requestHeader.GetCorrelationID(), requestHeader.GetErrorCode())
 	serializedResponse, err := response.Serialize()
 	if err != nil {
 		fmt.Println("Error serializing response: ", err)
