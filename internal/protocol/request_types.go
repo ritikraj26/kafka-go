@@ -123,10 +123,79 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	}, nil
 }
 
-// placeholder 
+// ParseDescribeTopicPartitionsRequest parses a DescribeTopicPartitions request
 func ParseDescribeTopicPartitionsRequest(header *RequestHeader) (*DescribeTopicPartitionsRequest, error) {
-	// TODO: implement when DescribeTopicPartitions API is needed
+	decoder := NewDecoder(header.GetBody())
+
+	// DescribeTopicPartitions v0 uses flexible request format (KIP-482).
+	// The body includes flexible request header fields before the API-specific fields.
+
+	// 1. Read cursor field - nullable byte (0x00 = null/no cursor)
+	cursorByte, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cursor: %w", err)
+	}
+	_ = cursorByte // Not used for this stage
+
+	// 2. Read client software identifier - simple length-prefixed string
+	// Note: This uses plain length encoding (not COMPACT_STRING +1 encoding)
+	// Format: [length_byte][string_bytes...]
+	lengthByte, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read client software length: %w", err)
+	}
+
+	// Read the client software name bytes
+	clientBytes := make([]byte, lengthByte)
+	for i := 0; i < int(lengthByte); i++ {
+		b, err := decoder.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read client software byte %d: %w", i, err)
+		}
+		clientBytes[i] = b
+	}
+	_ = clientBytes // Not used for this stage
+
+	// 3. Read TAG_BUFFER for flexible request header
+	tagBuffer, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read header TAG_BUFFER: %w", err)
+	}
+	_ = tagBuffer // Should be 0x00 (empty)
+
+	// Now read the actual DescribeTopicPartitions v0 request fields:
+	// - topics (COMPACT_ARRAY of topic entries)
+	// - response_partition_limit (INT32) - comes after topics
+	// - cursor (nullable complex type) - comes after limit
+	// - TAG_BUFFER for request body
+
+	// Read topics array length (compact array: length+1)
+	arrayLen, err := decoder.ReadUnsignedVarint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read topics array length: %w", err)
+	}
+
+	var topicNames []string
+	if arrayLen > 0 {
+		actualLen := arrayLen - 1 // compact array encoding
+		for i := uint64(0); i < actualLen; i++ {
+			// Read topic_name (COMPACT_STRING)
+			topicName, err := decoder.ReadCompactString()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read topic name: %w", err)
+			}
+			topicNames = append(topicNames, topicName)
+
+			// Skip TAG_BUFFER for each topic entry
+			_, err = decoder.ReadByte()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read topic TAG_BUFFER: %w", err)
+			}
+		}
+	}
+
 	return &DescribeTopicPartitionsRequest{
-		Header: header,
+		Header:     header,
+		TopicNames: topicNames,
 	}, nil
 }
