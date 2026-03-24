@@ -23,6 +23,14 @@ func (r *RequestHeader) GetCorrelationID() int32 {
 	return r.correlation_id
 }
 
+func (r *RequestHeader) GetAPIKey() int16 {
+	return r.api_key
+}
+
+func (r *RequestHeader) GetAPIVersion() int16 {
+	return r.api_version
+}
+
 func (r *RequestHeader) GetMessageSize() int32 {
 	return r.message_size
 }

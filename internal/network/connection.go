@@ -17,7 +17,27 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
-		body := apiversions.BuildBody(requestHeader.GetErrorCode())
+		var body []byte
+		switch requestHeader.GetAPIKey() {
+		case protocol.APIKeyApiVersions:
+			body = apiversions.BuildBody(requestHeader.GetErrorCode())
+		case protocol.APIKeyProduce:
+			// TODO: implement Produce handler
+			fmt.Printf("Produce API not yet implemented (api_key=%d)\n", protocol.APIKeyProduce)
+			return
+		case protocol.APIKeyFetch:
+			// TODO: implement Fetch handler
+			fmt.Printf("Fetch API not yet implemented (api_key=%d)\n", protocol.APIKeyFetch)
+			return
+		case protocol.APIKeyDescribeTopicPartitions:
+			// TODO: implement DescribeTopicPartitions handler
+			fmt.Printf("DescribeTopicPartitions API not yet implemented (api_key=%d)\n", protocol.APIKeyDescribeTopicPartitions)
+			return
+		default:
+			fmt.Printf("Unknown API key: %d\n", requestHeader.GetAPIKey())
+			return
+		}
+
 		response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
 
 		serializedResponse, err := response.Serialize()
