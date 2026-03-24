@@ -9,14 +9,15 @@ import (
 type response struct {
 	message_size   int32
 	correlation_id int32
-	error_code     int16
+	body           []byte
 }
 
-func NewResponse(messageSize int32, correlationID int32, errorCode int16) *response {
+// NewResponse builds a response. message_size is computed as 4 (correlation_id) + len(body).
+func NewResponse(correlationID int32, body []byte) *response {
 	return &response{
-		message_size:   messageSize,
+		message_size:   int32(4 + len(body)),
 		correlation_id: correlationID,
-		error_code:     errorCode,
+		body:           body,
 	}
 }
 
@@ -24,15 +25,15 @@ func (r *response) Serialize() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
 	if err := binary.Write(buf, binary.BigEndian, r.message_size); err != nil {
-		return nil, fmt.Errorf("Failed to write message_size: %w", err)
+		return nil, fmt.Errorf("failed to write message_size: %w", err)
 	}
 
 	if err := binary.Write(buf, binary.BigEndian, r.correlation_id); err != nil {
-		return nil, fmt.Errorf("Failed to write correlation_id: %w", err)
+		return nil, fmt.Errorf("failed to write correlation_id: %w", err)
 	}
 
-	if err := binary.Write(buf, binary.BigEndian, r.error_code); err != nil {
-		return nil, fmt.Errorf("Failed to write error_code: %w", err)
+	if _, err := buf.Write(r.body); err != nil {
+		return nil, fmt.Errorf("failed to write body: %w", err)
 	}
 
 	return buf.Bytes(), nil
