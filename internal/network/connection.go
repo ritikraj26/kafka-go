@@ -17,24 +17,36 @@ func handleConnection(conn net.Conn) {
 			return
 		}
 
+		// Parse the request into the appropriate type
+		request, err := protocol.ParseRequest(requestHeader)
+		if err != nil {
+			fmt.Printf("Error parsing request: %v\n", err)
+			return
+		}
+
 		var body []byte
-		switch requestHeader.GetAPIKey() {
-		case protocol.APIKeyApiVersions:
+		switch req := request.(type) {
+		case *protocol.ApiVersionsRequest:
+			// Handle ApiVersions request
 			body = apiversions.BuildBody(requestHeader.GetErrorCode())
-		case protocol.APIKeyProduce:
+
+		case *protocol.ProduceRequest:
 			// TODO: implement Produce handler
-			fmt.Printf("Produce API not yet implemented (api_key=%d)\n", protocol.APIKeyProduce)
+			fmt.Printf("Produce API not yet implemented (api_key=%d)\n", req.GetAPIKey())
 			return
-		case protocol.APIKeyFetch:
+
+		case *protocol.FetchRequest:
 			// TODO: implement Fetch handler
-			fmt.Printf("Fetch API not yet implemented (api_key=%d)\n", protocol.APIKeyFetch)
+			fmt.Printf("Fetch API not yet implemented (api_key=%d)\n", req.GetAPIKey())
 			return
-		case protocol.APIKeyDescribeTopicPartitions:
+
+		case *protocol.DescribeTopicPartitionsRequest:
 			// TODO: implement DescribeTopicPartitions handler
-			fmt.Printf("DescribeTopicPartitions API not yet implemented (api_key=%d)\n", protocol.APIKeyDescribeTopicPartitions)
+			fmt.Printf("DescribeTopicPartitions API not yet implemented (api_key=%d)\n", req.GetAPIKey())
 			return
+
 		default:
-			fmt.Printf("Unknown API key: %d\n", requestHeader.GetAPIKey())
+			fmt.Printf("Unknown request type: %T\n", req)
 			return
 		}
 
