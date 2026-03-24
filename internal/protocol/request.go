@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 )
 
@@ -11,6 +12,7 @@ type RequestHeader struct {
 	api_key        int16
 	api_version    int16
 	correlation_id int32
+	body           []byte
 }
 
 func NewRequestHeader() *RequestHeader {
@@ -23,6 +25,10 @@ func (r *RequestHeader) GetCorrelationID() int32 {
 
 func (r *RequestHeader) GetMessageSize() int32 {
 	return r.message_size
+}
+
+func (r *RequestHeader) GetBody() []byte {
+	return r.body
 }
 
 func (r *RequestHeader) GetErrorCode() int16 {
@@ -47,6 +53,16 @@ func (r *RequestHeader) ReadFrom(conn net.Conn) error {
 
 	if err := binary.Read(conn, binary.BigEndian, &r.correlation_id); err != nil {
 		return fmt.Errorf("failed to read correlation_id: %w", err)
+	}
+
+	// Read the remaining bytes of the request body
+	bytesRead := int32(8) // api_key (2) + api_version (2) + correlation_id (4)
+	remainingBytes := r.message_size - bytesRead
+	if remainingBytes > 0 {
+		r.body = make([]byte, remainingBytes)
+		if _, err := io.ReadFull(conn, r.body); err != nil {
+			return fmt.Errorf("failed to read request body: %w", err)
+		}
 	}
 
 	return nil
