@@ -1,14 +1,16 @@
 package protocol
 
-import "fmt"
+import (
+	"fmt"
+)
 
-// Request is an interface that all request types implement
+// interface for all request types
 type Request interface {
 	GetHeader() *RequestHeader
 	GetAPIKey() int16
 }
 
-// ApiVersionsRequest represents an ApiVersions request (api_key=18)
+// ApiVersionsRequest request (api_key=18)
 type ApiVersionsRequest struct {
 	Header   *RequestHeader
 	ClientID string
@@ -22,7 +24,7 @@ func (r *ApiVersionsRequest) GetAPIKey() int16 {
 	return APIKeyApiVersions
 }
 
-// ProduceRequest represents a Produce request (api_key=0) - PLACEHOLDER
+// ProduceRequest request (api_key=0) - PLACEHOLDER
 type ProduceRequest struct {
 	Header          *RequestHeader
 	TransactionalID *string
@@ -39,7 +41,7 @@ func (r *ProduceRequest) GetAPIKey() int16 {
 	return APIKeyProduce
 }
 
-// FetchRequest represents a Fetch request (api_key=1) - PLACEHOLDER
+// FetchRequest request (api_key=1) - PLACEHOLDER
 type FetchRequest struct {
 	Header    *RequestHeader
 	ReplicaID int32
@@ -56,7 +58,7 @@ func (r *FetchRequest) GetAPIKey() int16 {
 	return APIKeyFetch
 }
 
-// DescribeTopicPartitionsRequest represents a DescribeTopicPartitions request (api_key=75) - PLACEHOLDER
+// DescribeTopicPartitionsRequest request (api_key=75) - PLACEHOLDER
 type DescribeTopicPartitionsRequest struct {
 	Header     *RequestHeader
 	TopicNames []string
@@ -87,7 +89,7 @@ func ParseRequest(header *RequestHeader) (Request, error) {
 	}
 }
 
-// ParseApiVersionsRequest parses an ApiVersions request
+// parse an ApiVersions request
 func ParseApiVersionsRequest(header *RequestHeader) (*ApiVersionsRequest, error) {
 	decoder := NewDecoder(header.GetBody())
 
@@ -105,7 +107,7 @@ func ParseApiVersionsRequest(header *RequestHeader) (*ApiVersionsRequest, error)
 	}, nil
 }
 
-// ParseProduceRequest is a placeholder for Produce request parsing
+// placeholder for Produce request parsing
 func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 	// TODO: implement when Produce API is needed
 	return &ProduceRequest{
@@ -113,7 +115,7 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 	}, nil
 }
 
-// ParseFetchRequest is a placeholder for Fetch request parsing
+// placeholder for Fetch request parsing
 func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	// TODO: implement when Fetch API is needed
 	return &FetchRequest{
@@ -121,7 +123,7 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	}, nil
 }
 
-// ParseDescribeTopicPartitionsRequest is a placeholder
+// placeholder 
 func ParseDescribeTopicPartitionsRequest(header *RequestHeader) (*DescribeTopicPartitionsRequest, error) {
 	// TODO: implement when DescribeTopicPartitions API is needed
 	return &DescribeTopicPartitionsRequest{

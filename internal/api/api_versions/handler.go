@@ -5,21 +5,21 @@ import (
 	"encoding/binary"
 )
 
-// APIVersion represents a supported API and its version range
+// supported API and its version range
 type APIVersion struct {
 	Key        int16
 	MinVersion int16
 	MaxVersion int16
 }
 
-// getSupportedAPIs returns the list of APIs supported by this broker
+// return the list of APIs supported by this broker
 func getSupportedAPIs() []APIVersion {
 	return []APIVersion{
 		{18, 0, 4}, // ApiVersions
+		{75, 0, 0}, // DescribeTopicPartitions
 		// TODO: Add more APIs as they are implemented
 		// {0, 0, 9},  // Produce
 		// {1, 0, 13}, // Fetch
-		// {75, 0, 0}, // DescribeTopicPartitions
 	}
 }
 
