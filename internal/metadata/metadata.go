@@ -55,3 +55,19 @@ func (m *Manager) TopicExists(name string) bool {
 	_, exists := m.topics[name]
 	return exists
 }
+
+// GetTopicByID retrieves a topic by UUID, returns nil if not found
+func (m *Manager) GetTopicByID(id [16]byte) *Topic {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, topic := range m.topics {
+		topicIDBytes := topic.ID[:]
+		var topicIDArray [16]byte
+		copy(topicIDArray[:], topicIDBytes)
+		if topicIDArray == id {
+			return topic
+		}
+	}
+	return nil
+}
