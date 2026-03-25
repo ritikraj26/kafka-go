@@ -1,6 +1,10 @@
 package produce
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
@@ -39,19 +43,36 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 			if topic != nil {
 				// Topic exists, check if partition exists
 				partitionExists := false
+				var partitionLogDir string
 				for _, partition := range topic.Partitions {
 					if partition.Index == reqPartition.Index {
 						partitionExists = true
+						partitionLogDir = partition.LogDir
 						break
 					}
 				}
 
 				if partitionExists {
-					// Valid topic and partition - return success
-					errorCode = protocol.ErrNone
-					baseOffset = 0
-					logAppendTime = -1
-					logStartOffset = 0
+					// Valid topic and partition - write record to disk
+					if len(reqPartition.Records) > 0 {
+						err := writeRecordsToDisk(partitionLogDir, reqPartition.Records)
+						if err != nil {
+							fmt.Printf("Error writing records to disk: %v\n", err)
+							errorCode = protocol.ErrUnknownTopicOrPartition
+						} else {
+							// Success
+							errorCode = protocol.ErrNone
+							baseOffset = 0
+							logAppendTime = -1
+							logStartOffset = 0
+						}
+					} else {
+						// No records to write - still success
+						errorCode = protocol.ErrNone
+						baseOffset = 0
+						logAppendTime = -1
+						logStartOffset = 0
+					}
 				}
 			}
 
@@ -88,4 +109,31 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 	encoder.WriteTagBuffer()
 
 	return encoder.Bytes()
+}
+
+// writeRecordsToDisk writes record batch data to the partition's log file
+func writeRecordsToDisk(logDir string, records []byte) error {
+	// Ensure the log directory exists
+	err := os.MkdirAll(logDir, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	// Write to the log file (00000000000000000000.log)
+	logFilePath := filepath.Join(logDir, "00000000000000000000.log")
+
+	// Open file for appending (create if not exists)
+	file, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	defer file.Close()
+
+	// Write the record batch data
+	_, err = file.Write(records)
+	if err != nil {
+		return fmt.Errorf("failed to write records: %w", err)
+	}
+
+	return nil
 }
