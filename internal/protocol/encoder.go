@@ -42,6 +42,12 @@ func (e *Encoder) WriteCompactString(s string) {
 	e.buf.WriteString(s)
 }
 
+// WriteCompactBytes writes COMPACT_BYTES (length+1 as varint, then raw bytes)
+func (e *Encoder) WriteCompactBytes(data []byte) {
+	e.WriteUnsignedVarint(uint64(len(data) + 1))
+	e.buf.Write(data)
+}
+
 // WriteUnsignedVarint writes an unsigned varint
 func (e *Encoder) WriteUnsignedVarint(value uint64) {
 	for value >= 0x80 {
