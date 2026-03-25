@@ -43,7 +43,7 @@ func (r *ProduceRequest) GetAPIKey() int16 {
 
 // FetchTopic represents a topic in a Fetch request
 type FetchTopic struct {
-	TopicName  string
+	TopicID    [16]byte // UUID in v13+
 	Partitions []FetchPartition
 }
 
@@ -283,8 +283,12 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 				}
 			}
 
+			// Store the topic ID
+			var topicID [16]byte
+			copy(topicID[:], topicIDBytes)
+
 			topics = append(topics, FetchTopic{
-				TopicName:  "", // Topic ID is used in v13+, not topic name
+				TopicID:    topicID,
 				Partitions: partitions,
 			})
 
