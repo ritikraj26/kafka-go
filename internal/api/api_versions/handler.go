@@ -18,8 +18,7 @@ func getSupportedAPIs() []APIVersion {
 		{18, 0, 4}, // ApiVersions
 		{75, 0, 0}, // DescribeTopicPartitions
 		{1, 0, 16}, // Fetch
-		// TODO: Add more APIs as they are implemented
-		// {0, 0, 9},  // Produce
+		{0, 0, 11}, // Produce
 	}
 }
 
