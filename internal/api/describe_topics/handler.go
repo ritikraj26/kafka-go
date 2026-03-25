@@ -1,6 +1,8 @@
 package describetopics
 
 import (
+	"sort"
+
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
@@ -9,15 +11,20 @@ import (
 func BuildBody(req *protocol.DescribeTopicPartitionsRequest, metaMgr *metadata.Manager) []byte {
 	encoder := protocol.NewEncoder()
 
+	// Sort topic names alphabetically (required by Kafka protocol)
+	sortedTopics := make([]string, len(req.TopicNames))
+	copy(sortedTopics, req.TopicNames)
+	sort.Strings(sortedTopics)
+
 	// throttle_time_ms: 0
 	encoder.WriteInt32(0)
 
 	// topics array (COMPACT_ARRAY: length+1)
-	topicCount := len(req.TopicNames)
+	topicCount := len(sortedTopics)
 	encoder.WriteUnsignedVarint(uint64(topicCount + 1))
 
 	// Write each topic
-	for _, topicName := range req.TopicNames {
+	for _, topicName := range sortedTopics {
 		topic := metaMgr.GetTopic(topicName)
 
 		if topic == nil {
