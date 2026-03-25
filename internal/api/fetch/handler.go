@@ -62,9 +62,36 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 			// TAG_BUFFER for partition
 			encoder.WriteTagBuffer()
 		} else {
-			// Known topic - will implement in later stages
-			// For now, return empty partitions array
-			encoder.WriteUnsignedVarint(1) // 0 partitions + 1
+			// Known topic with no messages
+			// partitions (COMPACT_ARRAY) - 1 partition
+			encoder.WriteUnsignedVarint(2) // 1 partition + 1
+
+			// partition_index (INT32): 0
+			encoder.WriteInt32(0)
+
+			// error_code (INT16): 0 (NO_ERROR)
+			encoder.WriteInt16(protocol.ErrNone)
+
+			// high_watermark (INT64): 0 (no messages yet)
+			encoder.WriteInt64(0)
+
+			// last_stable_offset (INT64): 0
+			encoder.WriteInt64(0)
+
+			// log_start_offset (INT64): 0
+			encoder.WriteInt64(0)
+
+			// aborted_transactions (COMPACT_ARRAY): null
+			encoder.WriteByte(0x00)
+
+			// preferred_read_replica (INT32): -1
+			encoder.WriteInt32(-1)
+
+			// records (COMPACT_BYTES): null
+			encoder.WriteByte(0x00)
+
+			// TAG_BUFFER for partition
+			encoder.WriteTagBuffer()
 		}
 
 		// TAG_BUFFER for topic
