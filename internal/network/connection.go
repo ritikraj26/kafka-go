@@ -7,6 +7,7 @@ import (
 	apiversions "github.com/codecrafters-io/kafka-starter-go/internal/api/api_versions"
 	describetopics "github.com/codecrafters-io/kafka-starter-go/internal/api/describe_topics"
 	"github.com/codecrafters-io/kafka-starter-go/internal/api/fetch"
+	"github.com/codecrafters-io/kafka-starter-go/internal/api/produce"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
@@ -38,9 +39,10 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager) {
 			serializedResponse, err = response.Serialize()
 
 		case *protocol.ProduceRequest:
-			// TODO: implement Produce handler
-			fmt.Printf("Produce API not yet implemented (api_key=%d)\n", req.GetAPIKey())
-			return
+			// Handle Produce request (uses response header v1)
+			body = produce.BuildBody(req, metaMgr)
+			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
+			serializedResponse, err = response.Serialize()
 
 		case *protocol.FetchRequest:
 			// Handle Fetch request (uses response header v1)

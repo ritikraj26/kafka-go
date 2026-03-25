@@ -40,6 +40,51 @@ func (d *Decoder) ReadCompactString() (string, error) {
 	return str, nil
 }
 
+// ReadCompactNullableString reads a COMPACT_NULLABLE_STRING
+// Returns nil pointer for null, otherwise pointer to string
+func (d *Decoder) ReadCompactNullableString() (*string, error) {
+	length, err := d.ReadUnsignedVarint()
+	if err != nil {
+		return nil, err
+	}
+
+	if length == 0 {
+		return nil, nil // null string
+	}
+
+	strLen := length - 1 // compact encoding is length+1
+	if d.pos+int(strLen) > len(d.data) {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	str := string(d.data[d.pos : d.pos+int(strLen)])
+	d.pos += int(strLen)
+	return &str, nil
+}
+
+// ReadCompactBytes reads COMPACT_BYTES (length as unsigned varint, then bytes)
+// Returns nil for null (length=0)
+func (d *Decoder) ReadCompactBytes() ([]byte, error) {
+	length, err := d.ReadUnsignedVarint()
+	if err != nil {
+		return nil, err
+	}
+
+	if length == 0 {
+		return nil, nil // null bytes
+	}
+
+	bytesLen := length - 1 // compact encoding is length+1
+	if d.pos+int(bytesLen) > len(d.data) {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	bytes := make([]byte, bytesLen)
+	copy(bytes, d.data[d.pos:d.pos+int(bytesLen)])
+	d.pos += int(bytesLen)
+	return bytes, nil
+}
+
 // ReadUnsignedVarint reads an unsigned varint
 func (d *Decoder) ReadUnsignedVarint() (uint64, error) {
 	var value uint64
