@@ -6,7 +6,6 @@ import (
 )
 
 // BuildBody builds a Produce v11 response
-// For now, hardcode error responses for all topics/partitions
 func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 	encoder := protocol.NewEncoder()
 
@@ -23,22 +22,50 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 		partitionCount := len(reqTopic.Partitions)
 		encoder.WriteUnsignedVarint(uint64(partitionCount + 1))
 
+		// Look up the topic in metadata
+		topic := metaMgr.GetTopic(reqTopic.Name)
+
 		// Write each partition response
 		for _, reqPartition := range reqTopic.Partitions {
 			// index (INT32) - echo back the partition index
 			encoder.WriteInt32(reqPartition.Index)
 
-			// error_code (INT16): 3 (UNKNOWN_TOPIC_OR_PARTITION)
-			encoder.WriteInt16(protocol.ErrUnknownTopicOrPartition)
+			// Validate topic and partition exist
+			var errorCode int16 = protocol.ErrUnknownTopicOrPartition
+			var baseOffset int64 = -1
+			var logAppendTime int64 = -1
+			var logStartOffset int64 = -1
 
-			// base_offset (INT64): -1
-			encoder.WriteInt64(-1)
+			if topic != nil {
+				// Topic exists, check if partition exists
+				partitionExists := false
+				for _, partition := range topic.Partitions {
+					if partition.Index == reqPartition.Index {
+						partitionExists = true
+						break
+					}
+				}
 
-			// log_append_time_ms (INT64): -1
-			encoder.WriteInt64(-1)
+				if partitionExists {
+					// Valid topic and partition - return success
+					errorCode = protocol.ErrNone
+					baseOffset = 0
+					logAppendTime = -1
+					logStartOffset = 0
+				}
+			}
 
-			// log_start_offset (INT64): -1
-			encoder.WriteInt64(-1)
+			// error_code (INT16)
+			encoder.WriteInt16(errorCode)
+
+			// base_offset (INT64)
+			encoder.WriteInt64(baseOffset)
+
+			// log_append_time_ms (INT64)
+			encoder.WriteInt64(logAppendTime)
+
+			// log_start_offset (INT64)
+			encoder.WriteInt64(logStartOffset)
 
 			// record_errors (COMPACT_ARRAY): null
 			encoder.WriteByte(0x00)
