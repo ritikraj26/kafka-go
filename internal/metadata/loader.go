@@ -86,14 +86,17 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 
 		// Add partition (ensure partitions array is large enough)
 		for len(topic.Partitions) <= partitionIndex {
+			partIdx := int32(len(topic.Partitions))
+			partLogDir := fmt.Sprintf("%s/%s-%d", logDir, topicName, partIdx)
 			topic.Partitions = append(topic.Partitions, Partition{
-				Index:           int32(len(topic.Partitions)),
+				Index:           partIdx,
 				LeaderID:        1,
 				ReplicaNodes:    []int32{1},
 				ISRNodes:        []int32{1},
 				OfflineReplicas: []int32{},
 				LeaderEpoch:     0,
 				PartitionEpoch:  0,
+				LogDir:          partLogDir,
 			})
 		}
 	}
@@ -228,4 +231,21 @@ func getKeys(m map[string]bool) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// ReadPartitionLog reads the log file for a partition and returns the raw bytes
+// The log file is located at <partition.LogDir>/00000000000000000000.log
+func ReadPartitionLog(partition *Partition) ([]byte, error) {
+	logFilePath := partition.LogDir + "/00000000000000000000.log"
+
+	data, err := os.ReadFile(logFilePath)
+	if err != nil {
+		// If file doesn't exist, return empty (no messages)
+		if os.IsNotExist(err) {
+			return []byte{}, nil
+		}
+		return nil, fmt.Errorf("failed to read log file: %w", err)
+	}
+
+	return data, nil
 }
