@@ -6,10 +6,11 @@ import (
 
 	apiversions "github.com/codecrafters-io/kafka-starter-go/internal/api/api_versions"
 	describetopics "github.com/codecrafters-io/kafka-starter-go/internal/api/describe_topics"
+	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, metaMgr *metadata.Manager) {
 	defer conn.Close()
 	for {
 		requestHeader := protocol.NewRequestHeader()
@@ -47,7 +48,7 @@ func handleConnection(conn net.Conn) {
 
 		case *protocol.DescribeTopicPartitionsRequest:
 			// Handle DescribeTopicPartitions request (uses response header v1)
-			body = describetopics.BuildBody(req)
+			body = describetopics.BuildBody(req, metaMgr)
 			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
 			serializedResponse, err = response.Serialize()
 
