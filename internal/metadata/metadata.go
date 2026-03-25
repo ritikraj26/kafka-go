@@ -8,13 +8,29 @@ import (
 type Manager struct {
 	mu     sync.RWMutex
 	topics map[string]*Topic // topic_name -> Topic
+	logDir string            // Base directory for log files
 }
 
 // NewManager creates a new metadata manager
 func NewManager() *Manager {
 	return &Manager{
 		topics: make(map[string]*Topic),
+		logDir: "/tmp/kraft-broker-logs", // Default
 	}
+}
+
+// SetLogDir sets the log directory path
+func (m *Manager) SetLogDir(dir string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logDir = dir
+}
+
+// GetLogDir returns the log directory path
+func (m *Manager) GetLogDir() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.logDir
 }
 
 // CreateTopic creates a new topic with the given name and number of partitions
