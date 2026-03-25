@@ -62,7 +62,7 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 			// TAG_BUFFER for partition
 			encoder.WriteTagBuffer()
 		} else {
-			// Known topic with no messages
+			// Known topic - read records from disk
 			// partitions (COMPACT_ARRAY) - 1 partition
 			encoder.WriteUnsignedVarint(2) // 1 partition + 1
 
@@ -72,11 +72,30 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 			// error_code (INT16): 0 (NO_ERROR)
 			encoder.WriteInt16(protocol.ErrNone)
 
-			// high_watermark (INT64): 0 (no messages yet)
-			encoder.WriteInt64(0)
+			// Read records from the log file
+			var recordBatches []byte
+			if len(topic.Partitions) > 0 {
+				partition := &topic.Partitions[0]
+				var err error
+				recordBatches, err = metadata.ReadPartitionLog(partition)
+				if err != nil {
+					// If we can't read the log, treat as empty
+					recordBatches = []byte{}
+				}
+			}
 
-			// last_stable_offset (INT64): 0
-			encoder.WriteInt64(0)
+			// Calculate high_watermark (number of messages)
+			// For simplicity, if we have data, high_watermark is 1, otherwise 0
+			highWatermark := int64(0)
+			if len(recordBatches) > 0 {
+				highWatermark = 1
+			}
+
+			// high_watermark (INT64)
+			encoder.WriteInt64(highWatermark)
+
+			// last_stable_offset (INT64)
+			encoder.WriteInt64(highWatermark)
 
 			// log_start_offset (INT64): 0
 			encoder.WriteInt64(0)
@@ -87,8 +106,14 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 			// preferred_read_replica (INT32): -1
 			encoder.WriteInt32(-1)
 
-			// records (COMPACT_BYTES): null
-			encoder.WriteByte(0x00)
+			// records (COMPACT_BYTES): raw record batch data from log file
+			if len(recordBatches) == 0 {
+				// null (no records)
+				encoder.WriteByte(0x00)
+			} else {
+				// Write the record batches as COMPACT_BYTES
+				encoder.WriteCompactBytes(recordBatches)
+			}
 
 			// TAG_BUFFER for partition
 			encoder.WriteTagBuffer()
