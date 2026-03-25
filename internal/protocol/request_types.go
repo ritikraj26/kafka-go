@@ -41,13 +41,27 @@ func (r *ProduceRequest) GetAPIKey() int16 {
 	return APIKeyProduce
 }
 
-// FetchRequest request (api_key=1) - PLACEHOLDER
+// FetchTopic represents a topic in a Fetch request
+type FetchTopic struct {
+	TopicName  string
+	Partitions []FetchPartition
+}
+
+// FetchPartition represents a partition in a Fetch request
+type FetchPartition struct {
+	PartitionIndex int32
+	FetchOffset    int64
+}
+
+// FetchRequest request (api_key=1)
 type FetchRequest struct {
-	Header    *RequestHeader
-	ReplicaID int32
-	MaxWaitMs int32
-	MinBytes  int32
-	// Topics []FetchTopic // TODO: implement when needed
+	Header       *RequestHeader
+	MaxWaitMs    int32
+	MinBytes     int32
+	MaxBytes     int32
+	SessionID    int32
+	SessionEpoch int32
+	Topics       []FetchTopic
 }
 
 func (r *FetchRequest) GetHeader() *RequestHeader {
@@ -115,11 +129,231 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 	}, nil
 }
 
-// placeholder for Fetch request parsing
+// ParseFetchRequest parses a Fetch request (v16)
 func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
-	// TODO: implement when Fetch API is needed
+	decoder := NewDecoder(header.GetBody())
+
+	// Fetch v16 uses flexible request format (KIP-482)
+	// First, parse the flexible request header fields
+
+	// 1. Read cursor field - nullable byte (0x00 = null/no cursor)
+	cursorByte, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cursor: %w", err)
+	}
+	_ = cursorByte
+
+	// 2. Read client software identifier - simple length-prefixed string
+	lengthByte, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read client software length: %w", err)
+	}
+
+	// Read the client software name bytes
+	clientBytes := make([]byte, lengthByte)
+	for i := 0; i < int(lengthByte); i++ {
+		b, err := decoder.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read client software byte %d: %w", i, err)
+		}
+		clientBytes[i] = b
+	}
+
+	// 3. Read TAG_BUFFER for flexible request header
+	tagBuffer, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read header TAG_BUFFER: %w", err)
+	}
+	_ = tagBuffer
+
+	// Now parse the actual Fetch v16 request fields
+
+	// max_wait_ms (INT32)
+	maxWaitMs, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read max_wait_ms: %w", err)
+	}
+
+	// min_bytes (INT32)
+	minBytes, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read min_bytes: %w", err)
+	}
+
+	// max_bytes (INT32)
+	maxBytes, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read max_bytes: %w", err)
+	}
+
+	// isolation_level (INT8)
+	_, err = decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read isolation_level: %w", err)
+	}
+
+	// session_id (INT32)
+	sessionID, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read session_id: %w", err)
+	}
+
+	// session_epoch (INT32)
+	sessionEpoch, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read session_epoch: %w", err)
+	}
+
+	// topics (COMPACT_ARRAY)
+	topicsLen, err := decoder.ReadUnsignedVarint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read topics array length: %w", err)
+	}
+
+	var topics []FetchTopic
+	if topicsLen > 0 {
+		actualLen := topicsLen - 1 // compact array encoding
+		for i := uint64(0); i < actualLen; i++ {
+			// topic_id (UUID - 16 bytes) - for v13+
+			topicIDBytes := make([]byte, 16)
+			for j := 0; j < 16; j++ {
+				b, err := decoder.ReadByte()
+				if err != nil {
+					return nil, fmt.Errorf("failed to read topic_id byte %d: %w", j, err)
+				}
+				topicIDBytes[j] = b
+			}
+
+			// partitions (COMPACT_ARRAY)
+			partitionsLen, err := decoder.ReadUnsignedVarint()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read partitions array length: %w", err)
+			}
+
+			var partitions []FetchPartition
+			if partitionsLen > 0 {
+				actualPartLen := partitionsLen - 1
+				for j := uint64(0); j < actualPartLen; j++ {
+					// partition_index (INT32)
+					partitionIndex, err := decoder.ReadInt32()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read partition_index: %w", err)
+					}
+
+					// current_leader_epoch (INT32)
+					_, err = decoder.ReadInt32()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read current_leader_epoch: %w", err)
+					}
+
+					// fetch_offset (INT64)
+					fetchOffset, err := decoder.ReadInt64()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read fetch_offset: %w", err)
+					}
+
+					// last_fetched_epoch (INT32)
+					_, err = decoder.ReadInt32()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read last_fetched_epoch: %w", err)
+					}
+
+					// log_start_offset (INT64)
+					_, err = decoder.ReadInt64()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read log_start_offset: %w", err)
+					}
+
+					// partition_max_bytes (INT32)
+					_, err = decoder.ReadInt32()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read partition_max_bytes: %w", err)
+					}
+
+					// TAG_BUFFER for partition
+					_, err = decoder.ReadByte()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read partition TAG_BUFFER: %w", err)
+					}
+
+					partitions = append(partitions, FetchPartition{
+						PartitionIndex: partitionIndex,
+						FetchOffset:    fetchOffset,
+					})
+				}
+			}
+
+			topics = append(topics, FetchTopic{
+				TopicName:  "", // Topic ID is used in v13+, not topic name
+				Partitions: partitions,
+			})
+
+			// TAG_BUFFER for topic
+			_, err = decoder.ReadByte()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read topic TAG_BUFFER: %w", err)
+			}
+		}
+	}
+
+	// forgotten_topics_data (COMPACT_ARRAY)
+	forgottenLen, err := decoder.ReadUnsignedVarint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read forgotten_topics_data length: %w", err)
+	}
+	// If length > 0, we need to parse the forgotten topics
+	if forgottenLen > 1 { // Remember: compact array, so 1 means 0 elements
+		actualLen := forgottenLen - 1
+		for i := uint64(0); i < actualLen; i++ {
+			// topic_id (UUID - 16 bytes)
+			for j := 0; j < 16; j++ {
+				_, err := decoder.ReadByte()
+				if err != nil {
+					return nil, fmt.Errorf("failed to read forgotten topic_id: %w", err)
+				}
+			}
+			// partitions (COMPACT_ARRAY of INT32)
+			partLen, err := decoder.ReadUnsignedVarint()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read forgotten partitions length: %w", err)
+			}
+			if partLen > 1 {
+				actualPartLen := partLen - 1
+				for j := uint64(0); j < actualPartLen; j++ {
+					_, err := decoder.ReadInt32()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read forgotten partition: %w", err)
+					}
+				}
+			}
+			// TAG_BUFFER for forgotten topic
+			_, err = decoder.ReadByte()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read forgotten topic TAG_BUFFER: %w", err)
+			}
+		}
+	}
+
+	// rack_id (COMPACT_STRING)
+	_, err = decoder.ReadCompactString()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rack_id: %w", err)
+	}
+
+	// TAG_BUFFER for request
+	_, err = decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request TAG_BUFFER: %w", err)
+	}
+
 	return &FetchRequest{
-		Header: header,
+		Header:       header,
+		MaxWaitMs:    maxWaitMs,
+		MinBytes:     minBytes,
+		MaxBytes:     maxBytes,
+		SessionID:    sessionID,
+		SessionEpoch: sessionEpoch,
+		Topics:       topics,
 	}, nil
 }
 
