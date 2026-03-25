@@ -24,13 +24,25 @@ func (r *ApiVersionsRequest) GetAPIKey() int16 {
 	return APIKeyApiVersions
 }
 
-// ProduceRequest request (api_key=0) - PLACEHOLDER
+// ProduceTopic represents a topic in a Produce request
+type ProduceTopic struct {
+	Name       string
+	Partitions []ProducePartition
+}
+
+// ProducePartition represents a partition in a Produce request
+type ProducePartition struct {
+	Index   int32
+	Records []byte // Raw record batch data
+}
+
+// ProduceRequest request (api_key=0)
 type ProduceRequest struct {
 	Header          *RequestHeader
 	TransactionalID *string
 	Acks            int16
 	TimeoutMs       int32
-	// TopicData    []TopicProduceData // TODO: implement when needed
+	Topics          []ProduceTopic
 }
 
 func (r *ProduceRequest) GetHeader() *RequestHeader {
@@ -121,11 +133,134 @@ func ParseApiVersionsRequest(header *RequestHeader) (*ApiVersionsRequest, error)
 	}, nil
 }
 
-// placeholder for Produce request parsing
+// ParseProduceRequest parses a Produce request (v11)
 func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
-	// TODO: implement when Produce API is needed
+	decoder := NewDecoder(header.GetBody())
+
+	// Produce v11 uses flexible request format (KIP-482)
+	// First, parse the flexible request header fields
+
+	// 1. Read cursor field (nullable byte)
+	_, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cursor: %w", err)
+	}
+
+	// 2. Read client software identifier (length-prefixed string)
+	lengthByte, err := decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read client software length: %w", err)
+	}
+
+	// Skip client software name bytes
+	for i := 0; i < int(lengthByte); i++ {
+		_, err = decoder.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read client software byte %d: %w", i, err)
+		}
+	}
+
+	// 3. Read TAG_BUFFER for flexible request header
+	_, err = decoder.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read header TAG_BUFFER: %w", err)
+	}
+
+	// Now read the actual Produce v11 request fields:
+	// - transactional_id (COMPACT_NULLABLE_STRING)
+	// - acks (INT16)
+	// - timeout_ms (INT32)
+	// - topics (COMPACT_ARRAY)
+	// - TAG_BUFFER for request body
+
+	// Read transactional_id
+	transactionalID, err := decoder.ReadCompactNullableString()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read transactional_id: %w", err)
+	}
+
+	// Read acks
+	acks, err := decoder.ReadInt16()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read acks: %w", err)
+	}
+
+	// Read timeout_ms
+	timeoutMs, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read timeout_ms: %w", err)
+	}
+
+	// Read topics array (COMPACT_ARRAY)
+	topicsLen, err := decoder.ReadUnsignedVarint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read topics array length: %w", err)
+	}
+
+	var topics []ProduceTopic
+	if topicsLen > 0 {
+		actualLen := topicsLen - 1 // compact array encoding
+		for i := uint64(0); i < actualLen; i++ {
+			// Read topic name (COMPACT_STRING)
+			topicName, err := decoder.ReadCompactString()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read topic name: %w", err)
+			}
+
+			// Read partitions array (COMPACT_ARRAY)
+			partitionsLen, err := decoder.ReadUnsignedVarint()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read partitions array length: %w", err)
+			}
+
+			var partitions []ProducePartition
+			if partitionsLen > 0 {
+				actualPartLen := partitionsLen - 1
+				for j := uint64(0); j < actualPartLen; j++ {
+					// Read partition index (INT32)
+					partitionIndex, err := decoder.ReadInt32()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read partition index: %w", err)
+					}
+
+					// Read records (COMPACT_BYTES)
+					records, err := decoder.ReadCompactBytes()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read records: %w", err)
+					}
+
+					partitions = append(partitions, ProducePartition{
+						Index:   partitionIndex,
+						Records: records,
+					})
+
+					// Skip TAG_BUFFER for partition
+					_, err = decoder.ReadByte()
+					if err != nil {
+						return nil, fmt.Errorf("failed to read partition TAG_BUFFER: %w", err)
+					}
+				}
+			}
+
+			topics = append(topics, ProduceTopic{
+				Name:       topicName,
+				Partitions: partitions,
+			})
+
+			// Skip TAG_BUFFER for topic
+			_, err = decoder.ReadByte()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read topic TAG_BUFFER: %w", err)
+			}
+		}
+	}
+
 	return &ProduceRequest{
-		Header: header,
+		Header:          header,
+		TransactionalID: transactionalID,
+		Acks:            acks,
+		TimeoutMs:       timeoutMs,
+		Topics:          topics,
 	}, nil
 }
 
