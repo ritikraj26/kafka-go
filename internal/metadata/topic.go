@@ -1,6 +1,11 @@
 package metadata
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+
 	"github.com/google/uuid"
 )
 
@@ -22,6 +27,42 @@ type Partition struct {
 	LeaderEpoch     int32
 	PartitionEpoch  int32
 	LogDir          string // Path to the partition's log directory
+
+	// Offset tracking
+	NextOffset int64      // Next offset to assign to an incoming RecordBatch
+	mu         sync.Mutex // Serializes writes to this partition's log file
+}
+
+// AppendRecords writes records to the partition's log file under its mutex
+// and returns the base offset (offset before the write) on success.
+func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int64, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err = writeRecords(logDir, records); err != nil {
+		return -1, err
+	}
+
+	baseOffset = p.NextOffset
+	p.NextOffset++
+	return baseOffset, nil
+}
+
+// writeRecords appends raw record batch bytes to the partition's log file.
+func writeRecords(logDir string, records []byte) error {
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+	logFile := filepath.Join(logDir, "00000000000000000000.log")
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	defer f.Close()
+	if _, err = f.Write(records); err != nil {
+		return fmt.Errorf("failed to write records: %w", err)
+	}
+	return nil
 }
 
 // create a new topic with the given name and ID

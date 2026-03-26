@@ -79,23 +79,22 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 				var err error
 				recordBatches, err = metadata.ReadPartitionLog(partition)
 				if err != nil {
-					// If we can't read the log, treat as empty
 					recordBatches = []byte{}
 				}
+
+				// high_watermark = next offset to be assigned (i.e. number of batches written)
+				highWatermark := partition.NextOffset
+
+				// high_watermark (INT64)
+				encoder.WriteInt64(highWatermark)
+
+				// last_stable_offset (INT64)
+				encoder.WriteInt64(highWatermark)
+			} else {
+				// No partitions - watermarks are 0
+				encoder.WriteInt64(0)
+				encoder.WriteInt64(0)
 			}
-
-			// Calculate high_watermark (number of messages)
-			// For simplicity, if we have data, high_watermark is 1, otherwise 0
-			highWatermark := int64(0)
-			if len(recordBatches) > 0 {
-				highWatermark = 1
-			}
-
-			// high_watermark (INT64)
-			encoder.WriteInt64(highWatermark)
-
-			// last_stable_offset (INT64)
-			encoder.WriteInt64(highWatermark)
 
 			// log_start_offset (INT64): 0
 			encoder.WriteInt64(0)
