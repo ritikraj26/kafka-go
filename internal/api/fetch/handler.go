@@ -62,60 +62,59 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 			// TAG_BUFFER for partition
 			encoder.WriteTagBuffer()
 		} else {
-			// Known topic - read records from disk
-			// partitions (COMPACT_ARRAY) - 1 partition
-			encoder.WriteUnsignedVarint(2) // 1 partition + 1
+			// Known topic — respond per requested partition
+			encoder.WriteUnsignedVarint(uint64(len(reqTopic.Partitions) + 1))
 
-			// partition_index (INT32): 0
-			encoder.WriteInt32(0)
-
-			// error_code (INT16): 0 (NO_ERROR)
-			encoder.WriteInt16(protocol.ErrNone)
-
-			// Read records from the log file
-			var recordBatches []byte
-			if len(topic.Partitions) > 0 {
-				partition := &topic.Partitions[0]
-				var err error
-				recordBatches, err = metadata.ReadPartitionLog(partition)
-				if err != nil {
-					recordBatches = []byte{}
+			for _, reqPart := range reqTopic.Partitions {
+				// Find the partition in metadata
+				var partition *metadata.Partition
+				for i := range topic.Partitions {
+					if topic.Partitions[i].Index == reqPart.PartitionIndex {
+						partition = &topic.Partitions[i]
+						break
+					}
 				}
 
-				// high_watermark = next offset to be assigned (i.e. number of batches written)
+				// partition_index (INT32)
+				encoder.WriteInt32(reqPart.PartitionIndex)
+
+				if partition == nil {
+					// Partition not found
+					encoder.WriteInt16(protocol.ErrUnknownTopicOrPartition)
+					encoder.WriteInt64(-1)  // high_watermark
+					encoder.WriteInt64(-1)  // last_stable_offset
+					encoder.WriteInt64(-1)  // log_start_offset
+					encoder.WriteByte(0x00) // aborted_transactions null
+					encoder.WriteInt32(-1)  // preferred_read_replica
+					encoder.WriteByte(0x00) // records null
+					encoder.WriteTagBuffer()
+					continue
+				}
+
 				highWatermark := partition.NextOffset
 
-				// high_watermark (INT64)
-				encoder.WriteInt64(highWatermark)
+				encoder.WriteInt16(protocol.ErrNone)
+				encoder.WriteInt64(highWatermark) // high_watermark
+				encoder.WriteInt64(highWatermark) // last_stable_offset
+				encoder.WriteInt64(0)             // log_start_offset
+				encoder.WriteByte(0x00)           // aborted_transactions null
+				encoder.WriteInt32(-1)            // preferred_read_replica
 
-				// last_stable_offset (INT64)
-				encoder.WriteInt64(highWatermark)
-			} else {
-				// No partitions - watermarks are 0
-				encoder.WriteInt64(0)
-				encoder.WriteInt64(0)
+				// Seek to the requested offset via index, then read from that byte position
+				var recordBatches []byte
+				if reqPart.FetchOffset < highWatermark {
+					bytePos, _ := partition.SeekToOffset(reqPart.FetchOffset)
+					recordBatches, _ = metadata.ReadPartitionLogFrom(partition, bytePos)
+				}
+
+				if len(recordBatches) == 0 {
+					encoder.WriteByte(0x00) // null records
+				} else {
+					encoder.WriteCompactBytes(recordBatches)
+				}
+
+				encoder.WriteTagBuffer()
 			}
-
-			// log_start_offset (INT64): 0
-			encoder.WriteInt64(0)
-
-			// aborted_transactions (COMPACT_ARRAY): null
-			encoder.WriteByte(0x00)
-
-			// preferred_read_replica (INT32): -1
-			encoder.WriteInt32(-1)
-
-			// records (COMPACT_BYTES): raw record batch data from log file
-			if len(recordBatches) == 0 {
-				// null (no records)
-				encoder.WriteByte(0x00)
-			} else {
-				// Write the record batches as COMPACT_BYTES
-				encoder.WriteCompactBytes(recordBatches)
-			}
-
-			// TAG_BUFFER for partition
-			encoder.WriteTagBuffer()
 		}
 
 		// TAG_BUFFER for topic

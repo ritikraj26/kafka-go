@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
@@ -88,6 +89,7 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 		for len(topic.Partitions) <= partitionIndex {
 			partIdx := int32(len(topic.Partitions))
 			partLogDir := fmt.Sprintf("%s/%s-%d", logDir, topicName, partIdx)
+			nextOffset := recoverNextOffset(partLogDir)
 			topic.Partitions = append(topic.Partitions, Partition{
 				Index:           partIdx,
 				LeaderID:        1,
@@ -97,6 +99,7 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 				LeaderEpoch:     0,
 				PartitionEpoch:  0,
 				LogDir:          partLogDir,
+				NextOffset:      nextOffset,
 			})
 		}
 	}
@@ -144,108 +147,199 @@ func parseTopicDirName(dirName string) (string, int, error) {
 	return topicName, partitionIndex, nil
 }
 
-// parseClusterMetadata reads the cluster metadata log and extracts topic UUIDs
-func parseClusterMetadataForTopics(logPath string, topicNames map[string]bool) (map[string]uuid.UUID, error) {
+// recoverNextOffset counts RecordBatches in the existing log to recover NextOffset.
+// Each RecordBatch corresponds to one offset increment (as we track batches, not records).
+func recoverNextOffset(logDir string) int64 {
+	logFile := logDir + "/00000000000000000000.log"
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return 0
+	}
+	var count int64
+	pos := 0
+	for pos+12 <= len(data) {
+		batchLength := int(binary.BigEndian.Uint32(data[pos+8 : pos+12]))
+		batchEnd := pos + 12 + batchLength
+		if batchEnd > len(data) {
+			break
+		}
+		count++
+		pos = batchEnd
+	}
+	return count
+}
+
+// parseClusterMetadataForTopics reads __cluster_metadata log using proper
+// RecordBatch format and extracts topic UUIDs from TOPIC_RECORD entries (type 2).
+func parseClusterMetadataForTopics(logPath string, _ map[string]bool) (map[string]uuid.UUID, error) {
 	data, err := os.ReadFile(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cluster metadata log: %w", err)
 	}
 
-	fmt.Printf("Reading cluster metadata from %s (%d bytes)\n", logPath, len(data))
-	fmt.Printf("Looking for topics: %v\n", getKeys(topicNames))
-
 	topicUUIDs := make(map[string]uuid.UUID)
+	pos := 0
 
-	// For each topic name, search for it in the metadata
-	for topicName := range topicNames {
-		// Search for the topic name as a string in the data
-		nameBytes := []byte(topicName)
+	for pos < len(data) {
+		// RecordBatch header (minimum 61 bytes):
+		//   baseOffset        INT64   8
+		//   batchLength       INT32   4  ← length of everything after this field
+		//   partitionLeaderEpoch INT32 4
+		//   magic             INT8    1
+		//   crc               UINT32  4
+		//   attributes        INT16   2
+		//   lastOffsetDelta   INT32   4
+		//   baseTimestamp     INT64   8
+		//   maxTimestamp      INT64   8
+		//   producerId        INT64   8
+		//   producerEpoch     INT16   2
+		//   baseSequence      INT32   4
+		//   recordsCount      INT32   4   ← total fixed header = 61 bytes
+		if pos+12 > len(data) {
+			break
+		}
+		// baseOffset (8) + batchLength (4)
+		batchLength := int(binary.BigEndian.Uint32(data[pos+8 : pos+12]))
+		batchEnd := pos + 12 + batchLength
+		if batchEnd > len(data) {
+			break
+		}
 
-		var bestUUID uuid.UUID
-		bestScore := 0
+		// Parse records inside this batch starting at the records array.
+		// Fixed batch header after batchLength = 49 bytes, then recordsCount INT32 = 4 bytes
+		// Total offset to first record = 8+4+49 = 61
+		if pos+61 > len(data) {
+			pos = batchEnd
+			continue
+		}
+		recordsCount := int(binary.BigEndian.Uint32(data[pos+57 : pos+61]))
+		recordPos := pos + 61
 
-		// Find all occurrences of the topic name
-		for i := 0; i < len(data)-len(nameBytes); i++ {
-			if string(data[i:i+len(nameBytes)]) == topicName {
-				// Found the topic name, look for UUID nearby
-				// Prefer UUIDs that are AFTER the topic name (more likely to be the topic ID)
-				searchStart := i + len(nameBytes)
-				searchEnd := searchStart + 40 // Look within 40 bytes after the name
-				if searchEnd > len(data) {
-					searchEnd = len(data)
-				}
+		for r := 0; r < recordsCount && recordPos < batchEnd; r++ {
+			// Each Record:
+			//   length        VARINT   (signed zigzag)
+			//   attributes    INT8     1
+			//   timestampDelta VARINT
+			//   offsetDelta   VARINT
+			//   keyLength     VARINT  (-1 = null)
+			//   key           bytes
+			//   valueLength   VARINT
+			//   value         bytes
+			//   headers       VARINT count + entries
 
-				// Look for a 16-byte UUID in this region
-				for j := searchStart; j < searchEnd-16; j++ {
-					uuidBytes := data[j : j+16]
-					topicID, err := uuid.FromBytes(uuidBytes)
-					if err == nil && topicID != uuid.Nil && !isInvalidUUID(topicID) {
-						// Score based on how close to the topic name (closer is better)
-						distance := j - (i + len(nameBytes))
-						score := 1000 - distance
+			recLen, n := readSignedVarint(data, recordPos)
+			if n == 0 {
+				break
+			}
+			recEnd := recordPos + n + int(recLen)
+			if recEnd > len(data) {
+				break
+			}
 
-						if score > bestScore {
-							bestScore = score
-							bestUUID = topicID
+			cursor := recordPos + n
+			cursor++ // attributes INT8
+
+			// skip timestampDelta and offsetDelta varints
+			_, dn := readSignedVarint(data, cursor)
+			cursor += dn
+			_, dn = readSignedVarint(data, cursor)
+			cursor += dn
+
+			// keyLength VARINT (signed; -1 = null)
+			keyLen, dn := readSignedVarint(data, cursor)
+			cursor += dn
+			if keyLen > 0 {
+				cursor += int(keyLen) // skip key bytes
+			}
+
+			// valueLength VARINT
+			valLen, dn := readSignedVarint(data, cursor)
+			cursor += dn
+			if valLen < 0 || cursor+int(valLen) > len(data) {
+				recordPos = recEnd
+				continue
+			}
+			valueBytes := data[cursor : cursor+int(valLen)]
+
+			// Metadata record value layout (KIP-631):
+			//   frameVersion  INT8   1
+			//   type          INT8   1   (2 = TOPIC_RECORD, 3 = PARTITION_RECORD)
+			//   version       INT8   1
+			//   ... fields depend on type
+			if len(valueBytes) >= 3 {
+				recordType := valueBytes[1]
+				if recordType == 2 { // TOPIC_RECORD
+					// After frameVersion(1)+type(1)+version(1):
+					// name: COMPACT_STRING (varint length+1, then bytes)
+					// topicId: UUID 16 bytes
+					vpos := 3
+					nameLen, dn := readUvarint(valueBytes, vpos)
+					vpos += dn
+					if nameLen > 0 {
+						actualNameLen := int(nameLen) - 1 // compact encoding
+						if vpos+actualNameLen+16 <= len(valueBytes) {
+							name := string(valueBytes[vpos : vpos+actualNameLen])
+							vpos += actualNameLen
+							id, err := uuid.FromBytes(valueBytes[vpos : vpos+16])
+							if err == nil {
+								topicUUIDs[name] = id
+							}
 						}
 					}
 				}
 			}
+
+			recordPos = recEnd
 		}
 
-		if bestUUID != uuid.Nil {
-			topicUUIDs[topicName] = bestUUID
-			fmt.Printf("Found UUID for topic %s: %s (score: %d)\n", topicName, bestUUID, bestScore)
-		}
+		pos = batchEnd
 	}
 
 	return topicUUIDs, nil
 }
 
-// isInvalidUUID checks if a UUID looks invalid (all zeros, all FFs, mostly zeros, etc.)
-func isInvalidUUID(id uuid.UUID) bool {
-	bytes := id[:]
-	allZeros := true
-	allFFs := true
-	zeroCount := 0
-
-	for _, b := range bytes {
-		if b != 0 {
-			allZeros = false
-		} else {
-			zeroCount++
-		}
-		if b != 0xFF {
-			allFFs = false
-		}
-	}
-
-	// Reject if all zeros, all FFs, or more than 10 bytes are zero
-	return allZeros || allFFs || zeroCount > 10
+// readSignedVarint reads a zigzag-encoded signed varint from data[pos].
+// Returns the value and number of bytes consumed (0 on error).
+func readSignedVarint(data []byte, pos int) (int64, int) {
+	uval, n := readUvarint(data, pos)
+	// zigzag decode
+	return int64((uval >> 1) ^ -(uval & 1)), n
 }
 
-// getKeys returns the keys of a map as a slice
-func getKeys(m map[string]bool) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+// readUvarint reads an unsigned varint from data[pos].
+// Returns the value and number of bytes consumed (0 on error).
+func readUvarint(data []byte, pos int) (uint64, int) {
+	var val uint64
+	var shift uint
+	for i := pos; i < len(data) && i < pos+10; i++ {
+		b := data[i]
+		val |= uint64(b&0x7F) << shift
+		shift += 7
+		if b&0x80 == 0 {
+			return val, i - pos + 1
+		}
 	}
-	return keys
+	return 0, 0
 }
 
 // ReadPartitionLog reads the log file for a partition and returns the raw bytes
-// The log file is located at <partition.LogDir>/00000000000000000000.log
+// from the given file position onwards (0 = from beginning).
 func ReadPartitionLog(partition *Partition) ([]byte, error) {
-	logFilePath := partition.LogDir + "/00000000000000000000.log"
+	return ReadPartitionLogFrom(partition, 0)
+}
 
+// ReadPartitionLogFrom reads the log file starting at byteOffset.
+func ReadPartitionLogFrom(partition *Partition, byteOffset int64) ([]byte, error) {
+	logFilePath := partition.LogDir + "/00000000000000000000.log"
 	data, err := os.ReadFile(logFilePath)
 	if err != nil {
-		// If file doesn't exist, return empty (no messages)
 		if os.IsNotExist(err) {
 			return []byte{}, nil
 		}
 		return nil, fmt.Errorf("failed to read log file: %w", err)
 	}
-
+	if byteOffset > 0 && byteOffset < int64(len(data)) {
+		return data[byteOffset:], nil
+	}
 	return data, nil
 }
