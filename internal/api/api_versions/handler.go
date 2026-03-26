@@ -19,6 +19,7 @@ func getSupportedAPIs() []APIVersion {
 		{75, 0, 0}, // DescribeTopicPartitions
 		{1, 0, 16}, // Fetch
 		{0, 0, 11}, // Produce
+		{3, 0, 12}, // Metadata
 	}
 }
 

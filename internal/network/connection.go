@@ -1,13 +1,15 @@
 package network
 
 import (
-	"fmt"
+	"log/slog"
 	"net"
 
 	apiversions "github.com/codecrafters-io/kafka-starter-go/internal/api/api_versions"
 	describetopics "github.com/codecrafters-io/kafka-starter-go/internal/api/describe_topics"
 	"github.com/codecrafters-io/kafka-starter-go/internal/api/fetch"
+	apimetadata "github.com/codecrafters-io/kafka-starter-go/internal/api/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/api/produce"
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
@@ -17,14 +19,14 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager) {
 	for {
 		requestHeader := protocol.NewRequestHeader()
 		if err := requestHeader.ReadFrom(conn); err != nil {
-			fmt.Println("Error reading request header: ", err)
+			logger.L.Debug("connection closed", "remote", conn.RemoteAddr(), "err", err)
 			return
 		}
 
 		// Parse the request into the appropriate type
 		request, err := protocol.ParseRequest(requestHeader)
 		if err != nil {
-			fmt.Printf("Error parsing request: %v\n", err)
+			logger.L.Error("failed to parse request", "api_key", requestHeader.GetAPIKey(), "err", err)
 			return
 		}
 
@@ -56,19 +58,24 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager) {
 			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
 			serializedResponse, err = response.Serialize()
 
+		case *protocol.MetadataRequest:
+			// Handle Metadata request (uses response header v1 — flexible)
+			body = apimetadata.BuildBody(req, metaMgr)
+			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
+			serializedResponse, err = response.Serialize()
+
 		default:
-			fmt.Printf("Unknown request type: %T\n", req)
+			logger.L.Warn("unhandled request type", "type", slog.AnyValue(req))
 			return
 		}
 
 		if err != nil {
-			fmt.Println("Error serializing response: ", err)
+			logger.L.Error("failed to serialize response", "err", err)
 			return
 		}
 
-		_, err = conn.Write(serializedResponse)
-		if err != nil {
-			fmt.Println("Error writing response: ", err)
+		if _, err = conn.Write(serializedResponse); err != nil {
+			logger.L.Error("failed to write response", "remote", conn.RemoteAddr(), "err", err)
 		}
 	}
 }

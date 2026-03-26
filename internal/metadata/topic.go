@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/google/uuid"
 )
 
@@ -57,7 +58,7 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 	// We store: relativeOffset INT32 + filePosition INT32 (sufficient for files < 4GB)
 	if indexErr := appendIndexEntry(logDir, int32(baseOffset), int32(filePos)); indexErr != nil {
 		// Non-fatal: index is a performance optimisation, not correctness-critical
-		fmt.Printf("Warning: failed to write index entry: %v\n", indexErr)
+		logger.L.Warn("failed to write index entry", "err", indexErr)
 	}
 
 	p.NextOffset++

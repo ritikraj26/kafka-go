@@ -28,8 +28,8 @@ func (e *Encoder) WriteInt64(val int64) {
 	binary.Write(e.buf, binary.BigEndian, val)
 }
 
-func (e *Encoder) WriteByte(val byte) {
-	e.buf.WriteByte(val)
+func (e *Encoder) WriteByte(val byte) error {
+	return e.buf.WriteByte(val)
 }
 
 // WriteCompactString writes a COMPACT_STRING (length+1 as varint, then UTF-8 bytes)

@@ -94,7 +94,8 @@ func writeKnownTopic(encoder *protocol.Encoder, topic *metadata.Topic) {
 	// partitions array (COMPACT_ARRAY)
 	encoder.WriteUnsignedVarint(uint64(len(topic.Partitions) + 1))
 
-	for _, partition := range topic.Partitions {
+	for i := range topic.Partitions {
+		partition := &topic.Partitions[i]
 		// error_code for partition: 0 (NO_ERROR)
 		encoder.WriteInt16(protocol.ErrNone)
 

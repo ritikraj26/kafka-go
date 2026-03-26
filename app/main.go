@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"os"
 	"strings"
 
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/network"
 )
@@ -26,7 +26,7 @@ func main() {
 
 	// Load existing topics from disk
 	if err := metaMgr.LoadTopicsFromDisk(logDir); err != nil {
-		fmt.Printf("Warning: Failed to load topics from disk: %v\n", err)
+		logger.L.Warn("failed to load topics from disk", "err", err)
 	}
 
 	// Start server with metadata manager

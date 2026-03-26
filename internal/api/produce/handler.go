@@ -1,8 +1,7 @@
 package produce
 
 import (
-	"fmt"
-
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
@@ -53,7 +52,7 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 						// AppendRecords locks the partition, writes to disk, advances NextOffset
 						offset, err := matchedPartition.AppendRecords(reqPartition.Records, matchedPartition.LogDir)
 						if err != nil {
-							fmt.Printf("Error writing records to disk: %v\n", err)
+							logger.L.Error("failed to write records to disk", "topic", reqTopic.Name, "partition", reqPartition.Index, "err", err)
 							errorCode = protocol.ErrUnknownTopicOrPartition
 						} else {
 							errorCode = protocol.ErrNone

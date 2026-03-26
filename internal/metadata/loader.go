@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/google/uuid"
 )
 
@@ -42,7 +43,8 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 	clusterMetadataPath := logDir + "/__cluster_metadata-0/00000000000000000000.log"
 	topicUUIDs, err := parseClusterMetadataForTopics(clusterMetadataPath, topicNames)
 	if err != nil {
-		fmt.Printf("Warning: Failed to parse cluster metadata: %v\n", err)
+		logger.L.Warn("failed to parse cluster metadata", "err", err)
+		// non-fatal — broker starts without UUIDs
 		topicUUIDs = make(map[string]uuid.UUID)
 	}
 
@@ -58,11 +60,11 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 		topicName, partitionIndex, err := parseTopicDirName(dirName)
 		if err != nil {
 			// Skip directories that don't match the pattern
-			fmt.Printf("Skipping directory %s: %v\n", dirName, err)
+			logger.L.Debug("skipping directory", "dir", dirName, "reason", err.Error())
 			continue
 		}
 
-		fmt.Printf("Parsed: topic=%s, partition=%d\n", topicName, partitionIndex)
+		logger.L.Debug("loaded partition", "topic", topicName, "partition", partitionIndex)
 
 		// Get or create topic entry
 		topic, exists := topicsFound[topicName]
@@ -71,9 +73,9 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 			topicID, hasUUID := topicUUIDs[topicName]
 			if !hasUUID {
 				topicID = uuid.New()
-				fmt.Printf("Warning: No UUID found for topic %s, generated new one: %s\n", topicName, topicID)
+				logger.L.Warn("no UUID found for topic, generated new one", "topic", topicName, "uuid", topicID)
 			} else {
-				fmt.Printf("Found UUID for topic %s: %s\n", topicName, topicID)
+				logger.L.Debug("resolved topic UUID", "topic", topicName, "uuid", topicID)
 			}
 
 			topic = &Topic{

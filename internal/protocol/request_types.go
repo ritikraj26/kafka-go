@@ -84,6 +84,16 @@ func (r *FetchRequest) GetAPIKey() int16 {
 	return APIKeyFetch
 }
 
+// MetadataRequest request (api_key=3)
+// TopicNames is nil when the client requests metadata for all topics.
+type MetadataRequest struct {
+	Header     *RequestHeader
+	TopicNames []string // nil = all topics
+}
+
+func (r *MetadataRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *MetadataRequest) GetAPIKey() int16          { return APIKeyMetadata }
+
 // DescribeTopicPartitionsRequest request (api_key=75) - PLACEHOLDER
 type DescribeTopicPartitionsRequest struct {
 	Header     *RequestHeader
@@ -110,6 +120,8 @@ func ParseRequest(header *RequestHeader) (Request, error) {
 		return ParseFetchRequest(header)
 	case APIKeyDescribeTopicPartitions:
 		return ParseDescribeTopicPartitionsRequest(header)
+	case APIKeyMetadata:
+		return ParseMetadataRequest(header)
 	default:
 		return nil, fmt.Errorf("unknown API key: %d", header.GetAPIKey())
 	}
@@ -571,4 +583,50 @@ func ParseDescribeTopicPartitionsRequest(header *RequestHeader) (*DescribeTopicP
 		Header:     header,
 		TopicNames: topicNames,
 	}, nil
+}
+
+// ParseMetadataRequest parses a Metadata request (v1–v12).
+// The topic list may be empty (nil) meaning the client wants all topics.
+func ParseMetadataRequest(header *RequestHeader) (*MetadataRequest, error) {
+	decoder := NewDecoder(header.GetBody())
+
+	// Flexible request header fields (same pattern as other v9+ APIs)
+	// 1. cursor byte
+	if _, err := decoder.ReadByte(); err != nil {
+		return &MetadataRequest{Header: header}, nil
+	}
+	// 2. client software name (length-prefixed)
+	lengthByte, err := decoder.ReadByte()
+	if err != nil {
+		return &MetadataRequest{Header: header}, nil
+	}
+	for i := 0; i < int(lengthByte); i++ {
+		if _, err := decoder.ReadByte(); err != nil {
+			return &MetadataRequest{Header: header}, nil
+		}
+	}
+	// 3. TAG_BUFFER
+	if _, err := decoder.ReadByte(); err != nil {
+		return &MetadataRequest{Header: header}, nil
+	}
+
+	// topics COMPACT_ARRAY (null or empty = all topics)
+	arrayLen, err := decoder.ReadUnsignedVarint()
+	if err != nil || arrayLen == 0 {
+		// null array → all topics
+		return &MetadataRequest{Header: header, TopicNames: nil}, nil
+	}
+
+	var topicNames []string
+	actualLen := arrayLen - 1
+	for i := uint64(0); i < actualLen; i++ {
+		name, err := decoder.ReadCompactString()
+		if err != nil {
+			break
+		}
+		topicNames = append(topicNames, name)
+		decoder.ReadByte() // TAG_BUFFER per entry
+	}
+
+	return &MetadataRequest{Header: header, TopicNames: topicNames}, nil
 }

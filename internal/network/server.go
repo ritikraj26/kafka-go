@@ -1,10 +1,10 @@
 package network
 
 import (
-	"fmt"
 	"net"
 	"os"
 
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 )
 
@@ -12,16 +12,16 @@ import (
 func Start(metaMgr *metadata.Manager) {
 	listener, err := net.Listen("tcp", "0.0.0.0:9092")
 	if err != nil {
-		fmt.Println("Failed to bind to port 9092")
+		logger.L.Error("failed to bind to port 9092", "err", err)
 		os.Exit(1)
 	}
 	defer listener.Close()
-	fmt.Println("Listening on port 9092...")
+	logger.L.Info("broker listening", "port", 9092)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection: ", err)
+			logger.L.Error("failed to accept connection", "err", err)
 			continue
 		}
 
