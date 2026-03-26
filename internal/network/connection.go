@@ -1,6 +1,7 @@
 package network
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 
@@ -19,7 +20,7 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager) {
 	for {
 		requestHeader := protocol.NewRequestHeader()
 		if err := requestHeader.ReadFrom(conn); err != nil {
-			logger.L.Debug("connection closed", "remote", conn.RemoteAddr(), "err", err)
+			fmt.Println("Error reading request header: ", err)
 			return
 		}
 
@@ -70,12 +71,13 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager) {
 		}
 
 		if err != nil {
-			logger.L.Error("failed to serialize response", "err", err)
+			fmt.Println("Error serializing response: ", err)
 			return
 		}
 
-		if _, err = conn.Write(serializedResponse); err != nil {
-			logger.L.Error("failed to write response", "remote", conn.RemoteAddr(), "err", err)
+		_, err = conn.Write(serializedResponse)
+		if err != nil {
+			fmt.Println("Error writing response: ", err)
 		}
 	}
 }

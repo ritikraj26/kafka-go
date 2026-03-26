@@ -2,20 +2,24 @@ package metadata
 
 import (
 	"sync"
+
+	"github.com/codecrafters-io/kafka-starter-go/internal/schema"
 )
 
 // Manager holds cluster-level information and topic metadata
 type Manager struct {
-	mu     sync.RWMutex
-	topics map[string]*Topic // topic_name -> Topic
-	logDir string            // Base directory for log files
+	mu      sync.RWMutex
+	topics  map[string]*Topic // topic_name -> Topic
+	logDir  string            // Base directory for log files
+	Schemas *schema.Registry  // AI schema registry (topic -> inferred schema)
 }
 
 // NewManager creates a new metadata manager
 func NewManager() *Manager {
 	return &Manager{
-		topics: make(map[string]*Topic),
-		logDir: "/tmp/kraft-broker-logs", // Default
+		topics:  make(map[string]*Topic),
+		logDir:  "/tmp/kraft-broker-logs", // Default
+		Schemas: schema.NewRegistry(),
 	}
 }
 
@@ -70,6 +74,24 @@ func (m *Manager) TopicExists(name string) bool {
 
 	_, exists := m.topics[name]
 	return exists
+}
+
+// GetOrCreateDLQTopic returns the dead-letter-queue topic for the given source
+// topic, creating it (with 1 partition) if it does not yet exist.
+// The DLQ topic's partition LogDir is set from the manager's logDir so that
+// AppendRecords can write to disk immediately.
+func (m *Manager) GetOrCreateDLQTopic(sourceTopic string) *Topic {
+	dlqName := sourceTopic + ".dlq"
+	if t := m.GetTopic(dlqName); t != nil {
+		return t
+	}
+	t := m.CreateTopic(dlqName, 1)
+	// Set LogDir for the single partition so disk writes work immediately.
+	logDir := m.GetLogDir()
+	if logDir != "" && len(t.Partitions) > 0 {
+		t.Partitions[0].LogDir = logDir + "/" + dlqName + "-0"
+	}
+	return t
 }
 
 // GetTopicByID retrieves a topic by UUID, returns nil if not found
