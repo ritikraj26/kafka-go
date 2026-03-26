@@ -22,6 +22,12 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 	topicCount := len(req.Topics)
 	encoder.WriteUnsignedVarint(uint64(topicCount + 1))
 
+	maxBytes := int(req.MaxBytes)
+	if maxBytes <= 0 {
+		maxBytes = 1<<31 - 1
+	}
+	bytesWritten := 0
+
 	// Write each topic response
 	for _, reqTopic := range req.Topics {
 		// topic_id (UUID - 16 bytes)
@@ -102,9 +108,14 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 
 				// Seek to the requested offset via index, then read from that byte position
 				var recordBatches []byte
-				if reqPart.FetchOffset < highWatermark {
+				if reqPart.FetchOffset < highWatermark && bytesWritten < maxBytes {
 					bytePos, _ := partition.SeekToOffset(reqPart.FetchOffset)
 					recordBatches, _ = metadata.ReadPartitionLogFrom(partition, bytePos)
+					remaining := maxBytes - bytesWritten
+					if len(recordBatches) > remaining {
+						recordBatches = recordBatches[:remaining]
+					}
+					bytesWritten += len(recordBatches)
 				}
 
 				if len(recordBatches) == 0 {
