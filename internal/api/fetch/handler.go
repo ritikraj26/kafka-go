@@ -1,78 +1,42 @@
 package fetch
 
 import (
+	"time"
+
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
 
-// BuildBody builds a Fetch v16 response
-func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
-	encoder := protocol.NewEncoder()
+type partResult struct {
+	index   int32
+	errCode int16
+	hwm     int64
+	records []byte
+}
 
-	// throttle_time_ms (INT32): 0
-	encoder.WriteInt32(0)
+type topicResult struct {
+	id           [16]byte
+	unknownTopic bool
+	parts        []partResult
+}
 
-	// error_code (INT16): 0 (NO_ERROR)
-	encoder.WriteInt16(protocol.ErrNone)
-
-	// session_id (INT32): echo back from request
-	encoder.WriteInt32(req.SessionID)
-
-	// responses (COMPACT_ARRAY)
-	topicCount := len(req.Topics)
-	encoder.WriteUnsignedVarint(uint64(topicCount + 1))
-
-	maxBytes := int(req.MaxBytes)
-	if maxBytes <= 0 {
-		maxBytes = 1<<31 - 1
-	}
+// collectData reads record batches for all requested partitions, respecting maxBytes.
+// Returns the collected results and total number of record bytes gathered.
+func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes int) ([]topicResult, int) {
+	totalBytes := 0
 	bytesWritten := 0
+	results := make([]topicResult, 0, len(req.Topics))
 
-	// Write each topic response
 	for _, reqTopic := range req.Topics {
-		// topic_id (UUID - 16 bytes)
-		encoder.WriteUUID(reqTopic.TopicID)
-
-		// Check if topic exists
+		tr := topicResult{id: reqTopic.TopicID}
 		topic := metaMgr.GetTopicByID(reqTopic.TopicID)
 
 		if topic == nil {
-			// Unknown topic - return error in partition response
-			// partitions (COMPACT_ARRAY) - 1 partition with error
-			encoder.WriteUnsignedVarint(2) // 1 partition + 1
-
-			// partition_index (INT32): 0
-			encoder.WriteInt32(0)
-
-			// error_code (INT16): 100 (UNKNOWN_TOPIC_ID)
-			encoder.WriteInt16(protocol.ErrUnknownTopicID)
-
-			// high_watermark (INT64): -1
-			encoder.WriteInt64(-1)
-
-			// last_stable_offset (INT64): -1
-			encoder.WriteInt64(-1)
-
-			// log_start_offset (INT64): -1
-			encoder.WriteInt64(-1)
-
-			// aborted_transactions (COMPACT_ARRAY): null
-			encoder.WriteByte(0x00)
-
-			// preferred_read_replica (INT32): -1
-			encoder.WriteInt32(-1)
-
-			// records (COMPACT_BYTES): null
-			encoder.WriteByte(0x00)
-
-			// TAG_BUFFER for partition
-			encoder.WriteTagBuffer()
+			tr.unknownTopic = true
+			tr.parts = []partResult{{index: 0, errCode: protocol.ErrUnknownTopicID, hwm: -1}}
 		} else {
-			// Known topic — respond per requested partition
-			encoder.WriteUnsignedVarint(uint64(len(reqTopic.Partitions) + 1))
-
 			for _, reqPart := range reqTopic.Partitions {
-				// Find the partition in metadata
+				pr := partResult{index: reqPart.PartitionIndex}
 				var partition *metadata.Partition
 				for i := range topic.Partitions {
 					if topic.Partitions[i].Index == reqPart.PartitionIndex {
@@ -80,60 +44,109 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 						break
 					}
 				}
-
-				// partition_index (INT32)
-				encoder.WriteInt32(reqPart.PartitionIndex)
-
 				if partition == nil {
-					// Partition not found
-					encoder.WriteInt16(protocol.ErrUnknownTopicOrPartition)
-					encoder.WriteInt64(-1)  // high_watermark
+					pr.errCode = protocol.ErrUnknownTopicOrPartition
+					pr.hwm = -1
+				} else {
+					pr.hwm = partition.NextOffset
+					pr.errCode = protocol.ErrNone
+					if reqPart.FetchOffset < partition.NextOffset && bytesWritten < maxBytes {
+						bytePos, _ := partition.SeekToOffset(reqPart.FetchOffset)
+						records, _ := metadata.ReadPartitionLogFrom(partition, bytePos)
+						remaining := maxBytes - bytesWritten
+						if len(records) > remaining {
+							records = records[:remaining]
+						}
+						pr.records = records
+						bytesWritten += len(records)
+						totalBytes += len(records)
+					}
+				}
+				tr.parts = append(tr.parts, pr)
+			}
+		}
+		results = append(results, tr)
+	}
+	return results, totalBytes
+}
+
+// BuildBody builds a Fetch v16 response, honouring MaxBytes, MinBytes, and MaxWaitMs.
+func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
+	maxBytes := int(req.MaxBytes)
+	if maxBytes <= 0 {
+		maxBytes = 1<<31 - 1
+	}
+	minBytes := int(req.MinBytes)
+	if minBytes <= 0 {
+		minBytes = 1
+	}
+	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
+
+	// Poll until we have at least minBytes of data or the deadline is exceeded.
+	var topics []topicResult
+	var totalBytes int
+	for {
+		topics, totalBytes = collectData(req, metaMgr, maxBytes)
+		if totalBytes >= minBytes || !time.Now().Before(deadline) {
+			break
+		}
+		remaining := time.Until(deadline)
+		sleep := 5 * time.Millisecond
+		if sleep > remaining {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+	}
+
+	encoder := protocol.NewEncoder()
+	encoder.WriteInt32(0)                                // throttle_time_ms
+	encoder.WriteInt16(protocol.ErrNone)                 // error_code
+	encoder.WriteInt32(req.SessionID)                    // session_id
+	encoder.WriteUnsignedVarint(uint64(len(topics) + 1)) // responses COMPACT_ARRAY
+
+	for _, tr := range topics {
+		encoder.WriteUUID(tr.id)
+
+		if tr.unknownTopic {
+			encoder.WriteUnsignedVarint(2) // 1 partition + 1
+			encoder.WriteInt32(0)
+			encoder.WriteInt16(protocol.ErrUnknownTopicID)
+			encoder.WriteInt64(-1)  // high_watermark
+			encoder.WriteInt64(-1)  // last_stable_offset
+			encoder.WriteInt64(-1)  // log_start_offset
+			encoder.WriteByte(0x00) // aborted_transactions null
+			encoder.WriteInt32(-1)  // preferred_read_replica
+			encoder.WriteByte(0x00) // records null
+			encoder.WriteTagBuffer()
+		} else {
+			encoder.WriteUnsignedVarint(uint64(len(tr.parts) + 1))
+			for _, pr := range tr.parts {
+				encoder.WriteInt32(pr.index)
+				encoder.WriteInt16(pr.errCode)
+				encoder.WriteInt64(pr.hwm) // high_watermark
+				if pr.errCode != protocol.ErrNone {
 					encoder.WriteInt64(-1)  // last_stable_offset
 					encoder.WriteInt64(-1)  // log_start_offset
 					encoder.WriteByte(0x00) // aborted_transactions null
 					encoder.WriteInt32(-1)  // preferred_read_replica
 					encoder.WriteByte(0x00) // records null
-					encoder.WriteTagBuffer()
-					continue
-				}
-
-				highWatermark := partition.NextOffset
-
-				encoder.WriteInt16(protocol.ErrNone)
-				encoder.WriteInt64(highWatermark) // high_watermark
-				encoder.WriteInt64(highWatermark) // last_stable_offset
-				encoder.WriteInt64(0)             // log_start_offset
-				encoder.WriteByte(0x00)           // aborted_transactions null
-				encoder.WriteInt32(-1)            // preferred_read_replica
-
-				// Seek to the requested offset via index, then read from that byte position
-				var recordBatches []byte
-				if reqPart.FetchOffset < highWatermark && bytesWritten < maxBytes {
-					bytePos, _ := partition.SeekToOffset(reqPart.FetchOffset)
-					recordBatches, _ = metadata.ReadPartitionLogFrom(partition, bytePos)
-					remaining := maxBytes - bytesWritten
-					if len(recordBatches) > remaining {
-						recordBatches = recordBatches[:remaining]
-					}
-					bytesWritten += len(recordBatches)
-				}
-
-				if len(recordBatches) == 0 {
-					encoder.WriteByte(0x00) // null records
 				} else {
-					encoder.WriteCompactBytes(recordBatches)
+					encoder.WriteInt64(pr.hwm) // last_stable_offset
+					encoder.WriteInt64(0)      // log_start_offset
+					encoder.WriteByte(0x00)    // aborted_transactions null
+					encoder.WriteInt32(-1)     // preferred_read_replica
+					if len(pr.records) == 0 {
+						encoder.WriteByte(0x00)
+					} else {
+						encoder.WriteCompactBytes(pr.records)
+					}
 				}
-
 				encoder.WriteTagBuffer()
 			}
 		}
-
-		// TAG_BUFFER for topic
 		encoder.WriteTagBuffer()
 	}
 
-	// TAG_BUFFER for response body
 	encoder.WriteTagBuffer()
-
 	return encoder.Bytes()
 }
