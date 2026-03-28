@@ -3,9 +3,11 @@ package metadata
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/google/uuid"
@@ -31,8 +33,94 @@ type Partition struct {
 	LogDir          string // Path to the partition's log directory
 
 	// Offset tracking
-	NextOffset int64      // Next offset to assign to an incoming RecordBatch
-	mu         sync.Mutex // Serializes writes to this partition's log file
+	NextOffset    int64 // Next offset to assign to an incoming RecordBatch
+	HighWatermark int64 // Highest offset replicated to all ISR members
+	LogEndOffset  int64 // = NextOffset (alias for replication clarity)
+	mu            sync.Mutex
+	hwCond        *sync.Cond // signalled when HighWatermark advances
+
+	// Per-replica LEO for replication (broker_id -> LEO)
+	ReplicaLEO      map[int32]int64
+	ReplicaLastSeen map[int32]int64 // broker_id -> unix millis of last fetch
+}
+
+// initCond ensures hwCond is initialised (idempotent, call under mu or before sharing).
+func (p *Partition) initCond() {
+	if p.hwCond == nil {
+		p.hwCond = sync.NewCond(&p.mu)
+	}
+}
+
+// GetHighWatermark returns the current high watermark (thread-safe).
+func (p *Partition) GetHighWatermark() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.HighWatermark
+}
+
+// GetLogEndOffset returns the current log end offset (thread-safe).
+func (p *Partition) GetLogEndOffset() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.LogEndOffset
+}
+
+// WaitForHighWatermark blocks until HW >= target or timeout expires.
+// Returns true if the target was reached, false on timeout.
+func (p *Partition) WaitForHighWatermark(target int64, timeout time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.initCond()
+
+	if p.HighWatermark >= target {
+		return true
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	// Spawn a goroutine that broadcasts after timeout to unblock Wait.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-time.After(timeout):
+			p.hwCond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	for p.HighWatermark < target {
+		p.hwCond.Wait()
+		if p.HighWatermark >= target {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
+	return p.HighWatermark >= target
+}
+
+// UpdateReplicaState sets a replica's LEO and last-seen timestamp (thread-safe).
+func (p *Partition) UpdateReplicaState(brokerID int32, leo int64, lastSeenMs int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ReplicaLEO == nil {
+		p.ReplicaLEO = make(map[int32]int64)
+	}
+	if p.ReplicaLastSeen == nil {
+		p.ReplicaLastSeen = make(map[int32]int64)
+	}
+	p.ReplicaLEO[brokerID] = leo
+	p.ReplicaLastSeen[brokerID] = lastSeenMs
+}
+
+// RunUnderLock executes fn while holding the partition lock.
+// Use for compound read-modify-write operations that need atomicity.
+func (p *Partition) RunUnderLock(fn func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fn()
 }
 
 // AppendRecords writes records to the partition's log file under its mutex,
@@ -48,7 +136,7 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 		filePos = fi.Size()
 	}
 
-	if err = writeRecords(logDir, records); err != nil {
+	if err = writeRecords(logDir, records, p.NextOffset); err != nil {
 		return -1, err
 	}
 
@@ -62,6 +150,17 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 	}
 
 	p.NextOffset++
+	p.LogEndOffset = p.NextOffset
+
+	// Update leader's own replica LEO
+	if p.ReplicaLEO == nil {
+		p.ReplicaLEO = make(map[int32]int64)
+	}
+	p.ReplicaLEO[p.LeaderID] = p.LogEndOffset
+
+	// Advance HW — if leader is the only ISR member, HW advances immediately
+	p.AdvanceHighWatermark()
+
 	return baseOffset, nil
 }
 
@@ -77,8 +176,10 @@ func appendIndexEntry(logDir string, relativeOffset int32, filePos int32) error 
 	entry := make([]byte, 8)
 	binary.BigEndian.PutUint32(entry[0:4], uint32(relativeOffset))
 	binary.BigEndian.PutUint32(entry[4:8], uint32(filePos))
-	_, err = f.Write(entry)
-	return err
+	if _, err = f.Write(entry); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // SeekToOffset binary-searches the sparse index to find the file byte position
@@ -114,12 +215,95 @@ func (p *Partition) SeekToOffset(targetOffset int64) (int64, error) {
 	return result, nil
 }
 
-// writeRecords appends raw record batch bytes to the partition's log file.
-func writeRecords(logDir string, records []byte) error {
+// AppendReplicaRecords writes fetched record data to a follower's log directory.
+// Unlike AppendRecords this does NOT advance NextOffset (that tracks the leader's state).
+// It only writes the raw bytes to disk and updates the follower's local LEO.
+func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(records) == 0 {
+		return nil
+	}
+	return writeRecords(replicaLogDir, records, 0)
+}
+
+// AdvanceHighWatermark recalculates HW as min(LEO) across all ISR replicas.
+// Caller must hold p.mu. Broadcasts hwCond if HW advances.
+func (p *Partition) AdvanceHighWatermark() {
+	if len(p.ISRNodes) == 0 {
+		return
+	}
+	if p.ReplicaLEO == nil {
+		return
+	}
+	minLEO := int64(math.MaxInt64)
+	found := false
+	for _, id := range p.ISRNodes {
+		leo, ok := p.ReplicaLEO[id]
+		if !ok {
+			leo = 0
+		}
+		found = true
+		if leo < minLEO {
+			minLEO = leo
+		}
+	}
+	if !found {
+		return
+	}
+	if minLEO > p.HighWatermark {
+		p.HighWatermark = minLEO
+		p.initCond()
+		p.hwCond.Broadcast()
+	}
+}
+
+// MaxSegmentBytes is the maximum size of a single log segment file before rolling.
+var MaxSegmentBytes int64 = 1 << 30 // 1 GB
+
+// activeSegmentName returns the name of the active (latest) .log segment in logDir.
+func activeSegmentName(logDir string) string {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return "00000000000000000000.log"
+	}
+	latest := ""
+	for _, e := range entries {
+		name := e.Name()
+		if filepath.Ext(name) == ".log" && name > latest {
+			latest = name
+		}
+	}
+	if latest == "" {
+		return "00000000000000000000.log"
+	}
+	return latest
+}
+
+// segmentNameForOffset formats a segment file name from a base offset.
+func segmentNameForOffset(baseOffset int64) string {
+	return fmt.Sprintf("%020d.log", baseOffset)
+}
+
+// writeRecords appends raw record batch bytes to the partition's active log segment.
+// Rolls to a new segment if the active file exceeds MaxSegmentBytes.
+// Calls fsync for durability.
+func writeRecords(logDir string, records []byte, nextOffset int64) error {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return fmt.Errorf("failed to create log directory: %w", err)
 	}
-	logFile := filepath.Join(logDir, "00000000000000000000.log")
+
+	segName := activeSegmentName(logDir)
+	logFile := filepath.Join(logDir, segName)
+
+	// Roll to a new segment if the current one exceeds the size limit
+	if fi, err := os.Stat(logFile); err == nil && fi.Size() >= MaxSegmentBytes {
+		newName := segmentNameForOffset(nextOffset)
+		logger.L.Info("rolling log segment", "dir", logDir, "oldSegment", segName, "newSegment", newName)
+		logFile = filepath.Join(logDir, newName)
+	}
+
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
@@ -128,11 +312,16 @@ func writeRecords(logDir string, records []byte) error {
 	if _, err = f.Write(records); err != nil {
 		return fmt.Errorf("failed to write records: %w", err)
 	}
+	if err = f.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync log file: %w", err)
+	}
 	return nil
 }
 
 // create a new topic with the given name and ID
-func NewTopic(name string, numPartitions int) *Topic {
+// brokerIDs and replicationFactor control replica placement. If brokerIDs is
+// nil or empty, falls back to a single-broker default (broker 1).
+func NewTopic(name string, numPartitions int, brokerIDs ...[]int32) *Topic {
 	topic := &Topic{
 		Name:       name,
 		ID:         uuid.New(),
@@ -140,16 +329,33 @@ func NewTopic(name string, numPartitions int) *Topic {
 		Partitions: make([]Partition, numPartitions),
 	}
 
-	// initiallze partitions with default values
+	// Determine broker list
+	var ids []int32
+	if len(brokerIDs) > 0 && len(brokerIDs[0]) > 0 {
+		ids = brokerIDs[0]
+	} else {
+		ids = []int32{1}
+	}
+
+	// initialise partitions with round-robin replica assignment
 	for i := 0; i < numPartitions; i++ {
+		// Pick replicas starting at (i % len(ids)), wrapping around
+		rf := len(ids)
+		replicas := make([]int32, rf)
+		for r := 0; r < rf; r++ {
+			replicas[r] = ids[(i+r)%len(ids)]
+		}
+
 		topic.Partitions[i] = Partition{
 			Index:           int32(i),
-			LeaderID:        1,          // Default broker ID
-			ReplicaNodes:    []int32{1}, // Single replica on broker 1
-			ISRNodes:        []int32{1}, // Replica is in-sync
-			OfflineReplicas: []int32{},  // No offline replicas
+			LeaderID:        replicas[0],
+			ReplicaNodes:    replicas,
+			ISRNodes:        append([]int32{}, replicas...), // initially all in-sync
+			OfflineReplicas: []int32{},
 			LeaderEpoch:     0,
 			PartitionEpoch:  0,
+			ReplicaLEO:      make(map[int32]int64),
+			ReplicaLastSeen: make(map[int32]int64),
 		}
 	}
 

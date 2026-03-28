@@ -40,6 +40,48 @@ func (d *Decoder) ReadCompactString() (string, error) {
 	return str, nil
 }
 
+// ReadString reads a standard STRING (INT16 length-prefixed, then UTF-8 bytes).
+// Used by v0 non-flexible APIs.
+func (d *Decoder) ReadString() (string, error) {
+	length, err := d.ReadInt16()
+	if err != nil {
+		return "", err
+	}
+	if length < 0 {
+		return "", nil // null string
+	}
+	if d.pos+int(length) > len(d.data) {
+		return "", io.ErrUnexpectedEOF
+	}
+	str := string(d.data[d.pos : d.pos+int(length)])
+	d.pos += int(length)
+	return str, nil
+}
+
+// ReadBytes reads standard BYTES (INT32 length-prefixed, then raw bytes).
+// Used by v0 non-flexible APIs.
+func (d *Decoder) ReadBytes() ([]byte, error) {
+	length, err := d.ReadInt32()
+	if err != nil {
+		return nil, err
+	}
+	if length < 0 {
+		return nil, nil // null bytes
+	}
+	if d.pos+int(length) > len(d.data) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	result := make([]byte, length)
+	copy(result, d.data[d.pos:d.pos+int(length)])
+	d.pos += int(length)
+	return result, nil
+}
+
+// ReadArrayLen reads an INT32 array count for standard (non-compact) arrays.
+func (d *Decoder) ReadArrayLen() (int32, error) {
+	return d.ReadInt32()
+}
+
 // ReadCompactNullableString reads a COMPACT_NULLABLE_STRING
 // Returns nil pointer for null, otherwise pointer to string
 func (d *Decoder) ReadCompactNullableString() (*string, error) {

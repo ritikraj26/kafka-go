@@ -1,10 +1,11 @@
 package produce
 
 import (
+	"time"
+
 	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
-	"github.com/codecrafters-io/kafka-starter-go/internal/schema"
 	"github.com/codecrafters-io/kafka-starter-go/internal/storage"
 )
 
@@ -92,8 +93,13 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 							} else {
 								errorCode = protocol.ErrNone
 								baseOffset = offset
-								logAppendTime = -1
+								logAppendTime = time.Now().UnixMilli()
 								logStartOffset = 0
+
+								// acks=-1: wait for all ISR replicas to catch up (HW >= baseOffset+1)
+								if req.Acks == -1 {
+									waitForHW(matchedPartition, baseOffset+1, time.Duration(req.TimeoutMs)*time.Millisecond)
+								}
 							}
 						}
 					} else {
@@ -156,19 +162,9 @@ func validateRecords(records []byte, topic string, metaMgr *metadata.Manager) ([
 		return nil, false
 	}
 
-	// No schema yet — infer from first value, register, allow the whole batch through.
+	// No schema yet — kick off async inference and allow the whole batch through.
 	if reg.Get(topic) == nil {
-		s, err := schema.InferWithOllama(values[0])
-		if err != nil || s == nil {
-			// Ollama unavailable — fall back to local inference
-			s, err = schema.InferFromJSON(values[0])
-		}
-		if s != nil && err == nil {
-			reg.Register(topic, s)
-			logger.L.Info("schema inferred for topic", "topic", topic, "fields", s.Fields)
-		} else {
-			logger.L.Warn("could not infer schema for topic", "topic", topic)
-		}
+		reg.InferAsync(topic, values[0])
 		return nil, false
 	}
 
@@ -196,4 +192,10 @@ func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager) 
 			logger.L.Error("failed to write to DLQ", "topic", sourceTopic+".dlq", "err", err)
 		}
 	}
+}
+
+// waitForHW uses sync.Cond-based waiting for efficient HW advancement.
+// Blocks until the partition's HighWatermark >= targetHW or timeout expires.
+func waitForHW(p *metadata.Partition, targetHW int64, timeout time.Duration) {
+	p.WaitForHighWatermark(targetHW, timeout)
 }
