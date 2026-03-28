@@ -20,14 +20,6 @@ func getSupportedAPIs() []APIVersion {
 		{1, 0, 16}, // Fetch
 		{0, 0, 11}, // Produce
 		{3, 0, 12}, // Metadata
-		{2, 0, 1},  // ListOffsets
-		{8, 0, 2},  // OffsetCommit
-		{9, 0, 1},  // OffsetFetch
-		{10, 0, 0}, // FindCoordinator
-		{11, 0, 0}, // JoinGroup
-		{12, 0, 0}, // Heartbeat
-		{13, 0, 0}, // LeaveGroup
-		{14, 0, 0}, // SyncGroup
 	}
 }
 

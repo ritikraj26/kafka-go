@@ -1,21 +1,17 @@
 package metadata
 
 import (
-	"fmt"
 	"sync"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
 	"github.com/codecrafters-io/kafka-starter-go/internal/schema"
 )
 
 // Manager holds cluster-level information and topic metadata
 type Manager struct {
-	mu                sync.RWMutex
-	topics            map[string]*Topic // topic_name -> Topic
-	logDir            string            // Base directory for log files
-	Schemas           *schema.Registry  // AI schema registry (topic -> inferred schema)
-	Brokers           *broker.Registry  // Cluster broker registry
-	ReplicationFactor int               // Default replication factor for new topics
+	mu      sync.RWMutex
+	topics  map[string]*Topic // topic_name -> Topic
+	logDir  string            // Base directory for log files
+	Schemas *schema.Registry  // AI schema registry (topic -> inferred schema)
 }
 
 // NewManager creates a new metadata manager
@@ -41,33 +37,12 @@ func (m *Manager) GetLogDir() string {
 	return m.logDir
 }
 
-// BrokerLogDir returns the per-broker log directory: {baseLogDir}/broker-{id}/
-func (m *Manager) BrokerLogDir(brokerID int32) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return fmt.Sprintf("%s/broker-%d", m.logDir, brokerID)
-}
-
-// PartitionLogDir returns the log directory for a specific partition owned by a broker.
-func (m *Manager) PartitionLogDir(brokerID int32, topicName string, partitionIndex int32) string {
-	return fmt.Sprintf("%s/%s-%d", m.BrokerLogDir(brokerID), topicName, partitionIndex)
-}
-
 // CreateTopic creates a new topic with the given name and number of partitions
 func (m *Manager) CreateTopic(name string, numPartitions int) *Topic {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var brokerIDs []int32
-	if m.Brokers != nil {
-		brokerIDs = m.Brokers.IDs()
-	}
-	topic := NewTopic(name, numPartitions, brokerIDs)
-	// Set each partition's LogDir based on its leader
-	for i := range topic.Partitions {
-		p := &topic.Partitions[i]
-		p.LogDir = fmt.Sprintf("%s/broker-%d/%s-%d", m.logDir, p.LeaderID, name, p.Index)
-	}
+	topic := NewTopic(name, numPartitions)
 	m.topics[name] = topic
 	return topic
 }

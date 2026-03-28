@@ -42,38 +42,6 @@ func (e *Encoder) WriteCompactString(s string) {
 	e.buf.WriteString(s)
 }
 
-// WriteString writes a standard STRING (INT16 length-prefixed, then UTF-8 bytes).
-// Used by v0 non-flexible APIs.
-func (e *Encoder) WriteString(s string) {
-	binary.Write(e.buf, binary.BigEndian, int16(len(s)))
-	e.buf.WriteString(s)
-}
-
-// WriteNullableString writes a NULLABLE_STRING (INT16 length, -1 for null).
-func (e *Encoder) WriteNullableString(s *string) {
-	if s == nil {
-		binary.Write(e.buf, binary.BigEndian, int16(-1))
-		return
-	}
-	e.WriteString(*s)
-}
-
-// WriteBytes writes standard BYTES (INT32 length-prefixed, then raw bytes).
-// Used by v0 non-flexible APIs.
-func (e *Encoder) WriteBytes(data []byte) {
-	if data == nil {
-		binary.Write(e.buf, binary.BigEndian, int32(-1))
-		return
-	}
-	binary.Write(e.buf, binary.BigEndian, int32(len(data)))
-	e.buf.Write(data)
-}
-
-// WriteArrayLen writes the INT32 count prefix for a standard (non-compact) array.
-func (e *Encoder) WriteArrayLen(n int) {
-	binary.Write(e.buf, binary.BigEndian, int32(n))
-}
-
 // WriteCompactBytes writes COMPACT_BYTES (length+1 as varint, then raw bytes)
 func (e *Encoder) WriteCompactBytes(data []byte) {
 	e.WriteUnsignedVarint(uint64(len(data) + 1))

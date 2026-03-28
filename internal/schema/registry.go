@@ -26,9 +26,8 @@ type SimpleSchema struct {
 
 // Registry is a thread-safe store of topic → SimpleSchema.
 type Registry struct {
-	mu       sync.RWMutex
-	schemas  map[string]*SimpleSchema
-	inflight sync.Map // topic → struct{}: deduplicates in-progress async inferences
+	mu      sync.RWMutex
+	schemas map[string]*SimpleSchema
 }
 
 // NewRegistry creates an empty Registry.
@@ -121,25 +120,4 @@ func checkType(field string, val any, expected FieldType) error {
 		return fmt.Errorf("field %q: expected %s, got %s", field, expected, actual)
 	}
 	return nil
-}
-
-// InferAsync kicks off schema inference in a background goroutine.
-// Uses sync.Map to ensure only one inference runs per topic.
-func (r *Registry) InferAsync(topic string, payload []byte) {
-	if _, loaded := r.inflight.LoadOrStore(topic, struct{}{}); loaded {
-		return // inference already in progress
-	}
-	// Copy payload to prevent races on the caller's buffer.
-	buf := make([]byte, len(payload))
-	copy(buf, payload)
-	go func() {
-		defer r.inflight.Delete(topic)
-		s, err := InferWithOllama(buf)
-		if err != nil || s == nil {
-			s, err = InferFromJSON(buf)
-		}
-		if s != nil && err == nil {
-			r.Register(topic, s)
-		}
-	}()
 }
