@@ -5,12 +5,17 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
+	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
 	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 	"github.com/codecrafters-io/kafka-starter-go/internal/network"
+	"github.com/codecrafters-io/kafka-starter-go/internal/replication"
 )
 
 func main() {
@@ -18,8 +23,28 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Broker configuration from env (defaults: 3 simulated brokers, ID=1, RF=3)
+	brokerID := int32(envInt("BROKER_ID", 1))
+	numBrokers := envInt("NUM_BROKERS", 3)
+	replicationFactor := envInt("REPLICATION_FACTOR", 3)
+
+	// Create broker registry with simulated brokers
+	reg := broker.NewRegistry(brokerID)
+	for i := 0; i < numBrokers; i++ {
+		reg.Register(&broker.Broker{
+			ID:   int32(i + 1),
+			Host: "localhost",
+			Port: int32(9092 + i),
+		})
+	}
+
 	// Create metadata manager
 	metaMgr := metadata.NewManager()
+	metaMgr.Brokers = reg
+	metaMgr.ReplicationFactor = replicationFactor
+
+	// Create consumer group coordinator
+	coord := coordinator.NewCoordinator()
 
 	// Parse server.properties if provided
 	logDir := "/tmp/kraft-broker-logs" // Default log directory
@@ -36,8 +61,22 @@ func main() {
 		logger.L.Warn("failed to load topics from disk", "err", err)
 	}
 
+	// Load committed offsets from disk
+	coord.LoadOffsets(logDir)
+
+	// Start follower replication simulation
+	fm := replication.NewFollowerManager(metaMgr, brokerID, 100*time.Millisecond)
+	fm.Start(ctx)
+
+	// Start ISR maintenance (evaluates ISR every 1s)
+	lagTimeMaxMs := int64(envInt("REPLICA_LAG_TIME_MAX_MS", 10000))
+	isrMgr := replication.NewISRManager(metaMgr, 1*time.Second, lagTimeMaxMs)
+	isrMgr.Start(ctx)
+
 	// Start server (blocks until ctx is cancelled)
-	network.Start(ctx, metaMgr)
+	network.Start(ctx, metaMgr, coord)
+	fm.Wait()
+	isrMgr.Wait()
 }
 
 // parseLogDir reads server.properties and extracts log.dirs property
@@ -65,4 +104,14 @@ func parseLogDir(propsFile string) (string, error) {
 	}
 
 	return "", scanner.Err()
+}
+
+// envInt reads an integer from an environment variable with a default.
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }

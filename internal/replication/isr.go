@@ -1,0 +1,85 @@
+package replication
+
+import (
+	"time"
+
+	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
+	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
+)
+
+// DefaultReplicaLagTimeMaxMs is the default max time (ms) a replica can lag before ISR removal.
+const DefaultReplicaLagTimeMaxMs int64 = 10000 // 10 seconds
+
+// UpdateISR checks each replica for a partition and shrinks/expands the ISR
+// based on how recently it fetched and whether its LEO has caught up.
+// lagTimeMaxMs controls the maximum allowed lag time in milliseconds.
+// Caller must hold p's lock.
+func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) {
+	if p.ReplicaLastSeen == nil || p.ReplicaLEO == nil {
+		return
+	}
+
+	nowMs := time.Now().UnixMilli()
+
+	var newISR []int32
+	for _, brokerID := range p.ReplicaNodes {
+		if brokerID == p.LeaderID {
+			// Leader is always in ISR
+			newISR = append(newISR, brokerID)
+			continue
+		}
+		lastSeen, ok := p.ReplicaLastSeen[brokerID]
+		if !ok {
+			// Never fetched — not in ISR
+			continue
+		}
+
+		lagTime := nowMs - lastSeen
+		if lagTime > lagTimeMaxMs {
+			// Replica hasn't fetched recently — remove from ISR
+			logger.L.Warn("shrinking ISR: replica lagging",
+				"broker", brokerID, "lagMs", lagTime)
+			continue
+		}
+		// Replica is in range — keep in ISR regardless of LEO
+		newISR = append(newISR, brokerID)
+	}
+
+	if len(newISR) != len(p.ISRNodes) {
+		logger.L.Info("ISR updated", "partition", p.Index,
+			"old_isr", p.ISRNodes, "new_isr", newISR)
+		p.PartitionEpoch++
+	}
+
+	p.ISRNodes = newISR
+}
+
+// ShrinkISR removes a specific broker from the ISR.
+// Caller must hold p's lock.
+func ShrinkISR(p *metadata.Partition, brokerID int32) {
+	var newISR []int32
+	for _, id := range p.ISRNodes {
+		if id != brokerID {
+			newISR = append(newISR, id)
+		}
+	}
+	p.ISRNodes = newISR
+}
+
+// ExpandISR adds a broker back to the ISR if it has caught up.
+// Caller must hold p's lock.
+func ExpandISR(p *metadata.Partition, brokerID int32) {
+	for _, id := range p.ISRNodes {
+		if id == brokerID {
+			return // already in ISR
+		}
+	}
+	replicaLEO, ok := p.ReplicaLEO[brokerID]
+	if !ok {
+		return
+	}
+	if replicaLEO >= p.LogEndOffset {
+		p.ISRNodes = append(p.ISRNodes, brokerID)
+		logger.L.Info("expanded ISR", "partition", p.Index, "broker", brokerID)
+	}
+}

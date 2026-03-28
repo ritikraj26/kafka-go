@@ -5,27 +5,37 @@ import (
 	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
 )
 
-const (
-	brokerID   int32 = 1
-	brokerHost       = "localhost"
-	brokerPort int32 = 9092
-	clusterID        = "kafka-go-cluster"
-)
+const clusterID = "kafka-go-cluster"
 
 // BuildBody builds a Metadata v12 response body.
 func BuildBody(req *protocol.MetadataRequest, metaMgr *metadata.Manager) []byte {
 	enc := protocol.NewEncoder()
 
-	enc.WriteInt32(0)          // throttle_time_ms
-	enc.WriteUnsignedVarint(2) // brokers compact array (1 element)
-	enc.WriteInt32(brokerID)
-	enc.WriteCompactString(brokerHost)
-	enc.WriteInt32(brokerPort)
-	enc.WriteCompactString("") // rack
-	enc.WriteTagBuffer()
+	enc.WriteInt32(0) // throttle_time_ms
 
-	enc.WriteCompactString(clusterID) // cluster_id
-	enc.WriteInt32(brokerID)          // controller_id
+	// Brokers array — use registry if available, else fallback
+	if metaMgr.Brokers != nil {
+		brokers := metaMgr.Brokers.All()
+		enc.WriteUnsignedVarint(uint64(len(brokers) + 1))
+		for _, b := range brokers {
+			enc.WriteInt32(b.ID)
+			enc.WriteCompactString(b.Host)
+			enc.WriteInt32(b.Port)
+			enc.WriteCompactString("") // rack
+			enc.WriteTagBuffer()
+		}
+		enc.WriteCompactString(clusterID)
+		enc.WriteInt32(metaMgr.Brokers.LocalID) // controller_id
+	} else {
+		enc.WriteUnsignedVarint(2) // 1 broker
+		enc.WriteInt32(1)
+		enc.WriteCompactString("localhost")
+		enc.WriteInt32(9092)
+		enc.WriteCompactString("") // rack
+		enc.WriteTagBuffer()
+		enc.WriteCompactString(clusterID)
+		enc.WriteInt32(1) // controller_id
+	}
 
 	topics := selectTopics(req, metaMgr)
 	enc.WriteUnsignedVarint(uint64(len(topics) + 1))

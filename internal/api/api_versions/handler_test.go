@@ -24,14 +24,18 @@ func TestBuildBody_NoError(t *testing.T) {
 		t.Errorf("api array compact length = %d, want >= 2 (at least 1 API)", arrayLen)
 	}
 
-	// Verify all 5 supported APIs are present by scanning entries.
+	// Verify all 13 supported APIs are present by scanning entries.
 	// Each entry: api_key(2) + min_version(2) + max_version(2) + TAG_BUFFER(1) = 7 bytes
 	numAPIs := arrayLen - 1
-	if numAPIs != 5 {
-		t.Errorf("number of APIs = %d, want 5", numAPIs)
+	if numAPIs != 13 {
+		t.Errorf("number of APIs = %d, want 13", numAPIs)
 	}
 
-	expectedKeys := map[int16]bool{18: false, 75: false, 1: false, 0: false, 3: false}
+	expectedKeys := map[int16]bool{
+		18: false, 75: false, 1: false, 0: false, 3: false,
+		2: false, 8: false, 9: false, 10: false, 11: false,
+		12: false, 13: false, 14: false,
+	}
 	pos := 3
 	for i := 0; i < numAPIs && pos+6 < len(body); i++ {
 		key := int16(binary.BigEndian.Uint16(body[pos : pos+2]))

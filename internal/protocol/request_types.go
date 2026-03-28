@@ -56,6 +56,7 @@ func (r *ProduceRequest) GetAPIKey() int16 {
 // FetchTopic represents a topic in a Fetch request
 type FetchTopic struct {
 	TopicID    [16]byte // UUID in v13+
+	TopicName  string   // topic name in v0-v12
 	Partitions []FetchPartition
 }
 
@@ -68,6 +69,7 @@ type FetchPartition struct {
 // FetchRequest request (api_key=1)
 type FetchRequest struct {
 	Header       *RequestHeader
+	ReplicaID    int32 // -1 for consumers, >= 0 for follower replicas
 	MaxWaitMs    int32
 	MinBytes     int32
 	MaxBytes     int32
@@ -98,7 +100,6 @@ func (r *MetadataRequest) GetAPIKey() int16          { return APIKeyMetadata }
 type DescribeTopicPartitionsRequest struct {
 	Header     *RequestHeader
 	TopicNames []string
-	// Additional fields TODO: implement when needed
 }
 
 func (r *DescribeTopicPartitionsRequest) GetHeader() *RequestHeader {
@@ -109,6 +110,139 @@ func (r *DescribeTopicPartitionsRequest) GetAPIKey() int16 {
 	return APIKeyDescribeTopicPartitions
 }
 
+// --- Consumer Group API request types (v0, non-flexible) ---
+
+// GroupProtocol is a name+metadata pair sent in JoinGroup.
+type GroupProtocol struct {
+	Name     string
+	Metadata []byte
+}
+
+// FindCoordinatorRequest (api_key=10, v0)
+type FindCoordinatorRequest struct {
+	Header *RequestHeader
+	Key    string // group_id
+}
+
+func (r *FindCoordinatorRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *FindCoordinatorRequest) GetAPIKey() int16          { return APIKeyFindCoordinator }
+
+// JoinGroupRequest (api_key=11, v0)
+type JoinGroupRequest struct {
+	Header           *RequestHeader
+	GroupID          string
+	SessionTimeoutMs int32
+	MemberID         string
+	ProtocolType     string
+	Protocols        []GroupProtocol
+}
+
+func (r *JoinGroupRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *JoinGroupRequest) GetAPIKey() int16          { return APIKeyJoinGroup }
+
+// SyncGroupAssignment is a member_id→assignment pair in SyncGroup.
+type SyncGroupAssignment struct {
+	MemberID   string
+	Assignment []byte
+}
+
+// SyncGroupRequest (api_key=14, v0)
+type SyncGroupRequest struct {
+	Header       *RequestHeader
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+	Assignments  []SyncGroupAssignment
+}
+
+func (r *SyncGroupRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *SyncGroupRequest) GetAPIKey() int16          { return APIKeySyncGroup }
+
+// HeartbeatRequest (api_key=12, v0)
+type HeartbeatRequest struct {
+	Header       *RequestHeader
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+}
+
+func (r *HeartbeatRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *HeartbeatRequest) GetAPIKey() int16          { return APIKeyHeartbeat }
+
+// LeaveGroupRequest (api_key=13, v0)
+type LeaveGroupRequest struct {
+	Header   *RequestHeader
+	GroupID  string
+	MemberID string
+}
+
+func (r *LeaveGroupRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *LeaveGroupRequest) GetAPIKey() int16          { return APIKeyLeaveGroup }
+
+// OffsetCommitTopic is a topic in an OffsetCommit request.
+type OffsetCommitTopic struct {
+	Name       string
+	Partitions []OffsetCommitPartition
+}
+
+// OffsetCommitPartition is a partition in an OffsetCommit request.
+type OffsetCommitPartition struct {
+	Index           int32
+	CommittedOffset int64
+	Metadata        string
+}
+
+// OffsetCommitRequest (api_key=8, v2)
+type OffsetCommitRequest struct {
+	Header       *RequestHeader
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+	RetentionMs  int64
+	Topics       []OffsetCommitTopic
+}
+
+func (r *OffsetCommitRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *OffsetCommitRequest) GetAPIKey() int16          { return APIKeyOffsetCommit }
+
+// OffsetFetchTopic is a topic in an OffsetFetch request.
+type OffsetFetchTopic struct {
+	Name       string
+	Partitions []int32
+}
+
+// OffsetFetchRequest (api_key=9, v1)
+type OffsetFetchRequest struct {
+	Header  *RequestHeader
+	GroupID string
+	Topics  []OffsetFetchTopic
+}
+
+func (r *OffsetFetchRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *OffsetFetchRequest) GetAPIKey() int16          { return APIKeyOffsetFetch }
+
+// ListOffsetsTopic is a topic in a ListOffsets request.
+type ListOffsetsTopic struct {
+	Name       string
+	Partitions []ListOffsetsPartition
+}
+
+// ListOffsetsPartition is a partition in a ListOffsets request.
+type ListOffsetsPartition struct {
+	Index     int32
+	Timestamp int64 // -1 = latest, -2 = earliest
+}
+
+// ListOffsetsRequest (api_key=2, v1)
+type ListOffsetsRequest struct {
+	Header    *RequestHeader
+	ReplicaID int32
+	Topics    []ListOffsetsTopic
+}
+
+func (r *ListOffsetsRequest) GetHeader() *RequestHeader { return r.Header }
+func (r *ListOffsetsRequest) GetAPIKey() int16          { return APIKeyListOffsets }
+
 // ParseRequest parses the request header and body into an API-specific request type
 func ParseRequest(header *RequestHeader) (Request, error) {
 	switch header.GetAPIKey() {
@@ -117,11 +251,30 @@ func ParseRequest(header *RequestHeader) (Request, error) {
 	case APIKeyProduce:
 		return ParseProduceRequest(header)
 	case APIKeyFetch:
+		if header.GetAPIVersion() == 0 {
+			return ParseFetchRequestV0(header)
+		}
 		return ParseFetchRequest(header)
 	case APIKeyDescribeTopicPartitions:
 		return ParseDescribeTopicPartitionsRequest(header)
 	case APIKeyMetadata:
 		return ParseMetadataRequest(header)
+	case APIKeyFindCoordinator:
+		return ParseFindCoordinatorRequest(header)
+	case APIKeyJoinGroup:
+		return ParseJoinGroupRequest(header)
+	case APIKeySyncGroup:
+		return ParseSyncGroupRequest(header)
+	case APIKeyHeartbeat:
+		return ParseHeartbeatRequest(header)
+	case APIKeyLeaveGroup:
+		return ParseLeaveGroupRequest(header)
+	case APIKeyOffsetCommit:
+		return ParseOffsetCommitRequest(header)
+	case APIKeyOffsetFetch:
+		return ParseOffsetFetchRequest(header)
+	case APIKeyListOffsets:
+		return ParseListOffsetsRequest(header)
 	default:
 		return nil, fmt.Errorf("unknown API key: %d", header.GetAPIKey())
 	}
@@ -273,6 +426,88 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 		Acks:            acks,
 		TimeoutMs:       timeoutMs,
 		Topics:          topics,
+	}, nil
+}
+
+// ParseFetchRequestV0 parses a Fetch request using the v0 wire format.
+// Fetch v0 layout: ReplicaID(INT32), MaxWaitMs(INT32), MinBytes(INT32),
+// Topics(ARRAY[TopicName(STRING), Partitions(ARRAY[Partition(INT32), FetchOffset(INT64), MaxBytes(INT32)])])
+func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
+	decoder := NewDecoder(header.GetBody())
+
+	// Skip client_id (STRING) in the v0 request header
+	_, err := decoder.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("v0 fetch: failed to read client_id: %w", err)
+	}
+
+	replicaID, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("v0 fetch: failed to read replica_id: %w", err)
+	}
+
+	maxWaitMs, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("v0 fetch: failed to read max_wait_ms: %w", err)
+	}
+
+	minBytes, err := decoder.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("v0 fetch: failed to read min_bytes: %w", err)
+	}
+
+	numTopics, err := decoder.ReadArrayLen()
+	if err != nil {
+		return nil, fmt.Errorf("v0 fetch: failed to read topics array len: %w", err)
+	}
+
+	var topics []FetchTopic
+	for i := int32(0); i < numTopics; i++ {
+		topicName, err := decoder.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("v0 fetch: failed to read topic name: %w", err)
+		}
+
+		numPartitions, err := decoder.ReadArrayLen()
+		if err != nil {
+			return nil, fmt.Errorf("v0 fetch: failed to read partitions array len: %w", err)
+		}
+
+		var partitions []FetchPartition
+		for j := int32(0); j < numPartitions; j++ {
+			partIdx, err := decoder.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("v0 fetch: failed to read partition index: %w", err)
+			}
+			fetchOffset, err := decoder.ReadInt64()
+			if err != nil {
+				return nil, fmt.Errorf("v0 fetch: failed to read fetch_offset: %w", err)
+			}
+			// max_bytes per partition (INT32) — skip
+			_, err = decoder.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("v0 fetch: failed to read partition max_bytes: %w", err)
+			}
+			partitions = append(partitions, FetchPartition{
+				PartitionIndex: partIdx,
+				FetchOffset:    fetchOffset,
+			})
+		}
+
+		// v0 uses topic name, not UUID — store name for lookup later
+		ft := FetchTopic{
+			TopicName:  topicName,
+			Partitions: partitions,
+		}
+		topics = append(topics, ft)
+	}
+
+	return &FetchRequest{
+		Header:    header,
+		ReplicaID: replicaID,
+		MaxWaitMs: maxWaitMs,
+		MinBytes:  minBytes,
+		Topics:    topics,
 	}, nil
 }
 
@@ -629,4 +864,333 @@ func ParseMetadataRequest(header *RequestHeader) (*MetadataRequest, error) {
 	}
 
 	return &MetadataRequest{Header: header, TopicNames: topicNames}, nil
+}
+
+// --- Parsers for consumer group / offset / list-offsets (v0 non-flexible) ---
+
+// ParseFindCoordinatorRequest parses a FindCoordinator v0 request.
+// ParseFindCoordinatorRequest parses a FindCoordinator v0 request.
+func ParseFindCoordinatorRequest(header *RequestHeader) (*FindCoordinatorRequest, error) {
+	if header.GetAPIVersion() != 0 {
+		return nil, fmt.Errorf("FindCoordinator: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	key, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("FindCoordinator: read key: %w", err)
+	}
+	return &FindCoordinatorRequest{Header: header, Key: key}, nil
+}
+
+// ParseJoinGroupRequest parses a JoinGroup v0 request.
+func ParseJoinGroupRequest(header *RequestHeader) (*JoinGroupRequest, error) {
+	if header.GetAPIVersion() != 0 {
+		return nil, fmt.Errorf("JoinGroup: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("JoinGroup: read group_id: %w", err)
+	}
+	if groupID == "" {
+		return nil, fmt.Errorf("JoinGroup: group_id must not be empty")
+	}
+	sessionTimeout, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("JoinGroup: read session_timeout_ms: %w", err)
+	}
+	if sessionTimeout <= 0 {
+		return nil, fmt.Errorf("JoinGroup: session_timeout_ms must be > 0")
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("JoinGroup: read member_id: %w", err)
+	}
+	protocolType, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("JoinGroup: read protocol_type: %w", err)
+	}
+	numProtocols, err := d.ReadArrayLen()
+	if err != nil {
+		return nil, fmt.Errorf("JoinGroup: read protocols array len: %w", err)
+	}
+	protocols := make([]GroupProtocol, 0, numProtocols)
+	for i := int32(0); i < numProtocols; i++ {
+		name, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("JoinGroup: read protocol name: %w", err)
+		}
+		meta, err := d.ReadBytes()
+		if err != nil {
+			return nil, fmt.Errorf("JoinGroup: read protocol metadata: %w", err)
+		}
+		protocols = append(protocols, GroupProtocol{Name: name, Metadata: meta})
+	}
+	if len(protocols) == 0 {
+		return nil, fmt.Errorf("JoinGroup: at least one protocol is required")
+	}
+	return &JoinGroupRequest{
+		Header:           header,
+		GroupID:          groupID,
+		SessionTimeoutMs: sessionTimeout,
+		MemberID:         memberID,
+		ProtocolType:     protocolType,
+		Protocols:        protocols,
+	}, nil
+}
+
+// ParseSyncGroupRequest parses a SyncGroup v0 request.
+func ParseSyncGroupRequest(header *RequestHeader) (*SyncGroupRequest, error) {
+	if header.GetAPIVersion() != 0 {
+		return nil, fmt.Errorf("SyncGroup: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("SyncGroup: read group_id: %w", err)
+	}
+	if groupID == "" {
+		return nil, fmt.Errorf("SyncGroup: group_id must not be empty")
+	}
+	generationID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("SyncGroup: read generation_id: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("SyncGroup: read member_id: %w", err)
+	}
+	numAssignments, err := d.ReadArrayLen()
+	if err != nil {
+		return nil, fmt.Errorf("SyncGroup: read assignments array len: %w", err)
+	}
+	assignments := make([]SyncGroupAssignment, 0, numAssignments)
+	for i := int32(0); i < numAssignments; i++ {
+		mid, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("SyncGroup: read assignment member_id: %w", err)
+		}
+		data, err := d.ReadBytes()
+		if err != nil {
+			return nil, fmt.Errorf("SyncGroup: read assignment data: %w", err)
+		}
+		assignments = append(assignments, SyncGroupAssignment{MemberID: mid, Assignment: data})
+	}
+	return &SyncGroupRequest{
+		Header:       header,
+		GroupID:      groupID,
+		GenerationID: generationID,
+		MemberID:     memberID,
+		Assignments:  assignments,
+	}, nil
+}
+
+// ParseHeartbeatRequest parses a Heartbeat v0 request.
+func ParseHeartbeatRequest(header *RequestHeader) (*HeartbeatRequest, error) {
+	if header.GetAPIVersion() != 0 {
+		return nil, fmt.Errorf("Heartbeat: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("Heartbeat: read group_id: %w", err)
+	}
+	if groupID == "" {
+		return nil, fmt.Errorf("Heartbeat: group_id must not be empty")
+	}
+	generationID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("Heartbeat: read generation_id: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("Heartbeat: read member_id: %w", err)
+	}
+	return &HeartbeatRequest{
+		Header:       header,
+		GroupID:      groupID,
+		GenerationID: generationID,
+		MemberID:     memberID,
+	}, nil
+}
+
+// ParseLeaveGroupRequest parses a LeaveGroup v0 request.
+func ParseLeaveGroupRequest(header *RequestHeader) (*LeaveGroupRequest, error) {
+	if header.GetAPIVersion() != 0 {
+		return nil, fmt.Errorf("LeaveGroup: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("LeaveGroup: read group_id: %w", err)
+	}
+	if groupID == "" {
+		return nil, fmt.Errorf("LeaveGroup: group_id must not be empty")
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("LeaveGroup: read member_id: %w", err)
+	}
+	return &LeaveGroupRequest{
+		Header:   header,
+		GroupID:  groupID,
+		MemberID: memberID,
+	}, nil
+}
+
+// ParseOffsetCommitRequest parses an OffsetCommit v2 request.
+func ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, error) {
+	if header.GetAPIVersion() != 2 {
+		return nil, fmt.Errorf("OffsetCommit: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetCommit: read group_id: %w", err)
+	}
+	if groupID == "" {
+		return nil, fmt.Errorf("OffsetCommit: group_id must not be empty")
+	}
+	generationID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetCommit: read generation_id: %w", err)
+	}
+	memberID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetCommit: read member_id: %w", err)
+	}
+	retentionMs, err := d.ReadInt64()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetCommit: read retention_time_ms: %w", err)
+	}
+	numTopics, err := d.ReadArrayLen()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetCommit: read topics array len: %w", err)
+	}
+	topics := make([]OffsetCommitTopic, 0, numTopics)
+	for i := int32(0); i < numTopics; i++ {
+		name, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("OffsetCommit: read topic name: %w", err)
+		}
+		numParts, err := d.ReadArrayLen()
+		if err != nil {
+			return nil, fmt.Errorf("OffsetCommit: read partitions array len: %w", err)
+		}
+		parts := make([]OffsetCommitPartition, 0, numParts)
+		for j := int32(0); j < numParts; j++ {
+			idx, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("OffsetCommit: read partition index: %w", err)
+			}
+			offset, err := d.ReadInt64()
+			if err != nil {
+				return nil, fmt.Errorf("OffsetCommit: read committed_offset: %w", err)
+			}
+			meta, err := d.ReadString()
+			if err != nil {
+				return nil, fmt.Errorf("OffsetCommit: read metadata: %w", err)
+			}
+			parts = append(parts, OffsetCommitPartition{Index: idx, CommittedOffset: offset, Metadata: meta})
+		}
+		topics = append(topics, OffsetCommitTopic{Name: name, Partitions: parts})
+	}
+	return &OffsetCommitRequest{
+		Header:       header,
+		GroupID:      groupID,
+		GenerationID: generationID,
+		MemberID:     memberID,
+		RetentionMs:  retentionMs,
+		Topics:       topics,
+	}, nil
+}
+
+// ParseOffsetFetchRequest parses an OffsetFetch v1 request.
+func ParseOffsetFetchRequest(header *RequestHeader) (*OffsetFetchRequest, error) {
+	if header.GetAPIVersion() != 1 {
+		return nil, fmt.Errorf("OffsetFetch: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	groupID, err := d.ReadString()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetFetch: read group_id: %w", err)
+	}
+	if groupID == "" {
+		return nil, fmt.Errorf("OffsetFetch: group_id must not be empty")
+	}
+	numTopics, err := d.ReadArrayLen()
+	if err != nil {
+		return nil, fmt.Errorf("OffsetFetch: read topics array len: %w", err)
+	}
+	topics := make([]OffsetFetchTopic, 0, numTopics)
+	for i := int32(0); i < numTopics; i++ {
+		name, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("OffsetFetch: read topic name: %w", err)
+		}
+		numParts, err := d.ReadArrayLen()
+		if err != nil {
+			return nil, fmt.Errorf("OffsetFetch: read partitions array len: %w", err)
+		}
+		parts := make([]int32, 0, numParts)
+		for j := int32(0); j < numParts; j++ {
+			idx, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("OffsetFetch: read partition index: %w", err)
+			}
+			parts = append(parts, idx)
+		}
+		topics = append(topics, OffsetFetchTopic{Name: name, Partitions: parts})
+	}
+	return &OffsetFetchRequest{
+		Header:  header,
+		GroupID: groupID,
+		Topics:  topics,
+	}, nil
+}
+
+// ParseListOffsetsRequest parses a ListOffsets v1 request.
+// ParseListOffsetsRequest parses a ListOffsets v1 request.
+func ParseListOffsetsRequest(header *RequestHeader) (*ListOffsetsRequest, error) {
+	if header.GetAPIVersion() != 1 {
+		return nil, fmt.Errorf("ListOffsets: unsupported version %d", header.GetAPIVersion())
+	}
+	d := NewDecoder(header.GetBody())
+	replicaID, err := d.ReadInt32()
+	if err != nil {
+		return nil, fmt.Errorf("ListOffsets: read replica_id: %w", err)
+	}
+	numTopics, err := d.ReadArrayLen()
+	if err != nil {
+		return nil, fmt.Errorf("ListOffsets: read topics array len: %w", err)
+	}
+	topics := make([]ListOffsetsTopic, 0, numTopics)
+	for i := int32(0); i < numTopics; i++ {
+		name, err := d.ReadString()
+		if err != nil {
+			return nil, fmt.Errorf("ListOffsets: read topic name: %w", err)
+		}
+		numParts, err := d.ReadArrayLen()
+		if err != nil {
+			return nil, fmt.Errorf("ListOffsets: read partitions array len: %w", err)
+		}
+		parts := make([]ListOffsetsPartition, 0, numParts)
+		for j := int32(0); j < numParts; j++ {
+			idx, err := d.ReadInt32()
+			if err != nil {
+				return nil, fmt.Errorf("ListOffsets: read partition index: %w", err)
+			}
+			ts, err := d.ReadInt64()
+			if err != nil {
+				return nil, fmt.Errorf("ListOffsets: read timestamp: %w", err)
+			}
+			parts = append(parts, ListOffsetsPartition{Index: idx, Timestamp: ts})
+		}
+		topics = append(topics, ListOffsetsTopic{Name: name, Partitions: parts})
+	}
+	return &ListOffsetsRequest{
+		Header:    header,
+		ReplicaID: replicaID,
+		Topics:    topics,
+	}, nil
 }

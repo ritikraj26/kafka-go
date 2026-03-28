@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
 )
 
@@ -15,6 +16,7 @@ import (
 // sends a raw ApiVersions v4 request, and validates the wire-format response.
 func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 	metaMgr := metadata.NewManager()
+	coord := coordinator.NewCoordinator()
 
 	// Bind to a random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -28,7 +30,7 @@ func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		Serve(ctx, listener, metaMgr)
+		Serve(ctx, listener, metaMgr, coord)
 		close(done)
 	}()
 
@@ -46,9 +48,9 @@ func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 	//   message_size (4) + api_key (2) + api_version (2) + correlation_id (4) + body
 	// Body: client_id compact string "test" (varint 5, then 4 bytes) + TAG_BUFFER (0x00)
 	var body []byte
-	body = append(body, 0x05)          // compact string length: 4+1 = 5
-	body = append(body, "test"...)     // client_id
-	body = append(body, 0x00)          // TAG_BUFFER
+	body = append(body, 0x05)      // compact string length: 4+1 = 5
+	body = append(body, "test"...) // client_id
+	body = append(body, 0x00)      // TAG_BUFFER
 
 	// Header: api_key=18, api_version=4, correlation_id=99
 	headerSize := 2 + 2 + 4 // api_key + api_version + correlation_id
@@ -111,8 +113,8 @@ func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 
 	// Byte 6: compact array length (N+1) for the supported APIs
 	numAPIs := int(respBody[6]) - 1
-	if numAPIs != 5 {
-		t.Errorf("number of APIs = %d, want 5", numAPIs)
+	if numAPIs != 13 {
+		t.Errorf("number of APIs = %d, want 13", numAPIs)
 	}
 
 	// Close client connection so the handler's read loop exits
