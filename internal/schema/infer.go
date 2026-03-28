@@ -18,8 +18,9 @@ var httpClient = &http.Client{Timeout: 10 * time.Second}
 // unusable response — the broker must remain functional without AI.
 //
 // Environment variables:
-//   OLLAMA_URL   base URL of the Ollama server (default: http://localhost:11434)
-//   OLLAMA_MODEL model name to use           (default: llama3.2)
+//
+//	OLLAMA_URL   base URL of the Ollama server (default: http://localhost:11434)
+//	OLLAMA_MODEL model name to use           (default: llama3.2)
 func InferWithOllama(payload []byte) (*SimpleSchema, error) {
 	base := os.Getenv("OLLAMA_URL")
 	if base == "" {

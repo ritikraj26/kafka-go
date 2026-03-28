@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
@@ -11,6 +14,10 @@ import (
 )
 
 func main() {
+	// Graceful shutdown on SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Create metadata manager
 	metaMgr := metadata.NewManager()
 
@@ -29,8 +36,8 @@ func main() {
 		logger.L.Warn("failed to load topics from disk", "err", err)
 	}
 
-	// Start server with metadata manager
-	network.Start(metaMgr)
+	// Start server (blocks until ctx is cancelled)
+	network.Start(ctx, metaMgr)
 }
 
 // parseLogDir reads server.properties and extracts log.dirs property

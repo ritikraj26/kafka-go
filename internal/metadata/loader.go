@@ -3,6 +3,7 @@ package metadata
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -330,18 +331,28 @@ func ReadPartitionLog(partition *Partition) ([]byte, error) {
 	return ReadPartitionLogFrom(partition, 0)
 }
 
-// ReadPartitionLogFrom reads the log file starting at byteOffset.
+// ReadPartitionLogFrom reads the log file starting at byteOffset using seek,
+// avoiding reading the entire file into memory for large logs.
 func ReadPartitionLogFrom(partition *Partition, byteOffset int64) ([]byte, error) {
 	logFilePath := partition.LogDir + "/00000000000000000000.log"
-	data, err := os.ReadFile(logFilePath)
+	f, err := os.Open(logFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []byte{}, nil
 		}
-		return nil, fmt.Errorf("failed to read log file: %w", err)
+		return nil, fmt.Errorf("failed to open log file: %w", err)
 	}
-	if byteOffset > 0 && byteOffset < int64(len(data)) {
-		return data[byteOffset:], nil
+	defer f.Close()
+
+	if byteOffset > 0 {
+		if _, err := f.Seek(byteOffset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("failed to seek in log file: %w", err)
+		}
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read log file: %w", err)
 	}
 	return data, nil
 }

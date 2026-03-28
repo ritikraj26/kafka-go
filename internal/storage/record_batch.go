@@ -3,19 +3,20 @@ package storage
 import "encoding/binary"
 
 // RecordBatch fixed header layout (61 bytes total before records):
-//   baseOffset        INT64   8
-//   batchLength       INT32   4
-//   partitionEpoch    INT32   4
-//   magic             INT8    1
-//   crc               UINT32  4
-//   attributes        INT16   2
-//   lastOffsetDelta   INT32   4
-//   baseTimestamp     INT64   8
-//   maxTimestamp      INT64   8
-//   producerId        INT64   8
-//   producerEpoch     INT16   2
-//   baseSequence      INT32   4
-//   recordsCount      INT32   4
+//
+//	baseOffset        INT64   8
+//	batchLength       INT32   4
+//	partitionEpoch    INT32   4
+//	magic             INT8    1
+//	crc               UINT32  4
+//	attributes        INT16   2
+//	lastOffsetDelta   INT32   4
+//	baseTimestamp     INT64   8
+//	maxTimestamp      INT64   8
+//	producerId        INT64   8
+//	producerEpoch     INT16   2
+//	baseSequence      INT32   4
+//	recordsCount      INT32   4
 const recordBatchHeaderSize = 61
 
 // ParseRecordValues extracts the raw value bytes from every Record inside a

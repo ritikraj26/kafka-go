@@ -56,7 +56,7 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 						// each one against the topic's inferred schema.
 						// If no schema exists yet, infer it from the first value.
 						// Any value that fails validation is routed to {topic}.dlq instead.
-						targetRecords, dlqRecords := validateRecords(
+						dlqRecords, allFailed := validateRecords(
 							reqPartition.Records,
 							reqTopic.Name,
 							metaMgr,
@@ -67,23 +67,34 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 							routeToDLQ(reqTopic.Name, dlqRecords, metaMgr)
 						}
 
-						// If all records were invalid, still return success to the
-						// producer — DLQ routing is transparent.
-						recordsToWrite := targetRecords
-						if len(recordsToWrite) == 0 {
-							recordsToWrite = reqPartition.Records // fallback: write original
-						}
-
-						// AppendRecords locks the partition, writes to disk, advances NextOffset
-						offset, err := matchedPartition.AppendRecords(recordsToWrite, matchedPartition.LogDir)
-						if err != nil {
-							logger.L.Error("failed to write records to disk", "topic", reqTopic.Name, "partition", reqPartition.Index, "err", err)
-							errorCode = protocol.ErrUnknownTopicOrPartition
-						} else {
+						if allFailed {
+							// All records were invalid — they've been routed to DLQ.
+							// Return success to the producer (DLQ routing is transparent)
+							// but do NOT write invalid data to the main topic.
 							errorCode = protocol.ErrNone
-							baseOffset = offset
+							baseOffset = matchedPartition.NextOffset
 							logAppendTime = -1
 							logStartOffset = 0
+						} else {
+							if len(dlqRecords) > 0 {
+								// Some records failed — individual record filtering from a
+								// binary RecordBatch is not yet supported, so the full batch
+								// is written. Failed values are also in the DLQ.
+								logger.L.Warn("partial schema violation — writing full batch; failed records also in DLQ",
+									"topic", reqTopic.Name, "failed", len(dlqRecords))
+							}
+
+							// AppendRecords locks the partition, writes to disk, advances NextOffset
+							offset, err := matchedPartition.AppendRecords(reqPartition.Records, matchedPartition.LogDir)
+							if err != nil {
+								logger.L.Error("failed to write records to disk", "topic", reqTopic.Name, "partition", reqPartition.Index, "err", err)
+								errorCode = protocol.ErrUnknownTopicOrPartition
+							} else {
+								errorCode = protocol.ErrNone
+								baseOffset = offset
+								logAppendTime = -1
+								logStartOffset = 0
+							}
 						}
 					} else {
 						// No records — still valid, return current offset
@@ -132,17 +143,17 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 
 // validateRecords inspects each message value in the RecordBatch:
 //   - If no schema exists for the topic yet, calls Ollama to infer one from the
-//     first value, then registers it. The full original batch is returned as-is.
-//   - If a schema exists, values that pass go to targetRecords (original batch),
-//     values that fail go to dlqRecords (raw value bytes for DLQ logging).
+//     first value, then registers it. All records are allowed through.
+//   - If a schema exists, values that fail are collected for DLQ routing.
 //
-// Returns (originalBatch, nil) when all messages are valid or schema is new.
-// Returns (originalBatch, failedValues) when some messages violate the schema.
-func validateRecords(records []byte, topic string, metaMgr *metadata.Manager) ([]byte, [][]byte) {
+// Returns (nil, false) when all messages are valid or schema is new.
+// Returns (failedValues, true) when every message violates the schema.
+// Returns (failedValues, false) when only some messages violate the schema.
+func validateRecords(records []byte, topic string, metaMgr *metadata.Manager) ([][]byte, bool) {
 	reg := metaMgr.Schemas
 	values := storage.ParseRecordValues(records)
 	if len(values) == 0 {
-		return records, nil
+		return nil, false
 	}
 
 	// No schema yet — infer from first value, register, allow the whole batch through.
@@ -158,7 +169,7 @@ func validateRecords(records []byte, topic string, metaMgr *metadata.Manager) ([
 		} else {
 			logger.L.Warn("could not infer schema for topic", "topic", topic)
 		}
-		return records, nil
+		return nil, false
 	}
 
 	// Schema exists — validate every value.
@@ -169,7 +180,7 @@ func validateRecords(records []byte, topic string, metaMgr *metadata.Manager) ([
 			failed = append(failed, v)
 		}
 	}
-	return records, failed
+	return failed, len(failed) == len(values)
 }
 
 // routeToDLQ appends raw failed message values to the {topic}.dlq partition.
