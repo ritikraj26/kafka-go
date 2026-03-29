@@ -102,6 +102,7 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 				LeaderEpoch:     0,
 				PartitionEpoch:  0,
 				LogDir:          partLogDir,
+				BrokerLogDirs:   map[int32]string{1: partLogDir},
 				NextOffset:      nextOffset,
 			})
 		}
@@ -111,7 +112,39 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Populate per-broker log dirs and replica assignments for all brokers.
+	// Topics loaded from disk only know about the flat log dir; we need to
+	// set up BrokerLogDirs for every broker so followers can write to their
+	// own directories and leader election can switch seamlessly.
+	var brokerIDs []int32
+	if m.Brokers != nil {
+		brokerIDs = m.Brokers.IDs()
+	}
 	for _, topic := range topicsFound {
+		for i := range topic.Partitions {
+			p := &topic.Partitions[i]
+			if len(brokerIDs) > 0 {
+				p.ReplicaNodes = append([]int32{}, brokerIDs...)
+				p.ISRNodes = append([]int32{}, brokerIDs...)
+				if p.BrokerLogDirs == nil {
+					p.BrokerLogDirs = make(map[int32]string)
+				}
+				for _, bid := range brokerIDs {
+					if bid == p.LeaderID {
+						// Leader keeps the original log dir (the one on disk)
+						p.BrokerLogDirs[bid] = p.LogDir
+					} else {
+						p.BrokerLogDirs[bid] = fmt.Sprintf("%s/broker-%d/%s-%d", logDir, bid, topic.Name, p.Index)
+					}
+				}
+			}
+			if p.ReplicaLEO == nil {
+				p.ReplicaLEO = make(map[int32]int64)
+			}
+			if p.ReplicaLastSeen == nil {
+				p.ReplicaLastSeen = make(map[int32]int64)
+			}
+		}
 		m.topics[topic.Name] = topic
 	}
 
@@ -333,8 +366,12 @@ func ReadPartitionLog(partition *Partition) ([]byte, error) {
 
 // ReadPartitionLogFrom reads the log file starting at byteOffset using seek,
 // avoiding reading the entire file into memory for large logs.
-func ReadPartitionLogFrom(partition *Partition, byteOffset int64) ([]byte, error) {
-	logFilePath := partition.LogDir + "/00000000000000000000.log"
+func ReadPartitionLogFrom(partition *Partition, byteOffset int64, logDir ...string) ([]byte, error) {
+	dir := partition.LogDir
+	if len(logDir) > 0 && logDir[0] != "" {
+		dir = logDir[0]
+	}
+	logFilePath := dir + "/00000000000000000000.log"
 	f, err := os.Open(logFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {

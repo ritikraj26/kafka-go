@@ -64,11 +64,11 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 		case *protocol.FetchRequest:
 			// Handle Fetch request — v0 uses non-flexible response, v16 uses flexible
 			if requestHeader.GetAPIVersion() == 0 {
-				body = fetch.BuildBodyV0(req, metaMgr)
+				body = fetch.BuildBodyV0(req, metaMgr, localBrokerID)
 				response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
 				serializedResponse, err = response.Serialize()
 			} else {
-				body = fetch.BuildBody(req, metaMgr)
+				body = fetch.BuildBody(req, metaMgr, localBrokerID)
 				response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
 				serializedResponse, err = response.Serialize()
 			}

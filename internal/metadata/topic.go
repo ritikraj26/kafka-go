@@ -30,7 +30,8 @@ type Partition struct {
 	OfflineReplicas []int32
 	LeaderEpoch     int32
 	PartitionEpoch  int32
-	LogDir          string // Path to the partition's log directory
+	LogDir          string            // Legacy: leader's log directory (kept for backward compat)
+	BrokerLogDirs   map[int32]string  // Per-broker log directories (brokerID -> dir)
 
 	// Offset tracking
 	NextOffset    int64 // Next offset to assign to an incoming RecordBatch
@@ -63,6 +64,28 @@ func (p *Partition) GetLogEndOffset() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.LogEndOffset
+}
+
+// GetReplicaLEO returns the LEO tracked for a specific broker (thread-safe).
+// Returns 0 if the broker has no tracked LEO yet.
+func (p *Partition) GetReplicaLEO(brokerID int32) int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ReplicaLEO == nil {
+		return 0
+	}
+	return p.ReplicaLEO[brokerID]
+}
+
+// LogDirForBroker returns the log directory for a specific broker.
+// Falls back to the legacy LogDir field if BrokerLogDirs is not set.
+func (p *Partition) LogDirForBroker(brokerID int32) string {
+	if p.BrokerLogDirs != nil {
+		if dir, ok := p.BrokerLogDirs[brokerID]; ok {
+			return dir
+		}
+	}
+	return p.LogDir
 }
 
 // WaitForHighWatermark blocks until HW >= target or timeout expires.
@@ -185,8 +208,12 @@ func appendIndexEntry(logDir string, relativeOffset int32, filePos int32) error 
 // SeekToOffset binary-searches the sparse index to find the file byte position
 // for the largest index entry whose relativeOffset <= targetOffset.
 // Returns 0 if the index doesn't exist or targetOffset is before the first entry.
-func (p *Partition) SeekToOffset(targetOffset int64) (int64, error) {
-	indexFile := filepath.Join(p.LogDir, "00000000000000000000.index")
+func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (int64, error) {
+	dir := p.LogDir
+	if len(logDir) > 0 && logDir[0] != "" {
+		dir = logDir[0]
+	}
+	indexFile := filepath.Join(dir, "00000000000000000000.index")
 	data, err := os.ReadFile(indexFile)
 	if err != nil {
 		return 0, nil // no index → start from beginning
@@ -354,6 +381,7 @@ func NewTopic(name string, numPartitions int, brokerIDs ...[]int32) *Topic {
 			OfflineReplicas: []int32{},
 			LeaderEpoch:     0,
 			PartitionEpoch:  0,
+			BrokerLogDirs:   make(map[int32]string),
 			ReplicaLEO:      make(map[int32]int64),
 			ReplicaLastSeen: make(map[int32]int64),
 		}

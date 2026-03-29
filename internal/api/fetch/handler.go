@@ -33,7 +33,7 @@ func resolveTopic(reqTopic protocol.FetchTopic, metaMgr *metadata.Manager) *meta
 
 // collectData reads record batches for all requested partitions, respecting maxBytes.
 // When isReplicaFetch is true, data up to LogEndOffset is served (not limited to HW).
-func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes int) ([]topicResult, int) {
+func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes int, localBrokerID int32) ([]topicResult, int) {
 	isReplicaFetch := req.ReplicaID >= 0
 	totalBytes := 0
 	bytesWritten := 0
@@ -72,12 +72,13 @@ func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes
 					}
 
 					if reqPart.FetchOffset < readLimit && bytesWritten < maxBytes {
-						bytePos, seekErr := partition.SeekToOffset(reqPart.FetchOffset)
+						logDir := partition.LogDirForBroker(localBrokerID)
+						bytePos, seekErr := partition.SeekToOffset(reqPart.FetchOffset, logDir)
 						if seekErr != nil {
 							logger.L.Error("SeekToOffset failed", "partition", partition.Index, "err", seekErr)
 							pr.errCode = protocol.ErrUnknownServerError
 						} else {
-							records, readErr := metadata.ReadPartitionLogFrom(partition, bytePos)
+							records, readErr := metadata.ReadPartitionLogFrom(partition, bytePos, logDir)
 							if readErr != nil {
 								logger.L.Error("ReadPartitionLogFrom failed", "partition", partition.Index, "err", readErr)
 								pr.errCode = protocol.ErrUnknownServerError
@@ -103,7 +104,7 @@ func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes
 
 // BuildBody builds a Fetch v16 response, honouring MaxBytes, MinBytes, and MaxWaitMs.
 // After a replica fetch, it updates ReplicaLEO/ReplicaLastSeen and advances HW.
-func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
+func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager, localBrokerID ...int32) []byte {
 	maxBytes := int(req.MaxBytes)
 	if maxBytes <= 0 {
 		maxBytes = 1<<31 - 1
@@ -114,11 +115,16 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 	}
 	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
 
+	var brokerID int32 = 1
+	if len(localBrokerID) > 0 {
+		brokerID = localBrokerID[0]
+	}
+
 	// Poll until we have at least minBytes of data or the deadline is exceeded.
 	var topics []topicResult
 	var totalBytes int
 	for {
-		topics, totalBytes = collectData(req, metaMgr, maxBytes)
+		topics, totalBytes = collectData(req, metaMgr, maxBytes, brokerID)
 		if totalBytes >= minBytes || !time.Now().Before(deadline) {
 			break
 		}
@@ -190,7 +196,7 @@ func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 
 // BuildBodyV0 builds a Fetch v0 response (non-flexible, used for inter-broker replication).
 // Format: [TopicName(STRING), Partitions(ARRAY[Index(INT32), ErrorCode(INT16), HW(INT64), RecordSet(BYTES)])]
-func BuildBodyV0(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
+func BuildBodyV0(req *protocol.FetchRequest, metaMgr *metadata.Manager, localBrokerID ...int32) []byte {
 	maxBytes := int(req.MaxBytes)
 	if maxBytes <= 0 {
 		maxBytes = 1<<31 - 1
@@ -201,10 +207,15 @@ func BuildBodyV0(req *protocol.FetchRequest, metaMgr *metadata.Manager) []byte {
 	}
 	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
 
+	var brokerID int32 = 1
+	if len(localBrokerID) > 0 {
+		brokerID = localBrokerID[0]
+	}
+
 	var topics []topicResult
 	var totalBytes int
 	for {
-		topics, totalBytes = collectData(req, metaMgr, maxBytes)
+		topics, totalBytes = collectData(req, metaMgr, maxBytes, brokerID)
 		if totalBytes >= minBytes || !time.Now().Before(deadline) {
 			break
 		}

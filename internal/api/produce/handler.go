@@ -89,7 +89,8 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBro
 							}
 
 							// AppendRecords locks the partition, writes to disk, advances NextOffset
-							offset, err := matchedPartition.AppendRecords(reqPartition.Records, matchedPartition.LogDir)
+							logDir := matchedPartition.LogDirForBroker(localBrokerID)
+							offset, err := matchedPartition.AppendRecords(reqPartition.Records, logDir)
 							if err != nil {
 								logger.L.Error("failed to write records to disk", "topic", reqTopic.Name, "partition", reqPartition.Index, "err", err)
 								errorCode = protocol.ErrUnknownTopicOrPartition

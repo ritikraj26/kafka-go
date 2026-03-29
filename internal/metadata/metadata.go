@@ -63,10 +63,13 @@ func (m *Manager) CreateTopic(name string, numPartitions int) *Topic {
 		brokerIDs = m.Brokers.IDs()
 	}
 	topic := NewTopic(name, numPartitions, brokerIDs)
-	// Set each partition's LogDir based on its leader
+	// Set each partition's LogDir based on its leader, and BrokerLogDirs for all replicas
 	for i := range topic.Partitions {
 		p := &topic.Partitions[i]
 		p.LogDir = fmt.Sprintf("%s/broker-%d/%s-%d", m.logDir, p.LeaderID, name, p.Index)
+		for _, brokerID := range p.ReplicaNodes {
+			p.BrokerLogDirs[brokerID] = fmt.Sprintf("%s/broker-%d/%s-%d", m.logDir, brokerID, name, p.Index)
+		}
 	}
 	m.topics[name] = topic
 	return topic

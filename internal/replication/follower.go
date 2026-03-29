@@ -146,7 +146,10 @@ func (fm *FollowerManager) replicateAll() {
 			if !isReplica {
 				continue
 			}
-			leo := p.GetLogEndOffset()
+			// Use this broker's own LEO as the fetch offset (not the leader's LEO).
+			// ReplicaLEO is set by the leader's fetch handler after each successful fetch.
+			// Initially 0 — follower starts replicating from the beginning.
+			leo := p.GetReplicaLEO(fm.localID)
 			leaderParts[p.LeaderID] = append(leaderParts[p.LeaderID], partInfo{
 				topic: topic, partition: p, leo: leo,
 			})

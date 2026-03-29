@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
+	"github.com/codecrafters-io/kafka-starter-go/internal/controller"
 	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
 	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
 	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
@@ -69,6 +70,10 @@ func main() {
 	isrMgr := replication.NewISRManager(metaMgr, 1*time.Second, lagTimeMaxMs)
 	isrMgr.Start(ctx)
 
+	// Start controller for broker health monitoring and automatic leader failover
+	ctrl := controller.NewController(metaMgr, reg, 2*time.Second)
+	ctrl.Start(ctx)
+
 	// Start a FollowerManager + TCP listener per broker.
 	// Each broker replicates partitions where it is a follower from the leader.
 	var followers []*replication.FollowerManager
@@ -92,6 +97,7 @@ func main() {
 		fm.Wait()
 	}
 	isrMgr.Wait()
+	ctrl.Wait()
 }
 
 // parseLogDir reads server.properties and extracts log.dirs property
