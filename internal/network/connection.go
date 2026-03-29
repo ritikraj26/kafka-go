@@ -26,7 +26,7 @@ import (
 
 const connectionReadTimeout = 30 * time.Second
 
-func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinator.Coordinator) {
+func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
 	defer conn.Close()
 	for {
 		// Set read deadline to prevent zombie connections from holding goroutines
@@ -57,7 +57,7 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 
 		case *protocol.ProduceRequest:
 			// Handle Produce request (uses response header v1)
-			body = produce.BuildBody(req, metaMgr)
+			body = produce.BuildBody(req, metaMgr, localBrokerID)
 			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
 			serializedResponse, err = response.Serialize()
 

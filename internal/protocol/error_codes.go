@@ -5,6 +5,7 @@ const (
 	ErrNone                    int16 = 0
 	ErrUnknownServerError      int16 = 1
 	ErrUnknownTopicOrPartition int16 = 3
+	ErrNotLeaderOrFollower     int16 = 6
 	ErrCoordinatorNotAvailable int16 = 15
 	ErrNotCoordinator          int16 = 16
 	ErrIllegalGeneration       int16 = 22

@@ -30,7 +30,7 @@ func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		Serve(ctx, listener, metaMgr, coord)
+		Serve(ctx, listener, metaMgr, coord, 1)
 		close(done)
 	}()
 

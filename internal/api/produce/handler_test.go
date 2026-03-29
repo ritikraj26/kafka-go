@@ -24,7 +24,7 @@ func TestBuildBody_UnknownTopic(t *testing.T) {
 		},
 	}
 
-	body := BuildBody(req, metaMgr)
+	body := BuildBody(req, metaMgr, 1)
 	pos := 0
 
 	topicsArrayLen := int(body[pos]) - 1
@@ -82,7 +82,7 @@ func TestBuildBody_ValidTopic(t *testing.T) {
 	os.Setenv("OLLAMA_URL", "http://localhost:1")
 	defer os.Unsetenv("OLLAMA_URL")
 
-	body := BuildBody(req, metaMgr)
+	body := BuildBody(req, metaMgr, 1)
 	pos := 0
 
 	topicsArrayLen := int(body[pos]) - 1

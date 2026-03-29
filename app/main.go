@@ -64,18 +64,33 @@ func main() {
 	// Load committed offsets from disk
 	coord.LoadOffsets(logDir)
 
-	// Start follower replication simulation
-	fm := replication.NewFollowerManager(metaMgr, brokerID, 100*time.Millisecond)
-	fm.Start(ctx)
-
 	// Start ISR maintenance (evaluates ISR every 1s)
 	lagTimeMaxMs := int64(envInt("REPLICA_LAG_TIME_MAX_MS", 10000))
 	isrMgr := replication.NewISRManager(metaMgr, 1*time.Second, lagTimeMaxMs)
 	isrMgr.Start(ctx)
 
-	// Start server (blocks until ctx is cancelled)
-	network.Start(ctx, metaMgr, coord)
-	fm.Wait()
+	// Start a FollowerManager + TCP listener per broker.
+	// Each broker replicates partitions where it is a follower from the leader.
+	var followers []*replication.FollowerManager
+	for _, b := range reg.All() {
+		fm := replication.NewFollowerManager(metaMgr, b.ID, 100*time.Millisecond)
+		fm.Start(ctx)
+		followers = append(followers, fm)
+
+		// The primary broker (brokerID) listens on the main goroutine below.
+		// All other brokers listen in background goroutines.
+		if b.ID != brokerID {
+			go network.StartOnPort(ctx, b.Port, metaMgr, coord, b.ID)
+		}
+	}
+
+	// Start primary broker listener (blocks until ctx is cancelled)
+	network.Start(ctx, metaMgr, coord, brokerID)
+
+	// Wait for all followers and ISR manager to finish
+	for _, fm := range followers {
+		fm.Wait()
+	}
 	isrMgr.Wait()
 }
 

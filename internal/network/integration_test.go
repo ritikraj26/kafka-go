@@ -29,7 +29,7 @@ func TestIntegration_ConsumerGroupLifecycle(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		Serve(ctx, listener, metaMgr, coord)
+		Serve(ctx, listener, metaMgr, coord, 1)
 		close(done)
 	}()
 	time.Sleep(50 * time.Millisecond)

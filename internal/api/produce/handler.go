@@ -10,7 +10,7 @@ import (
 )
 
 // BuildBody builds a Produce v11 response
-func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
+func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32) []byte {
 	encoder := protocol.NewEncoder()
 
 	// responses (COMPACT_ARRAY) - comes FIRST in Produce v11
@@ -50,7 +50,10 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager) []byte {
 					}
 				}
 
-				if matchedPartition != nil {
+				if matchedPartition != nil && matchedPartition.LeaderID != localBrokerID {
+					// This broker is not the leader for this partition
+					errorCode = protocol.ErrNotLeaderOrFollower
+				} else if matchedPartition != nil {
 					if len(reqPartition.Records) > 0 {
 						// --- AI Schema Validation ---
 						// Extract raw message values from the RecordBatch and validate
