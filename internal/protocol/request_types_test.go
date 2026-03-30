@@ -227,6 +227,79 @@ func TestParseFetchRequest(t *testing.T) {
 	if req.Topics[0].Partitions[0].FetchOffset != 0 {
 		t.Errorf("FetchOffset = %d, want 0", req.Topics[0].Partitions[0].FetchOffset)
 	}
+	if req.Topics[0].Partitions[0].CurrentLeaderEpoch != -1 {
+		t.Errorf("CurrentLeaderEpoch = %d, want -1", req.Topics[0].Partitions[0].CurrentLeaderEpoch)
+	}
+}
+
+// TestParseFetchRequestV0_EpochDefault verifies that Fetch v0 (which has no epoch
+// field on the wire) always sets CurrentLeaderEpoch to -1 after parsing.
+func TestParseFetchRequestV0_EpochDefault(t *testing.T) {
+	tmp2 := make([]byte, 2)
+	tmp4 := make([]byte, 4)
+	tmp8 := make([]byte, 8)
+
+	var body []byte
+
+	// client_id: "demo" (STRING — 2-byte length + content)
+	binary.BigEndian.PutUint16(tmp2, 4)
+	body = append(body, tmp2...)
+	body = append(body, "demo"...)
+
+	// replica_id: -1
+	binary.BigEndian.PutUint32(tmp4, 0xFFFFFFFF)
+	body = append(body, tmp4...)
+
+	// max_wait_ms: 100
+	binary.BigEndian.PutUint32(tmp4, 100)
+	body = append(body, tmp4...)
+
+	// min_bytes: 1
+	binary.BigEndian.PutUint32(tmp4, 1)
+	body = append(body, tmp4...)
+
+	// topics array: 1 element
+	binary.BigEndian.PutUint32(tmp4, 1)
+	body = append(body, tmp4...)
+
+	// topic name: "orders" (STRING)
+	tn := "orders"
+	binary.BigEndian.PutUint16(tmp2, uint16(len(tn)))
+	body = append(body, tmp2...)
+	body = append(body, tn...)
+
+	// partitions array: 1 element
+	binary.BigEndian.PutUint32(tmp4, 1)
+	body = append(body, tmp4...)
+
+	// partition index: 0
+	binary.BigEndian.PutUint32(tmp4, 0)
+	body = append(body, tmp4...)
+
+	// fetch_offset: 0
+	binary.BigEndian.PutUint64(tmp8, 0)
+	body = append(body, tmp8...)
+
+	// partition max_bytes: 1048576
+	binary.BigEndian.PutUint32(tmp4, 1048576)
+	body = append(body, tmp4...)
+
+	header := makeRequestHeader(APIKeyFetch, 0, body)
+	req, err := ParseFetchRequestV0(header)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(req.Topics) != 1 || len(req.Topics[0].Partitions) != 1 {
+		t.Fatalf("unexpected topics/partitions count")
+	}
+	if req.Topics[0].TopicName != "orders" {
+		t.Errorf("TopicName = %q, want \"orders\"", req.Topics[0].TopicName)
+	}
+	// v0 has no epoch field — must default to -1 so epoch validation is skipped.
+	if req.Topics[0].Partitions[0].CurrentLeaderEpoch != -1 {
+		t.Errorf("CurrentLeaderEpoch = %d, want -1 (v0 no-epoch default)", req.Topics[0].Partitions[0].CurrentLeaderEpoch)
+	}
 }
 
 func TestParseDescribeTopicPartitionsRequest(t *testing.T) {

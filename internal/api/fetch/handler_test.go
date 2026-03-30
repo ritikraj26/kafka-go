@@ -125,3 +125,80 @@ func TestBuildBody_KnownTopicWithRecords(t *testing.T) {
 		t.Errorf("error_code = %d, want 0", topLevelErr)
 	}
 }
+
+// partitionErrCode parses the per-partition error_code out of a flex Fetch response.
+// Layout after BuildBody: throttle(4)+error(2)+session_id(4)+topics_varint(1)+UUID(16)+parts_varint(1)+part_idx(4) = offset 32.
+func partitionErrCode(t *testing.T, body []byte) int16 {
+	t.Helper()
+	const offset = 4 + 2 + 4 + 1 + 16 + 1 + 4
+	if offset+2 > len(body) {
+		t.Fatalf("response too short (%d bytes) to read partition error_code", len(body))
+	}
+	return int16(binary.BigEndian.Uint16(body[offset : offset+2]))
+}
+
+func TestBuildBody_FencedLeaderEpoch(t *testing.T) {
+	metaMgr := metadata.NewManager()
+	topic := metaMgr.CreateTopic("epoch-topic", 1)
+	topic.Partitions[0].LeaderEpoch = 2
+	topic.Partitions[0].LeaderID = 1
+
+	var topicIDBytes [16]byte
+	copy(topicIDBytes[:], topic.ID[:])
+
+	req := &protocol.FetchRequest{
+		MaxWaitMs:    0,
+		MinBytes:     1,
+		MaxBytes:     1 << 20,
+		SessionID:    0,
+		SessionEpoch: -1,
+		ReplicaID:    -1, // consumer, not replica
+		Topics: []protocol.FetchTopic{
+			{
+				TopicID: topicIDBytes,
+				Partitions: []protocol.FetchPartition{
+					{PartitionIndex: 0, FetchOffset: 0, CurrentLeaderEpoch: 1}, // stale: 1 < 2
+				},
+			},
+		},
+	}
+
+	body := BuildBody(req, metaMgr)
+	got := partitionErrCode(t, body)
+	if got != protocol.ErrFencedLeaderEpoch {
+		t.Errorf("partition error_code = %d, want %d (ErrFencedLeaderEpoch)", got, protocol.ErrFencedLeaderEpoch)
+	}
+}
+
+func TestBuildBody_EpochTooNew(t *testing.T) {
+	metaMgr := metadata.NewManager()
+	topic := metaMgr.CreateTopic("epoch-new-topic", 1)
+	topic.Partitions[0].LeaderEpoch = 2
+	topic.Partitions[0].LeaderID = 1
+
+	var topicIDBytes [16]byte
+	copy(topicIDBytes[:], topic.ID[:])
+
+	req := &protocol.FetchRequest{
+		MaxWaitMs:    0,
+		MinBytes:     1,
+		MaxBytes:     1 << 20,
+		SessionID:    0,
+		SessionEpoch: -1,
+		ReplicaID:    -1, // consumer — too-new check only fires for consumers
+		Topics: []protocol.FetchTopic{
+			{
+				TopicID: topicIDBytes,
+				Partitions: []protocol.FetchPartition{
+					{PartitionIndex: 0, FetchOffset: 0, CurrentLeaderEpoch: 3}, // too new: 3 > 2
+				},
+			},
+		},
+	}
+
+	body := BuildBody(req, metaMgr)
+	got := partitionErrCode(t, body)
+	if got != protocol.ErrNotLeaderOrFollower {
+		t.Errorf("partition error_code = %d, want %d (ErrNotLeaderOrFollower)", got, protocol.ErrNotLeaderOrFollower)
+	}
+}

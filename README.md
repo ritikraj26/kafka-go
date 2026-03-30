@@ -2,7 +2,6 @@
 
 A Kafka-compatible broker implemented from scratch in Go, supporting the binary wire protocol, on-disk persistence with sparse indexing, and AI-powered schema validation with dead-letter queue routing.
 
-Built as part of the [CodeCrafters "Build Your Own Kafka" challenge](https://codecrafters.io/challenges/kafka), then extended with production-grade features.
 
 ## Supported APIs
 
@@ -81,7 +80,8 @@ internal/
 - **Consumer groups** — Full eager-rebalance protocol: FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup with session timeout expiry and automatic rebalance triggers
 - **Offset management** — OffsetCommit/OffsetFetch for consumer group offset tracking; ListOffsets for earliest/latest offset discovery
 - **Simulated replication** — Configurable multi-broker cluster (in-process) with round-robin replica assignment, follower fetch simulation, and high watermark advancement
-- **ISR management** — Automatic ISR shrink on replica lag timeout, ISR expand when replicas catch up to log end offset
+- **LeaderEpoch validation** — Fetch requests carrying a `current_leader_epoch` are fenced: stale epoch → `ErrFencedLeaderEpoch (74)`, epoch newer than the leader's → `ErrNotLeaderOrFollower (6)`; epoch `-1` (Fetch v0 / old clients) skips validation
+- **ISR management** — Automatic ISR shrink when a replica exceeds the lag timeout **or** falls more than 10,000 messages behind the leader LEO (dual check); ISR expand when the replica catches up
 - **Produce acks** — Supports `acks=0` (fire-and-forget), `acks=1` (leader only), `acks=-1` (wait for ISR high watermark)
 - **Leader election** — Simple ISR-based leader election with epoch tracking
 - **Offset tracking** — Per-partition `NextOffset`, `HighWatermark`, and `LogEndOffset` recovered from existing log files at startup
@@ -138,14 +138,14 @@ go test ./internal/replication/ -v
 
 | Package | Tests |
 |---------|-------|
-| `protocol` | Encoder/decoder roundtrip, varint encoding, compact strings, UUID, all 13 request parsers |
+| `protocol` | Encoder/decoder roundtrip, varint encoding, compact strings, UUID, all 13 request parsers, `CurrentLeaderEpoch` field in Fetch v16, v0 epoch defaults to -1 |
 | `schema` | Validation (missing field, wrong type, not JSON), inference from JSON, integer↔number coercion |
 | `metadata` | SeekToOffset binary search, no-index fallback, leader election |
 | `coordinator` | Single/multi-member join, sync group, heartbeat, leave + rebalance, offset commit/fetch |
-| `replication` | Follower HW advancement, ISR shrink on lag, ISR expand on catch-up |
+| `replication` | Follower HW advancement, ISR shrink on time lag, ISR shrink on LEO lag (>10 000 messages), ISR expand on catch-up |
 | `api/api_versions` | All 13 API keys present, error propagation |
 | `api/produce` | Unknown topic error, valid topic write + offset |
-| `api/fetch` | Unknown topic ID error, known topic with records |
+| `api/fetch` | Unknown topic ID error, known topic with records, `ErrFencedLeaderEpoch` (stale epoch), `ErrNotLeaderOrFollower` (epoch too new) |
 | `network` | End-to-end ApiVersions roundtrip, full consumer group lifecycle integration test |
 
 ## Limitations & Future Work
