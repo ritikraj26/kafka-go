@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -180,11 +181,11 @@ func buildRecordBatch(key, value []byte) []byte {
 	recWithLen.Write(recBytes)
 
 	var batch bytes.Buffer
-	binary.Write(&batch, binary.BigEndian, int64(0))               // baseOffset
+	binary.Write(&batch, binary.BigEndian, int64(0)) // baseOffset
 	batchLengthPos := batch.Len()
 	binary.Write(&batch, binary.BigEndian, int32(0))               // batchLength placeholder
 	binary.Write(&batch, binary.BigEndian, int32(0))               // partitionLeaderEpoch
-	batch.WriteByte(2)                                              // magic
+	batch.WriteByte(2)                                             // magic
 	binary.Write(&batch, binary.BigEndian, uint32(0))              // CRC placeholder
 	binary.Write(&batch, binary.BigEndian, int16(0))               // attributes
 	binary.Write(&batch, binary.BigEndian, int32(0))               // lastOffsetDelta
@@ -208,13 +209,13 @@ func buildProduceV11Body(topicName string, partitionIndex int32, records []byte)
 	var body []byte
 	body = append(body, flexHeader()...)
 	body = append(body, 0x00)                              // transactional_id: null
-	body = append(body, encodeInt16(-1)...)                 // acks: all
-	body = append(body, encodeInt32(5000)...)               // timeout_ms
+	body = append(body, encodeInt16(-1)...)                // acks: all
+	body = append(body, encodeInt32(5000)...)              // timeout_ms
 	body = append(body, 0x02)                              // topics compact array: 1
 	body = append(body, encodeCompactString(topicName)...) // topic name
 	body = append(body, 0x02)                              // partitions compact array: 1
-	body = append(body, encodeInt32(partitionIndex)...)     // partition index
-	body = append(body, encodeCompactBytes(records)...)     // records
+	body = append(body, encodeInt32(partitionIndex)...)    // partition index
+	body = append(body, encodeCompactBytes(records)...)    // records
 	body = append(body, 0x00)                              // TAG partition
 	body = append(body, 0x00)                              // TAG topic
 	body = append(body, 0x00)                              // TAG body
@@ -311,6 +312,7 @@ func main() {
 	metaMgr.ReplicationFactor = 3
 	metaMgr.SetLogDir(logDir)
 	coord := coordinator.NewCoordinator()
+	coord.RebalanceDelay = 500 * time.Millisecond // allow all members to arrive before completing join
 
 	isrMgr := replication.NewISRManager(metaMgr, 500*time.Millisecond, 10000)
 	isrMgr.Start(ctx)
@@ -529,8 +531,38 @@ func main() {
 	}
 
 	// STEP 8
+	banner("STEP 8: Consumer Group — 3 Members Join Simultaneously")
+	info("  RebalanceDelay=500ms so all members land in the same generation")
+	var cgWg sync.WaitGroup
+	cgResults := make([]*coordinator.JoinGroupResult, 3)
+	for i := 0; i < 3; i++ {
+		cgWg.Add(1)
+		go func(idx int) {
+			defer cgWg.Done()
+			cgResults[idx] = coord.JoinGroup("demo-group", "", 10000, "consumer",
+				[]coordinator.MemberProtocol{{Name: "range", Metadata: []byte("meta")}})
+		}(i)
+	}
+	cgWg.Wait()
+	for i, r := range cgResults {
+		if r.ErrorCode == 0 {
+			role := "follower"
+			if r.MemberID == r.LeaderID {
+				role = "LEADER "
+			}
+			ok(fmt.Sprintf("Consumer %d — gen=%d  role=%s  memberID=%s...",
+				i+1, r.GenerationID, role, r.MemberID[:8]))
+		} else {
+			fail(fmt.Sprintf("Consumer %d join failed: error_code=%d", i+1, r.ErrorCode))
+		}
+	}
+	if len(cgResults) > 0 && cgResults[0].ErrorCode == 0 {
+		ok(fmt.Sprintf("All 3 consumers in generation %d — one rebalance round", cgResults[0].GenerationID))
+	}
+
+	// STEP 9
 	oldLeader := p.LeaderID
-	banner(fmt.Sprintf("STEP 8: Leader Failover \u2014 Killing Broker %d", oldLeader))
+	banner(fmt.Sprintf("STEP 9: Leader Failover \u2014 Killing Broker %d", oldLeader))
 	info(fmt.Sprintf("  Current leader: broker %d", oldLeader))
 	info(fmt.Sprintf("  Current ISR:    %v", p.ISRNodes))
 
@@ -556,9 +588,9 @@ func main() {
 		warn("Leader election did not occur within timeout")
 	}
 
-	// STEP 9
+	// STEP 10
 	if p.LeaderID != oldLeader {
-		banner(fmt.Sprintf("STEP 9: Produce to New Leader (broker %d)", p.LeaderID))
+		banner(fmt.Sprintf("STEP 10: Produce to New Leader (broker %d)", p.LeaderID))
 		newLeaderPort := ports[p.LeaderID-1]
 		newConn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", newLeaderPort), 2*time.Second)
 		if err != nil {
@@ -592,8 +624,9 @@ func main() {
 	fmt.Println("    6.  Fetch v0 consumer read from leader")
 	fmt.Println("    7.  Metadata v12 cluster overview")
 	fmt.Println("    8.  Per-broker log directory isolation")
-	fmt.Println("    9.  Controller-driven automatic leader failover")
-	fmt.Println("    10. Produce to newly-elected leader \u2192 SUCCESS")
+	fmt.Println("    9.  Consumer group — 3 members, 1 rebalance round, leader elected")
+	fmt.Println("    10. Controller-driven automatic leader failover")
+	fmt.Println("    11. Produce to newly-elected leader \u2192 SUCCESS")
 	fmt.Println()
 
 	stop()
