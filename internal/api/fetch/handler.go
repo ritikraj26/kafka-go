@@ -65,6 +65,22 @@ func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes
 					pr.leo = partition.LogEndOffset
 					pr.errCode = protocol.ErrNone
 
+					// LeaderEpoch validation — only when requester is tracking epochs (-1 = not tracking)
+					if reqPart.CurrentLeaderEpoch >= 0 {
+						if reqPart.CurrentLeaderEpoch < partition.LeaderEpoch {
+							// Requester (follower or consumer) is behind — stale epoch
+							pr.errCode = protocol.ErrFencedLeaderEpoch
+							tr.parts = append(tr.parts, pr)
+							continue
+						}
+						if !isReplicaFetch && reqPart.CurrentLeaderEpoch > partition.LeaderEpoch {
+							// Consumer thinks a newer election happened — this broker is stale
+							pr.errCode = protocol.ErrNotLeaderOrFollower
+							tr.parts = append(tr.parts, pr)
+							continue
+						}
+					}
+
 					// Determine read limit: LEO for replica fetches, HW for consumers
 					readLimit := partition.HighWatermark
 					if isReplicaFetch {

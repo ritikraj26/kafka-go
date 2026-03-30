@@ -37,11 +37,25 @@ func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) {
 		lagTime := nowMs - lastSeen
 		if lagTime > lagTimeMaxMs {
 			// Replica hasn't fetched recently — remove from ISR
-			logger.L.Warn("shrinking ISR: replica lagging",
+			logger.L.Warn("shrinking ISR: replica time lag",
 				"broker", brokerID, "lagMs", lagTime)
 			continue
 		}
-		// Replica is in range — keep in ISR regardless of LEO
+
+		// LEO check: replica must be within maxLeoLag messages of the leader.
+		// Prevents a fast-heartbeating but slow-replicating replica from staying in ISR.
+		const maxLeoLag = int64(10000)
+		replicaLEO, hasLEO := p.ReplicaLEO[brokerID]
+		if !hasLEO || (p.LogEndOffset-replicaLEO) > maxLeoLag {
+			logger.L.Warn("shrinking ISR: replica LEO lag",
+				"broker", brokerID,
+				"replicaLEO", replicaLEO,
+				"leaderLEO", p.LogEndOffset,
+				"lag", p.LogEndOffset-replicaLEO)
+			continue
+		}
+
+		// Both time and LEO checks passed — keep in ISR
 		newISR = append(newISR, brokerID)
 	}
 

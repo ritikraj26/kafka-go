@@ -1,8 +1,10 @@
 package network
 
 import (
+	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	apiversions "github.com/codecrafters-io/kafka-starter-go/internal/api/api_versions"
@@ -34,7 +36,12 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 
 		requestHeader := protocol.NewRequestHeader()
 		if err := requestHeader.ReadFrom(conn); err != nil {
-			logger.L.Error("error reading request header", "err", err)
+			// EOF / connection-reset on read = client (or health-check probe) disconnected cleanly.
+			if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "connection reset") {
+				logger.L.Debug("client disconnected", "err", err)
+			} else {
+				logger.L.Error("error reading request header", "err", err)
+			}
 			return
 		}
 

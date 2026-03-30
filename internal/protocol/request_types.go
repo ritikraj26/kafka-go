@@ -62,8 +62,9 @@ type FetchTopic struct {
 
 // FetchPartition represents a partition in a Fetch request
 type FetchPartition struct {
-	PartitionIndex int32
-	FetchOffset    int64
+	PartitionIndex     int32
+	FetchOffset        int64
+	CurrentLeaderEpoch int32 // -1 means requester is not tracking epochs (Fetch v0 / old clients)
 }
 
 // FetchRequest request (api_key=1)
@@ -489,8 +490,9 @@ func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
 				return nil, fmt.Errorf("v0 fetch: failed to read partition max_bytes: %w", err)
 			}
 			partitions = append(partitions, FetchPartition{
-				PartitionIndex: partIdx,
-				FetchOffset:    fetchOffset,
+				PartitionIndex:     partIdx,
+				FetchOffset:        fetchOffset,
+				CurrentLeaderEpoch: -1, // Fetch v0 has no epoch field
 			})
 		}
 
@@ -623,7 +625,7 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 					}
 
 					// current_leader_epoch (INT32)
-					_, err = decoder.ReadInt32()
+					currentLeaderEpoch, err := decoder.ReadInt32()
 					if err != nil {
 						return nil, fmt.Errorf("failed to read current_leader_epoch: %w", err)
 					}
@@ -659,8 +661,9 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 					}
 
 					partitions = append(partitions, FetchPartition{
-						PartitionIndex: partitionIndex,
-						FetchOffset:    fetchOffset,
+						PartitionIndex:     partitionIndex,
+						FetchOffset:        fetchOffset,
+						CurrentLeaderEpoch: currentLeaderEpoch,
 					})
 				}
 			}

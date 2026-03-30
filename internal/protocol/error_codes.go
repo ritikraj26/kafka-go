@@ -16,4 +16,5 @@ const (
 	ErrMemberIDRequired        int16 = 79
 	ErrGroupMaxSizeReached     int16 = 81
 	ErrUnknownTopicID          int16 = 100
+	ErrFencedLeaderEpoch       int16 = 74
 )
