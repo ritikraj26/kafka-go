@@ -46,6 +46,7 @@ func main() {
 
 	// Create consumer group coordinator
 	coord := coordinator.NewCoordinator()
+	coord.RebalanceDelay = 3 * time.Second // hold join round open so all members can arrive
 
 	// Parse server.properties if provided
 	logDir := "/tmp/kraft-broker-logs" // Default log directory
