@@ -89,12 +89,12 @@ func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes
 
 					if reqPart.FetchOffset < readLimit && bytesWritten < maxBytes {
 						logDir := partition.LogDirForBroker(localBrokerID)
-						bytePos, seekErr := partition.SeekToOffset(reqPart.FetchOffset, logDir)
+						segFile, bytePos, seekErr := partition.SeekToOffset(reqPart.FetchOffset, logDir)
 						if seekErr != nil {
 							logger.L.Error("SeekToOffset failed", "partition", partition.Index, "err", seekErr)
 							pr.errCode = protocol.ErrUnknownServerError
 						} else {
-							records, readErr := metadata.ReadPartitionLogFrom(partition, bytePos, logDir)
+							records, readErr := metadata.ReadPartitionLogFrom(partition, segFile, bytePos, logDir)
 							if readErr != nil {
 								logger.L.Error("ReadPartitionLogFrom failed", "partition", partition.Index, "err", readErr)
 								pr.errCode = protocol.ErrUnknownServerError

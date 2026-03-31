@@ -76,6 +76,7 @@ internal/
 
 - **Binary wire protocol** — Full Kafka protocol serialization: varints, compact arrays, compact strings, UUIDs, TAG_BUFFERs
 - **On-disk persistence** — Records written to `.log` files per partition; sparse `.index` files with binary search for offset lookup
+- **Log segment rolling** — Active segment rolls to a new `%020d.log` / `%020d.index` pair when the file exceeds `MaxSegmentBytes` (default 1 GB); `SeekToOffset` selects the correct segment before binary-searching its index
 - **Cluster metadata recovery** — Parses `__cluster_metadata` KIP-631 records on startup to recover topic UUIDs
 - **Consumer groups** — Full eager-rebalance protocol: FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup with session timeout expiry and automatic rebalance triggers
 - **Offset management** — OffsetCommit/OffsetFetch for consumer group offset tracking; ListOffsets for earliest/latest offset discovery
@@ -140,7 +141,7 @@ go test ./internal/replication/ -v
 |---------|-------|
 | `protocol` | Encoder/decoder roundtrip, varint encoding, compact strings, UUID, all 13 request parsers, `CurrentLeaderEpoch` field in Fetch v16, v0 epoch defaults to -1 |
 | `schema` | Validation (missing field, wrong type, not JSON), inference from JSON, integer↔number coercion |
-| `metadata` | SeekToOffset binary search, no-index fallback, leader election |
+| `metadata` | SeekToOffset binary search, no-index fallback, leader election, segment rolling + `recoverNextOffset` across segments |
 | `coordinator` | Single/multi-member join, sync group, heartbeat, leave + rebalance, offset commit/fetch |
 | `replication` | Follower HW advancement, ISR shrink on time lag, ISR shrink on LEO lag (>10 000 messages), ISR expand on catch-up |
 | `api/api_versions` | All 13 API keys present, error propagation |
@@ -150,7 +151,6 @@ go test ./internal/replication/ -v
 
 ## Limitations & Future Work
 
-- **Single log segment** — No segment rolling; all records go to `00000000000000000000.log`
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported
 - **Partial DLQ filtering** — When some (not all) records in a batch fail schema validation, the full batch still writes to the main topic (individual record filtering from binary RecordBatch is not supported)

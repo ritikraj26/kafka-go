@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/ritiraj/kafka-go/internal/logger"
 	"github.com/google/uuid"
+	"github.com/ritiraj/kafka-go/internal/logger"
 )
 
 // LoadTopicsFromDisk scans the log directory and loads existing topics
@@ -183,13 +184,20 @@ func parseTopicDirName(dirName string) (string, int, error) {
 	return topicName, partitionIndex, nil
 }
 
-// recoverNextOffset counts RecordBatches in the existing log to recover NextOffset.
-// Each RecordBatch corresponds to one offset increment (as we track batches, not records).
+// recoverNextOffset counts RecordBatches across all segments to recover NextOffset.
+// It sums the batch count only in the last (active) segment and adds its base offset,
+// since earlier segments are sealed and their offsets are encoded in their file names.
 func recoverNextOffset(logDir string) int64 {
-	logFile := logDir + "/00000000000000000000.log"
+	segs := listSegments(logDir)
+	if len(segs) == 0 {
+		return 0
+	}
+	last := segs[len(segs)-1]
+	logFile := filepath.Join(logDir, last.name)
 	data, err := os.ReadFile(logFile)
 	if err != nil {
-		return 0
+		// File listed but unreadable — fall back to base offset
+		return last.baseOffset
 	}
 	var count int64
 	pos := 0
@@ -202,7 +210,7 @@ func recoverNextOffset(logDir string) int64 {
 		count++
 		pos = batchEnd
 	}
-	return count
+	return last.baseOffset + count
 }
 
 // parseClusterMetadataForTopics reads __cluster_metadata log using proper
@@ -358,20 +366,20 @@ func readUvarint(data []byte, pos int) (uint64, int) {
 	return 0, 0
 }
 
-// ReadPartitionLog reads the log file for a partition and returns the raw bytes
-// from the given file position onwards (0 = from beginning).
+// ReadPartitionLog reads the first segment of the partition log from the beginning.
 func ReadPartitionLog(partition *Partition) ([]byte, error) {
-	return ReadPartitionLogFrom(partition, 0)
+	return ReadPartitionLogFrom(partition, "00000000000000000000.log", 0)
 }
 
-// ReadPartitionLogFrom reads the log file starting at byteOffset using seek,
-// avoiding reading the entire file into memory for large logs.
-func ReadPartitionLogFrom(partition *Partition, byteOffset int64, logDir ...string) ([]byte, error) {
+// ReadPartitionLogFrom reads a specific segment file starting at byteOffset.
+// segmentLogFile is the bare file name (e.g. "00000000000000000000.log");
+// logDir overrides partition.LogDir when provided.
+func ReadPartitionLogFrom(partition *Partition, segmentLogFile string, byteOffset int64, logDir ...string) ([]byte, error) {
 	dir := partition.LogDir
 	if len(logDir) > 0 && logDir[0] != "" {
 		dir = logDir[0]
 	}
-	logFilePath := dir + "/00000000000000000000.log"
+	logFilePath := filepath.Join(dir, segmentLogFile)
 	f, err := os.Open(logFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {

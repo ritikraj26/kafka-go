@@ -7,6 +7,56 @@ import (
 	"testing"
 )
 
+// TestSegmentRolling verifies that AppendRecords rolls to a new segment when
+// MaxSegmentBytes is exceeded, that multiple .log files are created, and that
+// recoverNextOffset returns the correct total across all segments.
+func TestSegmentRolling(t *testing.T) {
+	dir := t.TempDir()
+
+	// Override segment size: 20 bytes so each ~12-byte-header batch forces a roll.
+	orig := MaxSegmentBytes
+	MaxSegmentBytes = 20
+	defer func() { MaxSegmentBytes = orig }()
+
+	// Build a minimal valid-enough RecordBatch: 8-byte baseOffset + 4-byte batchLength + 12 payload bytes.
+	makeBatch := func() []byte {
+		b := make([]byte, 24)
+		binary.BigEndian.PutUint32(b[8:12], 12) // batchLength = 12
+		return b
+	}
+
+	p := &Partition{
+		Index:      0,
+		LeaderID:   1,
+		ISRNodes:   []int32{1},
+		ReplicaLEO: map[int32]int64{},
+	}
+
+	partDir := filepath.Join(dir, "test-0")
+	os.MkdirAll(partDir, 0755)
+
+	// Write 4 batches; with MaxSegmentBytes=20 and batch size=24 each write should
+	// create a new segment after the first (first segment gets the 24-byte write,
+	// which then exceeds 20 → next write rolls).
+	for i := 0; i < 4; i++ {
+		if _, err := p.AppendRecords(makeBatch(), partDir); err != nil {
+			t.Fatalf("AppendRecords[%d]: %v", i, err)
+		}
+	}
+
+	// There should be more than one .log file.
+	segs := listSegments(partDir)
+	if len(segs) < 2 {
+		t.Errorf("expected at least 2 segments, got %d", len(segs))
+	}
+
+	// recoverNextOffset must equal the number of batches we wrote.
+	got := recoverNextOffset(partDir)
+	if got != 4 {
+		t.Errorf("recoverNextOffset = %d, want 4", got)
+	}
+}
+
 // TestSeekToOffset verifies binary search across a synthetic 3-entry index.
 func TestSeekToOffset(t *testing.T) {
 	dir := t.TempDir()
@@ -16,6 +66,10 @@ func TestSeekToOffset(t *testing.T) {
 	//   offset 0  → file position 0
 	//   offset 5  → file position 100
 	//   offset 10 → file position 200
+	// Also create the corresponding .log file so listSegments finds the segment.
+	if err := os.WriteFile(filepath.Join(dir, "00000000000000000000.log"), []byte{}, 0644); err != nil {
+		t.Fatalf("setup log: %v", err)
+	}
 	idx := filepath.Join(dir, "00000000000000000000.index")
 	entries := [][2]int32{{0, 0}, {5, 100}, {10, 200}}
 	data := make([]byte, len(entries)*8)
@@ -40,7 +94,7 @@ func TestSeekToOffset(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got, err := p.SeekToOffset(tt.target)
+		_, got, err := p.SeekToOffset(tt.target)
 		if err != nil {
 			t.Errorf("SeekToOffset(%d): unexpected error: %v", tt.target, err)
 			continue
@@ -55,7 +109,7 @@ func TestSeekToOffset(t *testing.T) {
 func TestSeekToOffsetNoIndex(t *testing.T) {
 	dir := t.TempDir()
 	p := &Partition{LogDir: dir}
-	got, err := p.SeekToOffset(42)
+	_, got, err := p.SeekToOffset(42)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

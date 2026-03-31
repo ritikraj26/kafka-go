@@ -6,11 +6,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/ritiraj/kafka-go/internal/logger"
 	"github.com/google/uuid"
+	"github.com/ritiraj/kafka-go/internal/logger"
 )
 
 // topic with metadata
@@ -30,8 +32,8 @@ type Partition struct {
 	OfflineReplicas []int32
 	LeaderEpoch     int32
 	PartitionEpoch  int32
-	LogDir          string            // Legacy: leader's log directory (kept for backward compat)
-	BrokerLogDirs   map[int32]string  // Per-broker log directories (brokerID -> dir)
+	LogDir          string           // Legacy: leader's log directory (kept for backward compat)
+	BrokerLogDirs   map[int32]string // Per-broker log directories (brokerID -> dir)
 
 	// Offset tracking
 	NextOffset    int64 // Next offset to assign to an incoming RecordBatch
@@ -152,22 +154,16 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Get current file size to record as the byte position in the index.
-	logFile := filepath.Join(logDir, "00000000000000000000.log")
-	var filePos int64
-	if fi, statErr := os.Stat(logFile); statErr == nil {
-		filePos = fi.Size()
-	}
-
-	if err = writeRecords(logDir, records, p.NextOffset); err != nil {
-		return -1, err
+	writtenFile, filePosBefore, writeErr := writeRecords(logDir, records, p.NextOffset)
+	if writeErr != nil {
+		return -1, writeErr
 	}
 
 	baseOffset = p.NextOffset
 
-	// Append a 12-byte sparse index entry: relativeOffset(4) + filePosition(4) + baseOffset(8→4 truncated)
-	// We store: relativeOffset INT32 + filePosition INT32 (sufficient for files < 4GB)
-	if indexErr := appendIndexEntry(logDir, int32(baseOffset), int32(filePos)); indexErr != nil {
+	// Build the index path from the actual segment file that was written.
+	indexPath := strings.TrimSuffix(writtenFile, ".log") + ".index"
+	if indexErr := appendIndexEntry(indexPath, int32(baseOffset), int32(filePosBefore)); indexErr != nil {
 		// Non-fatal: index is a performance optimisation, not correctness-critical
 		logger.L.Warn("failed to write index entry", "err", indexErr)
 	}
@@ -187,11 +183,10 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 	return baseOffset, nil
 }
 
-// appendIndexEntry appends an 8-byte entry to the sparse offset index file.
+// appendIndexEntry appends an 8-byte entry to the given sparse offset index file.
 // Format: relativeOffset INT32 (big-endian) + filePosition INT32 (big-endian)
-func appendIndexEntry(logDir string, relativeOffset int32, filePos int32) error {
-	indexFile := filepath.Join(logDir, "00000000000000000000.index")
-	f, err := os.OpenFile(indexFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func appendIndexEntry(indexFilePath string, relativeOffset int32, filePos int32) error {
+	f, err := os.OpenFile(indexFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
@@ -205,24 +200,43 @@ func appendIndexEntry(logDir string, relativeOffset int32, filePos int32) error 
 	return f.Sync()
 }
 
-// SeekToOffset binary-searches the sparse index to find the file byte position
-// for the largest index entry whose relativeOffset <= targetOffset.
-// Returns 0 if the index doesn't exist or targetOffset is before the first entry.
-func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (int64, error) {
+// SeekToOffset finds the segment file and byte position for targetOffset.
+// It selects the last segment whose base offset <= targetOffset, then
+// binary-searches that segment's sparse index for the closest byte position.
+// Returns (segmentFileName, byteOffset, error).
+func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, int64, error) {
 	dir := p.LogDir
 	if len(logDir) > 0 && logDir[0] != "" {
 		dir = logDir[0]
 	}
-	indexFile := filepath.Join(dir, "00000000000000000000.index")
+
+	segs := listSegments(dir)
+	if len(segs) == 0 {
+		return "00000000000000000000.log", 0, nil
+	}
+
+	// Pick the last segment whose base offset <= targetOffset.
+	chosen := segs[0]
+	for _, s := range segs {
+		if s.baseOffset <= targetOffset {
+			chosen = s
+		} else {
+			break
+		}
+	}
+
+	// Binary-search the chosen segment's index file.
+	indexFile := filepath.Join(dir, strings.TrimSuffix(chosen.name, ".log")+".index")
 	data, err := os.ReadFile(indexFile)
 	if err != nil {
-		return 0, nil // no index → start from beginning
+		// No index for this segment — start reading from the beginning of it.
+		return chosen.name, 0, nil
 	}
 
 	const entrySize = 8
 	numEntries := len(data) / entrySize
 	if numEntries == 0 {
-		return 0, nil
+		return chosen.name, 0, nil
 	}
 
 	// Binary search for largest relativeOffset <= targetOffset
@@ -239,7 +253,7 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (int64, e
 			hi = mid - 1
 		}
 	}
-	return result, nil
+	return chosen.name, result, nil
 }
 
 // AppendReplicaRecords writes fetched record data to a follower's log directory.
@@ -252,7 +266,8 @@ func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string) e
 	if len(records) == 0 {
 		return nil
 	}
-	return writeRecords(replicaLogDir, records, 0)
+	_, _, err := writeRecords(replicaLogDir, records, 0)
+	return err
 }
 
 // AdvanceHighWatermark recalculates HW as min(LEO) across all ISR replicas.
@@ -289,23 +304,41 @@ func (p *Partition) AdvanceHighWatermark() {
 // MaxSegmentBytes is the maximum size of a single log segment file before rolling.
 var MaxSegmentBytes int64 = 1 << 30 // 1 GB
 
-// activeSegmentName returns the name of the active (latest) .log segment in logDir.
-func activeSegmentName(logDir string) string {
+// logSegment represents a single .log segment file on disk.
+type logSegment struct {
+	baseOffset int64  // first offset in the segment (encoded in the file name)
+	name       string // e.g. "00000000000001000000.log"
+}
+
+// listSegments returns all .log segments in logDir sorted by base offset ascending.
+func listSegments(logDir string) []logSegment {
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
-		return "00000000000000000000.log"
+		return nil
 	}
-	latest := ""
+	var segs []logSegment
 	for _, e := range entries {
 		name := e.Name()
-		if filepath.Ext(name) == ".log" && name > latest {
-			latest = name
+		if filepath.Ext(name) != ".log" || len(name) != 24 {
+			continue
 		}
+		var base int64
+		if _, err := fmt.Sscanf(strings.TrimSuffix(name, ".log"), "%d", &base); err != nil {
+			continue
+		}
+		segs = append(segs, logSegment{baseOffset: base, name: name})
 	}
-	if latest == "" {
+	sort.Slice(segs, func(i, j int) bool { return segs[i].baseOffset < segs[j].baseOffset })
+	return segs
+}
+
+// activeSegmentName returns the name of the active (latest) .log segment in logDir.
+func activeSegmentName(logDir string) string {
+	segs := listSegments(logDir)
+	if len(segs) == 0 {
 		return "00000000000000000000.log"
 	}
-	return latest
+	return segs[len(segs)-1].name
 }
 
 // segmentNameForOffset formats a segment file name from a base offset.
@@ -315,34 +348,41 @@ func segmentNameForOffset(baseOffset int64) string {
 
 // writeRecords appends raw record batch bytes to the partition's active log segment.
 // Rolls to a new segment if the active file exceeds MaxSegmentBytes.
-// Calls fsync for durability.
-func writeRecords(logDir string, records []byte, nextOffset int64) error {
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		return fmt.Errorf("failed to create log directory: %w", err)
+// Returns (logFilePath, filePosBefore, error). filePosBefore is the byte offset
+// at which these records were written — used to build the sparse index entry.
+func writeRecords(logDir string, records []byte, nextOffset int64) (logFilePath string, filePosBefore int64, err error) {
+	if err = os.MkdirAll(logDir, 0755); err != nil {
+		return "", 0, fmt.Errorf("failed to create log directory: %w", err)
 	}
 
 	segName := activeSegmentName(logDir)
 	logFile := filepath.Join(logDir, segName)
 
-	// Roll to a new segment if the current one exceeds the size limit
-	if fi, err := os.Stat(logFile); err == nil && fi.Size() >= MaxSegmentBytes {
+	// Capture size before the write (used as the sparse index byte position).
+	if fi, statErr := os.Stat(logFile); statErr == nil {
+		filePosBefore = fi.Size()
+	}
+
+	// Roll to a new segment if the current one exceeds the size limit.
+	if filePosBefore >= MaxSegmentBytes {
 		newName := segmentNameForOffset(nextOffset)
 		logger.L.Info("rolling log segment", "dir", logDir, "oldSegment", segName, "newSegment", newName)
 		logFile = filepath.Join(logDir, newName)
+		filePosBefore = 0
 	}
 
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
+	f, openErr := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if openErr != nil {
+		return "", 0, fmt.Errorf("failed to open log file: %w", openErr)
 	}
 	defer f.Close()
-	if _, err = f.Write(records); err != nil {
-		return fmt.Errorf("failed to write records: %w", err)
+	if _, writeErr := f.Write(records); writeErr != nil {
+		return "", 0, fmt.Errorf("failed to write records: %w", writeErr)
 	}
-	if err = f.Sync(); err != nil {
-		return fmt.Errorf("failed to fsync log file: %w", err)
+	if syncErr := f.Sync(); syncErr != nil {
+		return "", 0, fmt.Errorf("failed to fsync log file: %w", syncErr)
 	}
-	return nil
+	return logFile, filePosBefore, nil
 }
 
 // create a new topic with the given name and ID
