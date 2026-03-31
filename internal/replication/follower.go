@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // FollowerManager replicates data from leader partitions via real TCP Fetch v0 requests.

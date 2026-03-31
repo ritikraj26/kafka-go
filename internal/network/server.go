@@ -6,9 +6,9 @@ import (
 	"net"
 	"sync"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/coordinator"
+	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/metadata"
 )
 
 // Start binds to port 9092 and accepts incoming Kafka client connections.

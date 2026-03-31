@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 func TestBuildBody_UnknownTopic(t *testing.T) {

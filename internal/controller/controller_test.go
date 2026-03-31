@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/broker"
+	"github.com/ritiraj/kafka-go/internal/metadata"
 )
 
 func TestController_DetectsDeadBrokerAndElectsLeader(t *testing.T) {

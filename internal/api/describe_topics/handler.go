@@ -3,8 +3,8 @@ package describetopics
 import (
 	"sort"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // BuildBody builds a DescribeTopicPartitions response

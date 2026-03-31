@@ -1,8 +1,8 @@
 package findcoordinator
 
 import (
-	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/broker"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // BuildBody builds a FindCoordinator v0 response.

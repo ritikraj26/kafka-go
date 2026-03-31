@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/metadata"
 )
 
 func TestFollowerManager_EncodeFetchV0(t *testing.T) {

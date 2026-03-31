@@ -1,8 +1,8 @@
 package apimetadata
 
 import (
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 const clusterID = "kafka-go-cluster"

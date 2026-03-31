@@ -10,13 +10,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
-	"github.com/codecrafters-io/kafka-starter-go/internal/controller"
-	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
-	"github.com/codecrafters-io/kafka-starter-go/internal/network"
-	"github.com/codecrafters-io/kafka-starter-go/internal/replication"
+	"github.com/ritiraj/kafka-go/internal/broker"
+	"github.com/ritiraj/kafka-go/internal/controller"
+	"github.com/ritiraj/kafka-go/internal/coordinator"
+	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/network"
+	"github.com/ritiraj/kafka-go/internal/replication"
 )
 
 func main() {

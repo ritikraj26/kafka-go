@@ -3,8 +3,8 @@ package replication
 import (
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/metadata"
 )
 
 // DefaultReplicaLagTimeMaxMs is the default max time (ms) a replica can lag before ISR removal.

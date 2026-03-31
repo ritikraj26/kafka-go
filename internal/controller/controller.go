@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
-	"github.com/codecrafters-io/kafka-starter-go/internal/replication"
+	"github.com/ritiraj/kafka-go/internal/broker"
+	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/replication"
 )
 
 // Controller monitors broker health and triggers leader election when a leader goes offline.

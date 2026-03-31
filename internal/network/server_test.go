@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
-	"github.com/codecrafters-io/kafka-starter-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/coordinator"
+	"github.com/ritiraj/kafka-go/internal/metadata"
 )
 
 // TestIntegration_ApiVersionsRoundtrip starts the broker on a random port,

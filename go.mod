@@ -1,4 +1,4 @@
-module github.com/codecrafters-io/kafka-starter-go
+module github.com/ritiraj/kafka-go
 
 go 1.26.0
 

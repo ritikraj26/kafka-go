@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/logger"
 	"github.com/google/uuid"
 )
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/broker"
-	"github.com/codecrafters-io/kafka-starter-go/internal/schema"
+	"github.com/ritiraj/kafka-go/internal/broker"
+	"github.com/ritiraj/kafka-go/internal/schema"
 )
 
 // Manager holds cluster-level information and topic metadata

@@ -1,8 +1,8 @@
 package leavegroup
 
 import (
-	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/coordinator"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // BuildBody builds a LeaveGroup v0 response.

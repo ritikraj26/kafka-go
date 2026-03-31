@@ -1,8 +1,8 @@
 package syncgroup
 
 import (
-	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/coordinator"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // BuildBody builds a SyncGroup v0 response. May block for followers.

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/codecrafters-io/kafka-starter-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/logger"
 )
 
 // GroupState represents the state of a consumer group.

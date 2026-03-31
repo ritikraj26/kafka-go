@@ -1,8 +1,8 @@
 package joingroup
 
 import (
-	"github.com/codecrafters-io/kafka-starter-go/internal/coordinator"
-	"github.com/codecrafters-io/kafka-starter-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/coordinator"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // BuildBody builds a JoinGroup v0 response. May block until the join round completes.
