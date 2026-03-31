@@ -33,6 +33,10 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 		if !entry.IsDir() {
 			continue
 		}
+		// Skip broker replica subdirectories (broker-N/) created by the multi-broker layout.
+		if strings.HasPrefix(entry.Name(), "broker-") {
+			continue
+		}
 
 		topicName, _, err := parseTopicDirName(entry.Name())
 		if err != nil {
@@ -53,6 +57,10 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 	// Second pass: create topics with their UUIDs and partitions
 	for _, entry := range entries {
 		if !entry.IsDir() {
+			continue
+		}
+		// Skip broker replica subdirectories.
+		if strings.HasPrefix(entry.Name(), "broker-") {
 			continue
 		}
 
@@ -185,8 +193,8 @@ func parseTopicDirName(dirName string) (string, int, error) {
 }
 
 // recoverNextOffset counts RecordBatches across all segments to recover NextOffset.
-// It sums the batch count only in the last (active) segment and adds its base offset,
-// since earlier segments are sealed and their offsets are encoded in their file names.
+// It streams 12-byte batch headers from the last (active) segment rather than reading
+// the whole file into memory, avoiding a potential 1 GB allocation at startup.
 func recoverNextOffset(logDir string) int64 {
 	segs := listSegments(logDir)
 	if len(segs) == 0 {
@@ -194,21 +202,24 @@ func recoverNextOffset(logDir string) int64 {
 	}
 	last := segs[len(segs)-1]
 	logFile := filepath.Join(logDir, last.name)
-	data, err := os.ReadFile(logFile)
+	f, err := os.Open(logFile)
 	if err != nil {
 		// File listed but unreadable — fall back to base offset
 		return last.baseOffset
 	}
+	defer f.Close()
+
 	var count int64
-	pos := 0
-	for pos+12 <= len(data) {
-		batchLength := int(binary.BigEndian.Uint32(data[pos+8 : pos+12]))
-		batchEnd := pos + 12 + batchLength
-		if batchEnd > len(data) {
+	hdr := make([]byte, 12) // baseOffset(8) + batchLength(4)
+	for {
+		if _, err := io.ReadFull(f, hdr); err != nil {
+			break // EOF or truncated — done
+		}
+		batchLength := int64(binary.BigEndian.Uint32(hdr[8:12]))
+		if _, err := f.Seek(batchLength, io.SeekCurrent); err != nil {
 			break
 		}
 		count++
-		pos = batchEnd
 	}
 	return last.baseOffset + count
 }

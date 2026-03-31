@@ -259,14 +259,16 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 // AppendReplicaRecords writes fetched record data to a follower's log directory.
 // Unlike AppendRecords this does NOT advance NextOffset (that tracks the leader's state).
 // It only writes the raw bytes to disk and updates the follower's local LEO.
-func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string) error {
+// replicaLEO is the follower's current log-end-offset, used to name any newly rolled
+// segment file correctly (prevents all rolled segments being named "00000000000000000000.log").
+func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string, replicaLEO int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if len(records) == 0 {
 		return nil
 	}
-	_, _, err := writeRecords(replicaLogDir, records, 0)
+	_, _, err := writeRecords(replicaLogDir, records, replicaLEO)
 	return err
 }
 
