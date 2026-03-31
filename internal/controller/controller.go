@@ -13,6 +13,16 @@ import (
 	"github.com/ritiraj/kafka-go/internal/replication"
 )
 
+// Timing and threshold constants for the controller.
+const (
+	// probeTimeout is the TCP dial timeout used when health-checking a broker.
+	probeTimeout = 1 * time.Second
+
+	// defaultFailureThreshold is the number of consecutive probe failures before
+	// a broker is declared dead and its partitions are failed over.
+	defaultFailureThreshold = 3
+)
+
 // Controller monitors broker health and triggers leader election when a leader goes offline.
 // It periodically probes each broker's TCP port. If a broker fails consecutive health checks,
 // it is marked dead, removed from ISR, and any partitions it leads are reassigned.
@@ -38,7 +48,7 @@ func NewController(metaMgr *metadata.Manager, registry *broker.Registry, interva
 		metaMgr:          metaMgr,
 		registry:         registry,
 		interval:         interval,
-		failureThreshold: 3,
+		failureThreshold: defaultFailureThreshold,
 		failures:         make(map[int32]int),
 		alive:            make(map[int32]bool),
 	}
@@ -72,15 +82,30 @@ func (c *Controller) Wait() {
 	c.wg.Wait()
 }
 
-// healthCheck probes every broker and handles newly-dead or newly-recovered brokers.
+// healthCheck probes every broker concurrently and handles newly-dead or newly-recovered brokers.
+// Running probes in parallel ensures the entire round completes in probeTimeout regardless of
+// how many brokers are unresponsive, instead of taking N × probeTimeout serially.
 func (c *Controller) healthCheck() {
-	for _, b := range c.registry.All() {
-		reachable := c.probe(b)
+	brokers := c.registry.All()
+
+	type result struct {
+		b         *broker.Broker
+		reachable bool
+	}
+	results := make(chan result, len(brokers))
+	for _, b := range brokers {
+		b := b // capture loop variable
+		go func() { results <- result{b, c.probe(b)} }()
+	}
+
+	for range brokers {
+		r := <-results
+		b := r.b
 
 		c.mu.Lock()
 		wasAlive := c.alive[b.ID]
 
-		if reachable {
+		if r.reachable {
 			c.failures[b.ID] = 0
 			if !wasAlive {
 				// Broker came back online.
@@ -117,7 +142,7 @@ func (c *Controller) healthCheck() {
 // probe checks if a broker's TCP port is accepting connections.
 func (c *Controller) probe(b *broker.Broker) bool {
 	addr := fmt.Sprintf("%s:%d", b.Host, b.Port)
-	conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+	conn, err := net.DialTimeout("tcp", addr, probeTimeout)
 	if err != nil {
 		return false
 	}

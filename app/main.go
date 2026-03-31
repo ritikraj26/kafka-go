@@ -19,6 +19,25 @@ import (
 	"github.com/ritiraj/kafka-go/internal/replication"
 )
 
+// Timing constants for the broker runtime. Adjust these to tune replication,
+// failover detection, and consumer group rebalance behaviour.
+const (
+	// rebalanceDelay is how long the coordinator holds a join round open so that
+	// all group members can arrive before assignments are computed.
+	// Equivalent to Kafka's group.initial.rebalance.delay.ms (default 3 s).
+	rebalanceDelay = 3 * time.Second
+
+	// isrCheckInterval is how often the ISR manager evaluates replica lag.
+	isrCheckInterval = 1 * time.Second
+
+	// controllerHealthInterval is how often the controller probes broker TCP ports.
+	controllerHealthInterval = 2 * time.Second
+
+	// followerReplicationInterval is how often each FollowerManager sends a
+	// Fetch request to its leader(s) to pull new records.
+	followerReplicationInterval = 100 * time.Millisecond
+)
+
 func main() {
 	// Graceful shutdown on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -46,7 +65,7 @@ func main() {
 
 	// Create consumer group coordinator
 	coord := coordinator.NewCoordinator()
-	coord.RebalanceDelay = 3 * time.Second // hold join round open so all members can arrive
+	coord.RebalanceDelay = rebalanceDelay
 
 	// Parse server.properties if provided
 	logDir := "/tmp/kraft-broker-logs" // Default log directory
@@ -68,18 +87,18 @@ func main() {
 
 	// Start ISR maintenance (evaluates ISR every 1s)
 	lagTimeMaxMs := int64(envInt("REPLICA_LAG_TIME_MAX_MS", 10000))
-	isrMgr := replication.NewISRManager(metaMgr, 1*time.Second, lagTimeMaxMs)
+	isrMgr := replication.NewISRManager(metaMgr, isrCheckInterval, lagTimeMaxMs)
 	isrMgr.Start(ctx)
 
 	// Start controller for broker health monitoring and automatic leader failover
-	ctrl := controller.NewController(metaMgr, reg, 2*time.Second)
+	ctrl := controller.NewController(metaMgr, reg, controllerHealthInterval)
 	ctrl.Start(ctx)
 
 	// Start a FollowerManager + TCP listener per broker.
 	// Each broker replicates partitions where it is a follower from the leader.
 	var followers []*replication.FollowerManager
 	for _, b := range reg.All() {
-		fm := replication.NewFollowerManager(metaMgr, b.ID, 100*time.Millisecond)
+		fm := replication.NewFollowerManager(metaMgr, b.ID, followerReplicationInterval)
 		fm.Start(ctx)
 		followers = append(followers, fm)
 

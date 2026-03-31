@@ -8,7 +8,12 @@ import (
 )
 
 // DefaultReplicaLagTimeMaxMs is the default max time (ms) a replica can lag before ISR removal.
+// Equivalent to Kafka's replica.lag.time.max.ms (default 30 s; we use 10 s for faster detection).
 const DefaultReplicaLagTimeMaxMs int64 = 10000 // 10 seconds
+
+// defaultMaxLeoLag is the maximum allowed message-count difference between a
+// replica's LEO and the leader's LEO before the replica is removed from the ISR.
+const defaultMaxLeoLag int64 = 10000
 
 // UpdateISR checks each replica for a partition and shrinks/expands the ISR
 // based on how recently it fetched and whether its LEO has caught up.
@@ -42,11 +47,10 @@ func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) {
 			continue
 		}
 
-		// LEO check: replica must be within maxLeoLag messages of the leader.
+		// LEO check: replica must be within defaultMaxLeoLag messages of the leader.
 		// Prevents a fast-heartbeating but slow-replicating replica from staying in ISR.
-		const maxLeoLag = int64(10000)
 		replicaLEO, hasLEO := p.ReplicaLEO[brokerID]
-		if !hasLEO || (p.LogEndOffset-replicaLEO) > maxLeoLag {
+		if !hasLEO || (p.LogEndOffset-replicaLEO) > defaultMaxLeoLag {
 			logger.L.Warn("shrinking ISR: replica LEO lag",
 				"broker", brokerID,
 				"replicaLEO", replicaLEO,

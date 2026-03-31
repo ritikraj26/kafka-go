@@ -87,7 +87,7 @@ func TestDescribeTopics_SortedAlphabetically(t *testing.T) {
 		TopicNames: []string{"zebra", "apple"},
 	}
 	body := BuildBody(req, mgr)
-	pos := 4 // skip throttle_time_ms
+	pos := 4                       // skip throttle_time_ms
 	_, n := readUvarint(body, pos) // topics compact array length
 	pos += n
 	pos += 2 // error_code

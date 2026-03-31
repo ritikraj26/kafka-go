@@ -14,6 +14,16 @@ import (
 	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
+// Timing constants for follower replication.
+const (
+	// followerDialTimeout is the TCP dial timeout when connecting to a leader broker.
+	followerDialTimeout = 5 * time.Second
+
+	// followerRequestDeadline is the read/write deadline applied to each Fetch
+	// request/response cycle. Set to 3× the default replication interval.
+	followerRequestDeadline = 3 * time.Second
+)
+
 // FollowerManager replicates data from leader partitions via real TCP Fetch v0 requests.
 // For each partition where the local broker is a follower, it periodically sends a Fetch
 // request to the leader and writes the returned records to the follower's local log directory.
@@ -95,7 +105,7 @@ func (fm *FollowerManager) getConn(leaderID int32) (net.Conn, error) {
 		return nil, fmt.Errorf("unknown leader broker %d", leaderID)
 	}
 	addr := net.JoinHostPort(b.Host, fmt.Sprintf("%d", b.Port))
-	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	c, err := net.DialTimeout("tcp", addr, followerDialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -174,7 +184,7 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 	reqBytes := fm.encodeFetchV0(corrID, parts)
 
 	// Set write + read deadline
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(followerRequestDeadline))
 
 	if _, err := conn.Write(reqBytes); err != nil {
 		logger.L.Warn("follower: write failed", "leader", leaderID, "err", err)

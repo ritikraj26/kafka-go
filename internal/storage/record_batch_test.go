@@ -28,13 +28,13 @@ func buildRecordBatch(value []byte) []byte {
 // using zigzag varint encoding as required by the RecordBatch format.
 func buildRecord(value []byte) []byte {
 	var rec []byte
-	rec = append(rec, 0)                                  // attributes (INT8)
-	rec = append(rec, encodeSignedVarint(0)...)           // timestampDelta (varint) = 0
-	rec = append(rec, encodeSignedVarint(0)...)           // offsetDelta (varint) = 0
-	rec = append(rec, encodeSignedVarint(-1)...)          // keyLength (varint) = -1 (null key)
+	rec = append(rec, 0)                                        // attributes (INT8)
+	rec = append(rec, encodeSignedVarint(0)...)                 // timestampDelta (varint) = 0
+	rec = append(rec, encodeSignedVarint(0)...)                 // offsetDelta (varint) = 0
+	rec = append(rec, encodeSignedVarint(-1)...)                // keyLength (varint) = -1 (null key)
 	rec = append(rec, encodeSignedVarint(int64(len(value)))...) // valueLength (varint)
-	rec = append(rec, value...)                           // value bytes
-	rec = append(rec, encodeSignedVarint(0)...)           // headers count (varint) = 0
+	rec = append(rec, value...)                                 // value bytes
+	rec = append(rec, encodeSignedVarint(0)...)                 // headers count (varint) = 0
 	// Prepend record length (varint of the remaining bytes)
 	length := encodeSignedVarint(int64(len(rec)))
 	return append(length, rec...)
