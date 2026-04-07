@@ -105,7 +105,7 @@ func TestReadPartitionLogFrom(t *testing.T) {
 	content := []byte("AABBCCDD")
 	os.WriteFile(logFile, content, 0644)
 
-	p := &Partition{LogDir: dir}
+	p := &Partition{LeaderID: 1, BrokerLogDirs: map[int32]string{1: dir}}
 	// Read from offset 4 — should get "CCDD"
 	data, err := ReadPartitionLogFrom(p, "00000000000000000000.log", 4)
 	if err != nil {
@@ -119,7 +119,7 @@ func TestReadPartitionLogFrom(t *testing.T) {
 // TestReadPartitionLogFrom_MissingFile returns empty bytes for a non-existent segment.
 func TestReadPartitionLogFrom_MissingFile(t *testing.T) {
 	dir := t.TempDir()
-	p := &Partition{LogDir: dir}
+	p := &Partition{LeaderID: 1, BrokerLogDirs: map[int32]string{1: dir}}
 	data, err := ReadPartitionLogFrom(p, "00000000000000000000.log", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -200,7 +200,7 @@ func TestRecoverNextOffset_MultiSegment(t *testing.T) {
 // TestSeekToOffset verifies binary search across a synthetic 3-entry index.
 func TestSeekToOffset(t *testing.T) {
 	dir := t.TempDir()
-	p := &Partition{LogDir: dir}
+	p := &Partition{LeaderID: 1, BrokerLogDirs: map[int32]string{1: dir}}
 
 	// Build a synthetic index with 3 entries:
 	//   offset 0  → file position 0
@@ -248,7 +248,7 @@ func TestSeekToOffset(t *testing.T) {
 // TestSeekToOffsetNoIndex returns 0 when no index file exists.
 func TestSeekToOffsetNoIndex(t *testing.T) {
 	dir := t.TempDir()
-	p := &Partition{LogDir: dir}
+	p := &Partition{LeaderID: 1, BrokerLogDirs: map[int32]string{1: dir}}
 	_, got, err := p.SeekToOffset(42)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

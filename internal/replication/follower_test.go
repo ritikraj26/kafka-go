@@ -11,7 +11,7 @@ func TestFollowerManager_EncodeFetchV0(t *testing.T) {
 	metaMgr := metadata.NewManager()
 	topic := metaMgr.CreateTopic("test-topic", 1)
 	p := &topic.Partitions[0]
-	p.LogDir = t.TempDir()
+	p.BrokerLogDirs[p.LeaderID] = t.TempDir()
 
 	fm := NewFollowerManager(metaMgr, 2, 100*time.Millisecond)
 
@@ -37,7 +37,7 @@ func TestFollowerManager_ReplicateAllSkipsLeader(t *testing.T) {
 	topic := metaMgr.CreateTopic("test-topic", 1)
 	p := &topic.Partitions[0]
 	p.LeaderID = 1 // This broker is the leader
-	p.LogDir = t.TempDir()
+	p.BrokerLogDirs[p.LeaderID] = t.TempDir()
 
 	// FollowerManager with localID=1 (same as leader) should skip this partition
 	fm := NewFollowerManager(metaMgr, 1, 100*time.Millisecond)

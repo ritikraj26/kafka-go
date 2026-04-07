@@ -110,7 +110,7 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 				OfflineReplicas: []int32{},
 				LeaderEpoch:     0,
 				PartitionEpoch:  0,
-				LogDir:          partLogDir,
+
 				BrokerLogDirs:   map[int32]string{1: partLogDir},
 				NextOffset:      nextOffset,
 			})
@@ -140,8 +140,8 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 				}
 				for _, bid := range brokerIDs {
 					if bid == p.LeaderID {
-						// Leader keeps the original log dir (the one on disk)
-						p.BrokerLogDirs[bid] = p.LogDir
+						// Leader keeps the original log dir (already set from disk scan)
+						p.BrokerLogDirs[bid] = p.BrokerLogDirs[p.LeaderID]
 					} else {
 						p.BrokerLogDirs[bid] = fmt.Sprintf("%s/broker-%d/%s-%d", logDir, bid, topic.Name, p.Index)
 					}
@@ -384,9 +384,9 @@ func ReadPartitionLog(partition *Partition) ([]byte, error) {
 
 // ReadPartitionLogFrom reads a specific segment file starting at byteOffset.
 // segmentLogFile is the bare file name (e.g. "00000000000000000000.log");
-// logDir overrides partition.LogDir when provided.
+// logDir overrides the partition's leader log directory when provided.
 func ReadPartitionLogFrom(partition *Partition, segmentLogFile string, byteOffset int64, logDir ...string) ([]byte, error) {
-	dir := partition.LogDir
+	dir := partition.LogDirForBroker(partition.LeaderID)
 	if len(logDir) > 0 && logDir[0] != "" {
 		dir = logDir[0]
 	}

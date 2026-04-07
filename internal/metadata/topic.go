@@ -32,7 +32,6 @@ type Partition struct {
 	OfflineReplicas []int32
 	LeaderEpoch     int32
 	PartitionEpoch  int32
-	LogDir          string           // Legacy: leader's log directory (kept for backward compat)
 	BrokerLogDirs   map[int32]string // Per-broker log directories (brokerID -> dir)
 
 	// Offset tracking
@@ -80,14 +79,13 @@ func (p *Partition) GetReplicaLEO(brokerID int32) int64 {
 }
 
 // LogDirForBroker returns the log directory for a specific broker.
-// Falls back to the legacy LogDir field if BrokerLogDirs is not set.
 func (p *Partition) LogDirForBroker(brokerID int32) string {
 	if p.BrokerLogDirs != nil {
 		if dir, ok := p.BrokerLogDirs[brokerID]; ok {
 			return dir
 		}
 	}
-	return p.LogDir
+	return ""
 }
 
 // WaitForHighWatermark blocks until HW >= target or timeout expires.
@@ -205,7 +203,7 @@ func appendIndexEntry(indexFilePath string, relativeOffset int32, filePos int32)
 // binary-searches that segment's sparse index for the closest byte position.
 // Returns (segmentFileName, byteOffset, error).
 func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, int64, error) {
-	dir := p.LogDir
+	dir := p.LogDirForBroker(p.LeaderID)
 	if len(logDir) > 0 && logDir[0] != "" {
 		dir = logDir[0]
 	}

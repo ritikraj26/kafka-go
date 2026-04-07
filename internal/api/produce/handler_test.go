@@ -64,8 +64,7 @@ func TestBuildBody_ValidTopic(t *testing.T) {
 	dir := t.TempDir()
 	metaMgr.SetLogDir(dir)
 
-	topic := metaMgr.CreateTopic("orders", 1)
-	topic.Partitions[0].LogDir = dir + "/orders-0"
+	metaMgr.CreateTopic("orders", 1)
 
 	req := &protocol.ProduceRequest{
 		Acks: -1,

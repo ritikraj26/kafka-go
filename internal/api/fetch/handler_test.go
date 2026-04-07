@@ -93,7 +93,7 @@ func TestBuildBody_KnownTopicWithRecords(t *testing.T) {
 	logData := []byte{0xCA, 0xFE, 0xBA, 0xBE}
 	os.WriteFile(filepath.Join(partDir, "00000000000000000000.log"), logData, 0644)
 
-	topic.Partitions[0].LogDir = partDir
+	topic.Partitions[0].BrokerLogDirs[topic.Partitions[0].LeaderID] = partDir
 	topic.Partitions[0].NextOffset = 1
 
 	req := &protocol.FetchRequest{

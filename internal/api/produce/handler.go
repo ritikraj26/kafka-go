@@ -192,7 +192,7 @@ func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager) 
 	}
 	p := &dlq.Partitions[0]
 	for _, v := range values {
-		if _, err := p.AppendRecords(v, p.LogDir); err != nil {
+		if _, err := p.AppendRecords(v, p.LogDirForBroker(p.LeaderID)); err != nil {
 			logger.L.Error("failed to write to DLQ", "topic", sourceTopic+".dlq", "err", err)
 		}
 	}

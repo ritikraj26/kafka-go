@@ -63,10 +63,9 @@ func (m *Manager) CreateTopic(name string, numPartitions int) *Topic {
 		brokerIDs = m.Brokers.IDs()
 	}
 	topic := NewTopic(name, numPartitions, brokerIDs)
-	// Set each partition's LogDir based on its leader, and BrokerLogDirs for all replicas
+	// Set BrokerLogDirs for all replicas
 	for i := range topic.Partitions {
 		p := &topic.Partitions[i]
-		p.LogDir = fmt.Sprintf("%s/broker-%d/%s-%d", m.logDir, p.LeaderID, name, p.Index)
 		for _, brokerID := range p.ReplicaNodes {
 			p.BrokerLogDirs[brokerID] = fmt.Sprintf("%s/broker-%d/%s-%d", m.logDir, brokerID, name, p.Index)
 		}
@@ -106,20 +105,13 @@ func (m *Manager) TopicExists(name string) bool {
 
 // GetOrCreateDLQTopic returns the dead-letter-queue topic for the given source
 // topic, creating it (with 1 partition) if it does not yet exist.
-// The DLQ topic's partition LogDir is set from the manager's logDir so that
-// AppendRecords can write to disk immediately.
 func (m *Manager) GetOrCreateDLQTopic(sourceTopic string) *Topic {
 	dlqName := sourceTopic + ".dlq"
 	if t := m.GetTopic(dlqName); t != nil {
 		return t
 	}
-	t := m.CreateTopic(dlqName, 1)
-	// Set LogDir for the single partition so disk writes work immediately.
-	logDir := m.GetLogDir()
-	if logDir != "" && len(t.Partitions) > 0 {
-		t.Partitions[0].LogDir = logDir + "/" + dlqName + "-0"
-	}
-	return t
+	// CreateTopic already populates BrokerLogDirs from the manager's logDir.
+	return m.CreateTopic(dlqName, 1)
 }
 
 // GetTopicByID retrieves a topic by UUID, returns nil if not found
