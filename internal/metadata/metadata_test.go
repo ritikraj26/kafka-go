@@ -1,11 +1,30 @@
 package metadata
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
+
+func testRecordBatch(t *testing.T, values ...string) []byte {
+	t.Helper()
+	records := make([]storage.Record, len(values))
+	for i, value := range values {
+		records[i].Value = []byte(value)
+	}
+	batch, err := storage.EncodeRecordBatch(0, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return batch
+}
 
 // TestSegmentRolling verifies that AppendRecords rolls to a new segment when
 // MaxSegmentBytes is exceeded, that multiple .log files are created, and that
@@ -13,17 +32,10 @@ import (
 func TestSegmentRolling(t *testing.T) {
 	dir := t.TempDir()
 
-	// Override segment size: 20 bytes so each ~12-byte-header batch forces a roll.
+	// Each complete batch exceeds this limit, forcing the next append to roll.
 	orig := MaxSegmentBytes
 	MaxSegmentBytes = 20
 	defer func() { MaxSegmentBytes = orig }()
-
-	// Build a minimal valid-enough RecordBatch: 8-byte baseOffset + 4-byte batchLength + 12 payload bytes.
-	makeBatch := func() []byte {
-		b := make([]byte, 24)
-		binary.BigEndian.PutUint32(b[8:12], 12) // batchLength = 12
-		return b
-	}
 
 	p := &Partition{
 		Index:      0,
@@ -35,25 +47,27 @@ func TestSegmentRolling(t *testing.T) {
 	partDir := filepath.Join(dir, "test-0")
 	os.MkdirAll(partDir, 0755)
 
-	// Write 4 batches; with MaxSegmentBytes=20 and batch size=24 each write should
-	// create a new segment after the first (first segment gets the 24-byte write,
-	// which then exceeds 20 → next write rolls).
 	for i := 0; i < 4; i++ {
-		if _, err := p.AppendRecords(makeBatch(), partDir); err != nil {
+		if _, err := p.AppendRecords(testRecordBatch(t, "a", "b", "c"), partDir); err != nil {
 			t.Fatalf("AppendRecords[%d]: %v", i, err)
 		}
 	}
 
 	// There should be more than one .log file.
-	segs := listSegments(partDir)
+	segs, err := listSegments(partDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(segs) < 2 {
 		t.Errorf("expected at least 2 segments, got %d", len(segs))
 	}
 
-	// recoverNextOffset must equal the number of batches we wrote.
-	got := recoverNextOffset(partDir)
-	if got != 4 {
-		t.Errorf("recoverNextOffset = %d, want 4", got)
+	got, err := recoverNextOffset(partDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 12 {
+		t.Errorf("recoverNextOffset = %d, want 12", got)
 	}
 }
 
@@ -70,7 +84,7 @@ func TestAppendRecords(t *testing.T) {
 		ReplicaLEO: map[int32]int64{},
 	}
 
-	data := []byte("hello-record")
+	data := testRecordBatch(t, "hello-record")
 	offset, err := p.AppendRecords(data, partDir)
 	if err != nil {
 		t.Fatalf("AppendRecords: %v", err)
@@ -83,7 +97,7 @@ func TestAppendRecords(t *testing.T) {
 	}
 
 	// Second append
-	offset2, err := p.AppendRecords([]byte("second"), partDir)
+	offset2, err := p.AppendRecords(testRecordBatch(t, "second"), partDir)
 	if err != nil {
 		t.Fatalf("second AppendRecords: %v", err)
 	}
@@ -92,7 +106,10 @@ func TestAppendRecords(t *testing.T) {
 	}
 
 	// Data must be on disk
-	segs := listSegments(partDir)
+	segs, err := listSegments(partDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(segs) == 0 {
 		t.Fatal("no segment files found after AppendRecords")
 	}
@@ -181,9 +198,7 @@ func TestRecoverNextOffset_MultiSegment(t *testing.T) {
 		ISRNodes:   []int32{1},
 		ReplicaLEO: map[int32]int64{},
 	}
-	// Build a 24-byte batch (forces a new segment each time with limit=20)
-	batch := make([]byte, 24)
-	binary.BigEndian.PutUint32(batch[8:12], 12)
+	batch := testRecordBatch(t, "record")
 
 	for i := 0; i < 3; i++ {
 		if _, err := p.AppendRecords(batch, dir); err != nil {
@@ -191,7 +206,10 @@ func TestRecoverNextOffset_MultiSegment(t *testing.T) {
 		}
 	}
 
-	got := recoverNextOffset(dir)
+	got, err := recoverNextOffset(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got != 3 {
 		t.Errorf("recoverNextOffset = %d, want 3", got)
 	}
@@ -253,7 +271,249 @@ func TestSeekToOffsetNoIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
 	if got != 0 {
 		t.Errorf("got %d, want 0", got)
+	}
+}
+
+func TestAppendRecordsAssignsOffsetsAcrossBatches(t *testing.T) {
+	dir := t.TempDir()
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}, LeaderEpoch: 7}
+	first := testRecordBatch(t, "a", "b", "c")
+	second := testRecordBatch(t, "d", "e")
+	input := append(bytes.Clone(first), second...)
+	original := bytes.Clone(input)
+	if offset, err := p.AppendRecords(input, dir); err != nil || offset != 0 {
+		t.Fatalf("first append: offset=%d err=%v", offset, err)
+	}
+	if offset, err := p.AppendRecords(testRecordBatch(t, "f"), dir); err != nil || offset != 5 {
+		t.Fatalf("second append: offset=%d err=%v", offset, err)
+	}
+	if !bytes.Equal(input, original) {
+		t.Fatal("append mutated the producer's buffer")
+	}
+	if p.NextOffset != 6 || p.GetLogEndOffset() != 6 || p.GetHighWatermark() != 6 || p.GetReplicaLEO(1) != 6 {
+		t.Fatal("record offsets were not propagated to partition state")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, segmentNameForOffset(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	batches, err := storage.ParseRecordBatches(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 3 {
+		t.Fatalf("batches=%d, want 3", len(batches))
+	}
+	for i, want := range []int64{0, 3, 5} {
+		if batches[i].BaseOffset != want || binary.BigEndian.Uint32(batches[i].Data[12:16]) != 7 {
+			t.Fatalf("batch %d has wrong assigned offset or epoch", i)
+		}
+	}
+	_, pos, err := p.SeekToOffset(4, dir)
+	if err != nil || pos != int64(len(first)) {
+		t.Fatalf("seek inside second batch: pos=%d err=%v", pos, err)
+	}
+	if next, err := recoverNextOffset(dir); err != nil || next != 6 {
+		t.Fatalf("recovery: next=%d err=%v", next, err)
+	}
+}
+
+func TestAppendRecordsRejectsWholeInvalidRecordSet(t *testing.T) {
+	dir := t.TempDir()
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}}
+	good := testRecordBatch(t, "good")
+	bad := bytes.Clone(good)
+	bad[len(bad)-1] ^= 1
+	if _, err := p.AppendRecords(append(bytes.Clone(good), bad...), dir); !errors.Is(err, storage.ErrCorruptRecord) {
+		t.Fatalf("invalid second batch: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 || p.NextOffset != 0 {
+		t.Fatal("invalid input changed disk or offset state")
+	}
+	if _, err := p.AppendRecords(good, dir); err != nil {
+		t.Fatalf("validation failure fenced valid future writes: %v", err)
+	}
+}
+
+func TestAppendRecordsFencesDiskFailure(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "file")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}}
+	batch := testRecordBatch(t, "record")
+	if _, err := p.AppendRecords(batch, blocker); err == nil {
+		t.Fatal("disk failure was ignored")
+	}
+	if _, err := p.AppendRecords(batch, dir); err == nil || p.NextOffset != 0 {
+		t.Fatal("partition accepted another write after an ambiguous disk failure")
+	}
+}
+
+func TestRelativeIndexWithLargeOffsets(t *testing.T) {
+	dir := t.TempDir()
+	start := int64(math.MaxInt32) + 10
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}, NextOffset: start}
+	first := testRecordBatch(t, "a", "b")
+	if _, err := p.AppendRecords(first, dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.AppendRecords(testRecordBatch(t, "c"), dir); err != nil {
+		t.Fatal(err)
+	}
+	segment, pos, err := p.SeekToOffset(start+2, dir)
+	if err != nil || segment != segmentNameForOffset(start) || pos != int64(len(first)) {
+		t.Fatalf("large-offset seek: segment=%s pos=%d err=%v", segment, pos, err)
+	}
+	if next, err := recoverNextOffset(dir); err != nil || next != start+3 {
+		t.Fatalf("large-offset recovery: next=%d err=%v", next, err)
+	}
+}
+
+func TestAppendRecordsStartsSegmentAtFirstOffset(t *testing.T) {
+	dir := t.TempDir()
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}, NextOffset: 7}
+	if _, err := p.AppendRecords(testRecordBatch(t, "a", "b"), dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, segmentNameForOffset(7))); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := recoverNextOffset(dir); err != nil || next != 9 {
+		t.Fatalf("nonzero initial offset recovery: next=%d err=%v", next, err)
+	}
+}
+
+func TestAppendRecordsRejectsOffsetOverflow(t *testing.T) {
+	dir := t.TempDir()
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}, NextOffset: math.MaxInt64 - 1}
+	if _, err := p.AppendRecords(testRecordBatch(t, "a", "b"), dir); !errors.Is(err, storage.ErrCorruptRecord) {
+		t.Fatalf("offset overflow: %v", err)
+	}
+	if p.NextOffset != math.MaxInt64-1 {
+		t.Fatal("offset overflow changed partition state")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("overflowing append changed disk: %v", err)
+	}
+}
+
+func TestRecoveryPreservesDamagedLogs(t *testing.T) {
+	batch := testRecordBatch(t, "record")
+	tests := map[string][]byte{
+		"partial header": batch[:11],
+		"partial body":   batch[:len(batch)-1],
+		"partial tail":   append(bytes.Clone(batch), batch[:20]...),
+		"duplicate":      append(bytes.Clone(batch), batch...),
+		"bad checksum":   bytes.Clone(batch),
+	}
+	tests["bad checksum"][17] ^= 1
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, segmentNameForOffset(0))
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recoverNextOffset(dir); err == nil {
+				t.Fatal("damaged log was accepted")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(after, data) {
+				t.Fatalf("recovery modified damaged data: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoveryValidatesInactiveSegments(t *testing.T) {
+	dir := t.TempDir()
+	first := testRecordBatch(t, "first")
+	first[17] ^= 1
+	second := testRecordBatch(t, "second")
+	binary.BigEndian.PutUint64(second[:8], 1)
+	for offset, batch := range [][]byte{first, second} {
+		if err := os.WriteFile(filepath.Join(dir, segmentNameForOffset(int64(offset))), batch, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := recoverNextOffset(dir); !errors.Is(err, storage.ErrCorruptRecord) {
+		t.Fatalf("corrupt inactive segment was not rejected: %v", err)
+	}
+}
+
+func TestLoadTopicsRestoresRecordOffsets(t *testing.T) {
+	dir := t.TempDir()
+	partDir := filepath.Join(dir, "events-0")
+	p := &Partition{LeaderID: 1, ISRNodes: []int32{1}}
+	if _, err := p.AppendRecords(testRecordBatch(t, "a", "b", "c"), partDir); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager()
+	if err := m.LoadTopicsFromDisk(dir); err != nil {
+		t.Fatal(err)
+	}
+	topic := m.GetTopic("events")
+	if topic == nil {
+		t.Fatal("topic not recovered")
+	}
+	recovered := &topic.Partitions[0]
+	if recovered.NextOffset != 3 || recovered.GetLogEndOffset() != 3 || recovered.GetHighWatermark() != 3 ||
+		recovered.GetReplicaLEO(1) != 3 || m.GetLogDir() != dir {
+		t.Fatal("recovery did not restore offsets and configured directory")
+	}
+	if offset, err := recovered.AppendRecords(testRecordBatch(t, "d"), recovered.LogDirForBroker(1)); err != nil || offset != 3 {
+		t.Fatalf("append after restart: offset=%d err=%v", offset, err)
+	}
+}
+
+func TestLoadTopicsRejectsDamagedReplicaLogs(t *testing.T) {
+	dir := t.TempDir()
+	partDir := filepath.Join(dir, "broker-2", "events-0")
+	if err := os.MkdirAll(partDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(partDir, segmentNameForOffset(0)), []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewManager().LoadTopicsFromDisk(dir); err == nil {
+		t.Fatal("corrupt replica log was ignored")
+	}
+}
+
+func TestAppendReplicaRecordsPreservesOffsets(t *testing.T) {
+	dir := t.TempDir()
+	p := &Partition{}
+	data := testRecordBatch(t, "a", "b")
+	if err := p.AppendReplicaRecords(data, dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.AppendReplicaRecords(data, dir, 2); !errors.Is(err, storage.ErrCorruptRecord) {
+		t.Fatalf("noncontiguous replica write accepted: %v", err)
+	}
+	if next, err := recoverNextOffset(dir); err != nil || next != 2 {
+		t.Fatalf("replica recovery: next=%d err=%v", next, err)
+	}
+}
+
+func TestWaitForHighWatermarkTimesOut(t *testing.T) {
+	p := &Partition{}
+	for _, timeout := range []time.Duration{0, time.Millisecond, 5 * time.Millisecond} {
+		start := time.Now()
+		if p.WaitForHighWatermark(1, timeout) {
+			t.Fatal("wait succeeded before replication")
+		}
+		if time.Since(start) > time.Second {
+			t.Fatal("high-watermark timeout did not unblock")
+		}
 	}
 }

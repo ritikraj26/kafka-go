@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/network"
 	"github.com/ritiraj/kafka-go/internal/replication"
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 const (
@@ -146,63 +146,6 @@ func readUnsignedVarint(data []byte, pos int) (uint64, int) {
 		shift += 7
 	}
 	return result, i
-}
-
-func writeZigzagVarint(buf *bytes.Buffer, v int64) {
-	uv := uint64((v << 1) ^ (v >> 63))
-	for uv >= 0x80 {
-		buf.WriteByte(byte(uv) | 0x80)
-		uv >>= 7
-	}
-	buf.WriteByte(byte(uv))
-}
-
-func buildRecordBatch(key, value []byte) []byte {
-	var record bytes.Buffer
-	record.WriteByte(0x00) // attributes
-	record.WriteByte(0x00) // timestampDelta
-	record.WriteByte(0x00) // offsetDelta
-
-	if key == nil {
-		record.WriteByte(0x01) // zigzag(-1) = null key
-	} else {
-		writeZigzagVarint(&record, int64(len(key)))
-		record.Write(key)
-	}
-
-	writeZigzagVarint(&record, int64(len(value)))
-	record.Write(value)
-	record.WriteByte(0x00) // headersCount
-
-	recBytes := record.Bytes()
-
-	var recWithLen bytes.Buffer
-	writeZigzagVarint(&recWithLen, int64(len(recBytes)))
-	recWithLen.Write(recBytes)
-
-	var batch bytes.Buffer
-	binary.Write(&batch, binary.BigEndian, int64(0)) // baseOffset
-	batchLengthPos := batch.Len()
-	binary.Write(&batch, binary.BigEndian, int32(0))               // batchLength placeholder
-	binary.Write(&batch, binary.BigEndian, int32(0))               // partitionLeaderEpoch
-	batch.WriteByte(2)                                             // magic
-	binary.Write(&batch, binary.BigEndian, uint32(0))              // CRC placeholder
-	binary.Write(&batch, binary.BigEndian, int16(0))               // attributes
-	binary.Write(&batch, binary.BigEndian, int32(0))               // lastOffsetDelta
-	binary.Write(&batch, binary.BigEndian, time.Now().UnixMilli()) // baseTimestamp
-	binary.Write(&batch, binary.BigEndian, time.Now().UnixMilli()) // maxTimestamp
-	binary.Write(&batch, binary.BigEndian, int64(-1))              // producerId
-	binary.Write(&batch, binary.BigEndian, int16(-1))              // producerEpoch
-	binary.Write(&batch, binary.BigEndian, int32(-1))              // baseSequence
-	binary.Write(&batch, binary.BigEndian, int32(1))               // recordsCount
-
-	batch.Write(recWithLen.Bytes())
-
-	result := batch.Bytes()
-	batchLen := int32(len(result) - 12)
-	binary.BigEndian.PutUint32(result[batchLengthPos:batchLengthPos+4], uint32(batchLen))
-
-	return result
 }
 
 func buildProduceV11Body(topicName string, partitionIndex int32, records []byte) []byte {
@@ -367,7 +310,11 @@ func main() {
 	}
 
 	for _, m := range messages {
-		batch := buildRecordBatch([]byte(m.key), []byte(m.value))
+		batch, err := storage.EncodeRecordBatch(0, []storage.Record{{Key: []byte(m.key), Value: []byte(m.value)}})
+		if err != nil {
+			fail(fmt.Sprintf("Encode %s: %v", m.key, err))
+			continue
+		}
 		body := buildProduceV11Body("orders", 0, batch)
 		corrID++
 		resp, err := sendRequest(leaderConn, 0, 11, corrID, body)
@@ -402,7 +349,11 @@ func main() {
 		fail(fmt.Sprintf("Connect to follower %d: %v", followerBrokerID, err))
 	} else {
 		defer followerConn.Close()
-		batch := buildRecordBatch([]byte("bad"), []byte(`{"should":"fail"}`))
+		batch, err := storage.EncodeRecordBatch(0, []storage.Record{{Key: []byte("bad"), Value: []byte(`{"should":"fail"}`)}})
+		if err != nil {
+			fail(fmt.Sprintf("Encode follower produce: %v", err))
+			return
+		}
 		body := buildProduceV11Body("orders", 0, batch)
 		corrID++
 		resp, err := sendRequest(followerConn, 0, 11, corrID, body)
@@ -597,7 +548,11 @@ func main() {
 			fail(fmt.Sprintf("Connect to new leader: %v", err))
 		} else {
 			defer newConn.Close()
-			batch := buildRecordBatch([]byte("order-3"), []byte(`{"item":"tablet","qty":2}`))
+			batch, err := storage.EncodeRecordBatch(0, []storage.Record{{Key: []byte("order-3"), Value: []byte(`{"item":"tablet","qty":2}`)}})
+			if err != nil {
+				fail(fmt.Sprintf("Encode failover produce: %v", err))
+				return
+			}
 			body := buildProduceV11Body("orders", 0, batch)
 			corrID++
 			resp, err := sendRequest(newConn, 0, 11, corrID, body)

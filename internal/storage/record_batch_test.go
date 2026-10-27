@@ -1,110 +1,184 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
+	"hash/crc32"
+	"io"
+	"math"
 	"testing"
 )
 
-// buildRecordBatch builds a minimal but valid RecordBatch containing one record with
-// the given value. Offsets/timestamps/CRC are zero — sufficient for ParseRecordValues.
-func buildRecordBatch(value []byte) []byte {
-	// We'll build the record first, then the header.
-	record := buildRecord(value)
-	// RecordBatch header (61 bytes)
-	hdr := make([]byte, recordBatchHeaderSize)
-	// baseOffset = 0 (bytes 0-7 are already 0)
-	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(hdr)-12+len(record))) // batchLength
-	// magic = 2 (byte 16)
-	hdr[16] = 2
-	// recordsCount (bytes 57-60)
-	binary.BigEndian.PutUint32(hdr[57:61], 1)
-	var batch []byte
-	batch = append(batch, hdr...)
-	batch = append(batch, record...)
-	return batch
+// This fixture is assembled independently of EncodeRecordBatch.
+func fixtureBatch() []byte {
+	header := make([]byte, 61)
+	header[16] = 2
+	binary.BigEndian.PutUint32(header[57:61], 1)
+	record := []byte{14, 0, 0, 0, 1, 2, 'a', 0}
+	return sealBatch(append(header, record...))
 }
 
-// buildRecord returns a single Record with a null key and the given value,
-// using zigzag varint encoding as required by the RecordBatch format.
-func buildRecord(value []byte) []byte {
-	var rec []byte
-	rec = append(rec, 0)                                        // attributes (INT8)
-	rec = append(rec, encodeSignedVarint(0)...)                 // timestampDelta (varint) = 0
-	rec = append(rec, encodeSignedVarint(0)...)                 // offsetDelta (varint) = 0
-	rec = append(rec, encodeSignedVarint(-1)...)                // keyLength (varint) = -1 (null key)
-	rec = append(rec, encodeSignedVarint(int64(len(value)))...) // valueLength (varint)
-	rec = append(rec, value...)                                 // value bytes
-	rec = append(rec, encodeSignedVarint(0)...)                 // headers count (varint) = 0
-	// Prepend record length (varint of the remaining bytes)
-	length := encodeSignedVarint(int64(len(rec)))
-	return append(length, rec...)
+func sealBatch(data []byte) []byte {
+	binary.BigEndian.PutUint32(data[8:12], uint32(len(data)-12))
+	binary.BigEndian.PutUint32(data[17:21], crc32.Checksum(data[21:], crc32.MakeTable(crc32.Castagnoli)))
+	return data
 }
 
-func encodeSignedVarint(v int64) []byte {
-	// zigzag encode
-	uv := uint64((v << 1) ^ (v >> 63))
-	var buf [10]byte
-	n := 0
-	for uv >= 0x80 {
-		buf[n] = byte(uv) | 0x80
-		uv >>= 7
-		n++
+func TestParseRecordBatches(t *testing.T) {
+	first := fixtureBatch()
+	second := bytes.Clone(first)
+	binary.BigEndian.PutUint64(second[:8], 1)
+	batches, err := ParseRecordBatches(append(first, second...))
+	if err != nil {
+		t.Fatal(err)
 	}
-	buf[n] = byte(uv)
-	return buf[:n+1]
-}
-
-func TestParseRecordValues_SingleRecord(t *testing.T) {
-	want := []byte(`{"msg":"hello"}`)
-	batch := buildRecordBatch(want)
-	values := ParseRecordValues(batch)
-	if len(values) != 1 {
-		t.Fatalf("got %d values, want 1", len(values))
+	if len(batches) != 2 {
+		t.Fatalf("batches = %d, want 2", len(batches))
 	}
-	if string(values[0]) != string(want) {
-		t.Errorf("value = %q, want %q", values[0], want)
+	for i, batch := range batches {
+		if batch.BaseOffset != int64(i) || batch.RecordsCount != 1 || batch.LastOffsetDelta != 0 ||
+			len(batch.Values) != 1 || string(batch.Values[0]) != "a" {
+			t.Fatalf("unexpected batch %d: %+v", i, batch)
+		}
 	}
 }
 
-func TestParseRecordValues_TooShort(t *testing.T) {
-	values := ParseRecordValues([]byte{0x00, 0x01})
-	if values != nil {
-		t.Errorf("expected nil for too-short input, got %v", values)
+func TestParseRecordBatchesRejectsMalformedData(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+		want   error
+	}{
+		{"empty", func([]byte) []byte { return nil }, ErrCorruptRecord},
+		{"short header", func(b []byte) []byte { return b[:11] }, ErrCorruptRecord},
+		{"short batch", func(b []byte) []byte { return b[:len(b)-1] }, ErrCorruptRecord},
+		{"negative batch length", func(b []byte) []byte { binary.BigEndian.PutUint32(b[8:12], math.MaxUint32); return b }, ErrCorruptRecord},
+		{"oversized batch", func(b []byte) []byte { binary.BigEndian.PutUint32(b[8:12], MaxRecordBatchBytes); return b }, ErrCorruptRecord},
+		{"bad CRC", func(b []byte) []byte { b[67] ^= 1; return b }, ErrCorruptRecord},
+		{"old magic", func(b []byte) []byte { b[16] = 1; return b }, ErrUnsupportedFormat},
+		{"compression", func(b []byte) []byte { b[22] = 1; return sealBatch(b) }, ErrUnsupportedCompression},
+		{"transaction", func(b []byte) []byte { b[22] = 16; return sealBatch(b) }, ErrUnsupportedFormat},
+		{"control", func(b []byte) []byte { b[22] = 32; return sealBatch(b) }, ErrUnsupportedFormat},
+		{"zero records", func(b []byte) []byte { binary.BigEndian.PutUint32(b[57:61], 0); return sealBatch(b) }, ErrCorruptRecord},
+		{"negative count", func(b []byte) []byte { binary.BigEndian.PutUint32(b[57:61], math.MaxUint32); return sealBatch(b) }, ErrCorruptRecord},
+		{"last offset delta", func(b []byte) []byte { binary.BigEndian.PutUint32(b[23:27], 1); return sealBatch(b) }, ErrCorruptRecord},
+		{"record length", func(b []byte) []byte { b[61] = 0; return sealBatch(b) }, ErrCorruptRecord},
+		{"record attributes", func(b []byte) []byte { b[62] = 1; return sealBatch(b) }, ErrCorruptRecord},
+		{"record offset delta", func(b []byte) []byte { b[64] = 2; return sealBatch(b) }, ErrCorruptRecord},
+		{"negative key length", func(b []byte) []byte { b[65] = 3; return sealBatch(b) }, ErrCorruptRecord},
+		{"value length", func(b []byte) []byte { b[66] = 100; return sealBatch(b) }, ErrCorruptRecord},
+		{"negative headers", func(b []byte) []byte { b[68] = 1; return sealBatch(b) }, ErrCorruptRecord},
+		{"missing headers", func(b []byte) []byte { b[68] = 2; return sealBatch(b) }, ErrCorruptRecord},
+		{"trailing bytes", func(b []byte) []byte { return sealBatch(append(b, 0)) }, ErrCorruptRecord},
+		{"partial next batch", func(b []byte) []byte { return append(b, 0) }, ErrCorruptRecord},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batches, err := ParseRecordBatches(tt.mutate(fixtureBatch()))
+			if !errors.Is(err, tt.want) || batches != nil {
+				t.Fatalf("batches=%v err=%v, want nil/%v", batches, err, tt.want)
+			}
+		})
 	}
 }
 
-func TestParseRecordValues_Empty(t *testing.T) {
-	values := ParseRecordValues(nil)
-	if values != nil {
-		t.Errorf("expected nil for nil input, got %v", values)
+func TestParseRecordHeaders(t *testing.T) {
+	batch := fixtureBatch()
+	batch[61] = 22
+	batch[68] = 2
+	batch = sealBatch(append(batch, 2, 'k', 2, 'v'))
+	if _, err := ParseRecordBatches(batch); err != nil {
+		t.Fatal(err)
+	}
+	batch[69] = 1 // null header keys are invalid
+	if _, err := ParseRecordBatches(sealBatch(batch)); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("null header key: %v", err)
 	}
 }
 
-func TestParseRecordValues_ZeroRecords(t *testing.T) {
-	hdr := make([]byte, recordBatchHeaderSize)
-	// recordsCount deliberately left at 0
-	values := ParseRecordValues(hdr)
-	if values != nil {
-		t.Errorf("expected nil for zero-record batch, got %v", values)
+func TestEncodeRecordBatch(t *testing.T) {
+	records := []Record{
+		{Key: []byte("key"), Value: []byte("first")},
+		{Value: []byte("second")},
+		{Value: nil},
+		{Key: []byte{}, Value: []byte{}},
+	}
+	data, err := EncodeRecordBatch(42, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batches, err := ParseRecordBatches(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch := batches[0]
+	if batch.BaseOffset != 42 || batch.RecordsCount != 4 || batch.LastOffsetDelta != 3 ||
+		len(batch.Values) != 2 || string(batch.Values[0]) != "first" || string(batch.Values[1]) != "second" {
+		t.Fatalf("unexpected batch: %+v", batch)
+	}
+	for _, offset := range []int64{-1, math.MaxInt64} {
+		if _, err := EncodeRecordBatch(offset, records); !errors.Is(err, ErrCorruptRecord) {
+			t.Errorf("baseOffset=%d: %v", offset, err)
+		}
+	}
+	if _, err := EncodeRecordBatch(0, nil); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("empty batch: %v", err)
 	}
 }
 
-func TestParseRecordValues_MultipleRecords(t *testing.T) {
-	// Build a batch with 3 records manually
-	r1 := buildRecord([]byte("aaa"))
-	r2 := buildRecord([]byte("bb"))
-	r3 := buildRecord([]byte("c"))
-	records := append(append(r1, r2...), r3...)
-	hdr := make([]byte, recordBatchHeaderSize)
-	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(hdr)-12+len(records)))
-	hdr[16] = 2
-	binary.BigEndian.PutUint32(hdr[57:61], 3) // recordsCount = 3
-	batch := append(hdr, records...)
-	values := ParseRecordValues(batch)
-	if len(values) != 3 {
-		t.Fatalf("got %d values, want 3", len(values))
+func TestReadRecordBatch(t *testing.T) {
+	data := fixtureBatch()
+	r := bytes.NewReader(append(bytes.Clone(data), data...))
+	for i := 0; i < 2; i++ {
+		batch, err := ReadRecordBatch(r)
+		if err != nil || !bytes.Equal(batch.Data, data) {
+			t.Fatalf("batch %d: %v", i, err)
+		}
 	}
-	if string(values[0]) != "aaa" || string(values[1]) != "bb" || string(values[2]) != "c" {
-		t.Errorf("unexpected values: %v", values)
+	if _, err := ReadRecordBatch(r); err != io.EOF {
+		t.Fatalf("clean boundary: %v", err)
 	}
+	for size := 1; size < len(data); size++ {
+		if _, err := ReadRecordBatch(bytes.NewReader(data[:size])); !errors.Is(err, ErrCorruptRecord) {
+			t.Fatalf("truncation at %d: %v", size, err)
+		}
+	}
+	binary.BigEndian.PutUint32(data[8:12], math.MaxInt32)
+	if _, err := ReadRecordBatch(bytes.NewReader(data[:12])); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("oversized recovery allocation: %v", err)
+	}
+}
+
+func TestReadVarintRejectsOverflow(t *testing.T) {
+	for _, input := range [][]byte{{0x80}, bytes.Repeat([]byte{0xff}, 11), binary.AppendVarint(nil, math.MaxInt64)} {
+		if _, err := readVarint(&input, 32); !errors.Is(err, ErrCorruptRecord) {
+			t.Fatalf("expected invalid varint, got %v", err)
+		}
+	}
+}
+
+func FuzzParseRecordBatches(f *testing.F) {
+	f.Add(fixtureBatch())
+	f.Add([]byte{})
+	f.Add(append(fixtureBatch(), fixtureBatch()...))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		batches, err := ParseRecordBatches(data)
+		if err != nil {
+			if batches != nil {
+				t.Fatal("partially validated records escaped on error")
+			}
+			return
+		}
+		total := 0
+		for _, batch := range batches {
+			total += len(batch.Data)
+			if batch.RecordsCount <= 0 || int64(batch.LastOffsetDelta)+1 != int64(batch.RecordsCount) {
+				t.Fatal("invalid offset/count invariant")
+			}
+		}
+		if total != len(data) {
+			t.Fatal("unparsed trailing data")
+		}
+	})
 }

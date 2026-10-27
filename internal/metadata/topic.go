@@ -1,18 +1,22 @@
 package metadata
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 // topic with metadata
@@ -35,11 +39,12 @@ type Partition struct {
 	BrokerLogDirs   map[int32]string // Per-broker log directories (brokerID -> dir)
 
 	// Offset tracking
-	NextOffset    int64 // Next offset to assign to an incoming RecordBatch
-	HighWatermark int64 // Highest offset replicated to all ISR members
+	NextOffset    int64 // Next record offset to assign
+	HighWatermark int64 // Exclusive offset replicated to all ISR members
 	LogEndOffset  int64 // = NextOffset (alias for replication clarity)
 	mu            sync.Mutex
 	hwCond        *sync.Cond // signalled when HighWatermark advances
+	appendErr     error      // Fence leader writes after an ambiguous disk failure
 
 	// Per-replica LEO for replication (broker_id -> LEO)
 	ReplicaLEO      map[int32]int64
@@ -98,19 +103,17 @@ func (p *Partition) WaitForHighWatermark(target int64, timeout time.Duration) bo
 	if p.HighWatermark >= target {
 		return true
 	}
+	if timeout <= 0 {
+		return false
+	}
 
 	deadline := time.Now().Add(timeout)
-
-	// Spawn a goroutine that broadcasts after timeout to unblock Wait.
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-time.After(timeout):
-			p.hwCond.Broadcast()
-		case <-done:
-		}
-	}()
-	defer close(done)
+	timer := time.AfterFunc(timeout, func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.hwCond.Broadcast()
+	})
+	defer timer.Stop()
 
 	for p.HighWatermark < target {
 		p.hwCond.Wait()
@@ -149,25 +152,54 @@ func (p *Partition) RunUnderLock(fn func()) {
 // AppendRecords writes records to the partition's log file under its mutex,
 // appends a sparse index entry, and returns the base offset on success.
 func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int64, err error) {
+	records = bytes.Clone(records)
+	batches, err := storage.ParseRecordBatches(records)
+	if err != nil {
+		return -1, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	writtenFile, filePosBefore, writeErr := writeRecords(logDir, records, p.NextOffset)
+	if p.appendErr != nil {
+		return -1, fmt.Errorf("partition unavailable after append failure: %w", p.appendErr)
+	}
+	baseOffset = p.NextOffset
+	nextOffset := baseOffset
+	for i := range batches {
+		batch := &batches[i]
+		count := int64(batch.RecordsCount)
+		if nextOffset < 0 || nextOffset > math.MaxInt64-count {
+			return -1, fmt.Errorf("%w: offset overflow", storage.ErrCorruptRecord)
+		}
+		batch.BaseOffset = nextOffset
+		// Base offset and leader epoch are outside the CRC32C-covered region.
+		binary.BigEndian.PutUint64(batch.Data[:8], uint64(nextOffset))
+		binary.BigEndian.PutUint32(batch.Data[12:16], uint32(p.LeaderEpoch))
+		nextOffset += count
+	}
+
+	writtenFile, filePosBefore, writeErr := writeRecords(logDir, records, baseOffset, nextOffset-1)
 	if writeErr != nil {
+		p.appendErr = writeErr
 		return -1, writeErr
 	}
 
-	baseOffset = p.NextOffset
-
-	// Build the index path from the actual segment file that was written.
+	segmentBase, err := strconv.ParseInt(strings.TrimSuffix(filepath.Base(writtenFile), ".log"), 10, 64)
+	if err != nil {
+		p.appendErr = err
+		return -1, err
+	}
 	indexPath := strings.TrimSuffix(writtenFile, ".log") + ".index"
-	if indexErr := appendIndexEntry(indexPath, int32(baseOffset), int32(filePosBefore)); indexErr != nil {
-		// Non-fatal: index is a performance optimisation, not correctness-critical
-		logger.L.Warn("failed to write index entry", "err", indexErr)
+	for _, batch := range batches {
+		if indexErr := appendIndexEntry(indexPath, int32(batch.BaseOffset-segmentBase), int32(filePosBefore)); indexErr != nil {
+			logger.L.Warn("failed to write index entry", "err", indexErr)
+			break
+		}
+		filePosBefore += int64(len(batch.Data))
 	}
 
-	p.NextOffset++
-	p.LogEndOffset = p.NextOffset
+	p.NextOffset = nextOffset
+	p.LogEndOffset = nextOffset
 
 	// Update leader's own replica LEO
 	if p.ReplicaLEO == nil {
@@ -208,7 +240,10 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 		dir = logDir[0]
 	}
 
-	segs := listSegments(dir)
+	segs, err := listSegments(dir)
+	if err != nil {
+		return "", 0, err
+	}
 	if len(segs) == 0 {
 		return "00000000000000000000.log", 0, nil
 	}
@@ -227,11 +262,16 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 	indexFile := filepath.Join(dir, strings.TrimSuffix(chosen.name, ".log")+".index")
 	data, err := os.ReadFile(indexFile)
 	if err != nil {
-		// No index for this segment — start reading from the beginning of it.
-		return chosen.name, 0, nil
+		if os.IsNotExist(err) {
+			return chosen.name, 0, nil
+		}
+		return "", 0, err
 	}
 
 	const entrySize = 8
+	if len(data)%entrySize != 0 {
+		return "", 0, fmt.Errorf("incomplete offset index: %s", indexFile)
+	}
 	numEntries := len(data) / entrySize
 	if numEntries == 0 {
 		return chosen.name, 0, nil
@@ -244,7 +284,7 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 		mid := (lo + hi) / 2
 		relOff := int64(binary.BigEndian.Uint32(data[mid*entrySize : mid*entrySize+4]))
 		filePos := int64(binary.BigEndian.Uint32(data[mid*entrySize+4 : mid*entrySize+8]))
-		if relOff <= targetOffset {
+		if relOff <= targetOffset-chosen.baseOffset {
 			result = filePos
 			lo = mid + 1
 		} else {
@@ -256,7 +296,7 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 
 // AppendReplicaRecords writes fetched record data to a follower's log directory.
 // Unlike AppendRecords this does NOT advance NextOffset (that tracks the leader's state).
-// It only writes the raw bytes to disk and updates the follower's local LEO.
+// It preserves the leader-assigned offsets; replica progress is tracked separately.
 // replicaLEO is the follower's current log-end-offset, used to name any newly rolled
 // segment file correctly (prevents all rolled segments being named "00000000000000000000.log").
 func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string, replicaLEO int64) error {
@@ -266,7 +306,18 @@ func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string, r
 	if len(records) == 0 {
 		return nil
 	}
-	_, _, err := writeRecords(replicaLogDir, records, replicaLEO)
+	batches, err := storage.ParseRecordBatches(records)
+	if err != nil {
+		return err
+	}
+	next := replicaLEO
+	for _, batch := range batches {
+		if batch.BaseOffset != next || next < 0 || next > math.MaxInt64-int64(batch.RecordsCount) {
+			return fmt.Errorf("%w: unexpected replica offset %d, want %d", storage.ErrCorruptRecord, batch.BaseOffset, next)
+		}
+		next += int64(batch.RecordsCount)
+	}
+	_, _, err = writeRecords(replicaLogDir, records, replicaLEO, next-1)
 	return err
 }
 
@@ -311,34 +362,28 @@ type logSegment struct {
 }
 
 // listSegments returns all .log segments in logDir sorted by base offset ascending.
-func listSegments(logDir string) []logSegment {
+func listSegments(logDir string) ([]logSegment, error) {
 	entries, err := os.ReadDir(logDir)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var segs []logSegment
 	for _, e := range entries {
 		name := e.Name()
-		if filepath.Ext(name) != ".log" || len(name) != 24 {
+		if filepath.Ext(name) != ".log" {
 			continue
 		}
-		var base int64
-		if _, err := fmt.Sscanf(strings.TrimSuffix(name, ".log"), "%d", &base); err != nil {
-			continue
+		base, err := strconv.ParseInt(strings.TrimSuffix(name, ".log"), 10, 64)
+		if err != nil || base < 0 || len(name) != 24 || name != segmentNameForOffset(base) {
+			return nil, fmt.Errorf("invalid segment name: %s", name)
 		}
 		segs = append(segs, logSegment{baseOffset: base, name: name})
 	}
 	sort.Slice(segs, func(i, j int) bool { return segs[i].baseOffset < segs[j].baseOffset })
-	return segs
-}
-
-// activeSegmentName returns the name of the active (latest) .log segment in logDir.
-func activeSegmentName(logDir string) string {
-	segs := listSegments(logDir)
-	if len(segs) == 0 {
-		return "00000000000000000000.log"
-	}
-	return segs[len(segs)-1].name
+	return segs, nil
 }
 
 // segmentNameForOffset formats a segment file name from a base offset.
@@ -350,21 +395,35 @@ func segmentNameForOffset(baseOffset int64) string {
 // Rolls to a new segment if the active file exceeds MaxSegmentBytes.
 // Returns (logFilePath, filePosBefore, error). filePosBefore is the byte offset
 // at which these records were written — used to build the sparse index entry.
-func writeRecords(logDir string, records []byte, nextOffset int64) (logFilePath string, filePosBefore int64, err error) {
+func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64) (logFilePath string, filePosBefore int64, err error) {
+	if logDir == "" {
+		return "", 0, fmt.Errorf("missing partition log directory")
+	}
 	if err = os.MkdirAll(logDir, 0755); err != nil {
 		return "", 0, fmt.Errorf("failed to create log directory: %w", err)
 	}
 
-	segName := activeSegmentName(logDir)
+	segs, err := listSegments(logDir)
+	if err != nil {
+		return "", 0, err
+	}
+	active := logSegment{baseOffset: nextOffset, name: segmentNameForOffset(nextOffset)}
+	if len(segs) > 0 {
+		active = segs[len(segs)-1]
+	}
+	segName := active.name
 	logFile := filepath.Join(logDir, segName)
 
 	// Capture size before the write (used as the sparse index byte position).
 	if fi, statErr := os.Stat(logFile); statErr == nil {
 		filePosBefore = fi.Size()
+	} else if !os.IsNotExist(statErr) {
+		return "", 0, statErr
 	}
 
 	// Roll to a new segment if the current one exceeds the size limit.
-	if filePosBefore >= MaxSegmentBytes {
+	if filePosBefore >= MaxSegmentBytes || filePosBefore+int64(len(records)) > math.MaxInt32 ||
+		lastOffset-active.baseOffset > math.MaxInt32 {
 		newName := segmentNameForOffset(nextOffset)
 		logger.L.Info("rolling log segment", "dir", logDir, "oldSegment", segName, "newSegment", newName)
 		logFile = filepath.Join(logDir, newName)
@@ -376,8 +435,10 @@ func writeRecords(logDir string, records []byte, nextOffset int64) (logFilePath 
 		return "", 0, fmt.Errorf("failed to open log file: %w", openErr)
 	}
 	defer f.Close()
-	if _, writeErr := f.Write(records); writeErr != nil {
+	if n, writeErr := f.Write(records); writeErr != nil {
 		return "", 0, fmt.Errorf("failed to write records: %w", writeErr)
+	} else if n != len(records) {
+		return "", 0, io.ErrShortWrite
 	}
 	if syncErr := f.Sync(); syncErr != nil {
 		return "", 0, fmt.Errorf("failed to fsync log file: %w", syncErr)

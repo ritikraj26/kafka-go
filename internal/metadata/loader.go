@@ -4,16 +4,19 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 // LoadTopicsFromDisk scans the log directory and loads existing topics
 func (m *Manager) LoadTopicsFromDisk(logDir string) error {
+	m.SetLogDir(logDir)
 	// Check if directory exists
 	if _, err := os.Stat(logDir); os.IsNotExist(err) {
 		return nil
@@ -35,6 +38,9 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 		}
 		// Skip broker replica subdirectories (broker-N/) created by the multi-broker layout.
 		if strings.HasPrefix(entry.Name(), "broker-") {
+			if err := validateBrokerLogs(filepath.Join(logDir, entry.Name())); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -101,7 +107,10 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 		for len(topic.Partitions) <= partitionIndex {
 			partIdx := int32(len(topic.Partitions))
 			partLogDir := fmt.Sprintf("%s/%s-%d", logDir, topicName, partIdx)
-			nextOffset := recoverNextOffset(partLogDir)
+			nextOffset, err := recoverNextOffset(partLogDir)
+			if err != nil {
+				return err
+			}
 			topic.Partitions = append(topic.Partitions, Partition{
 				Index:           partIdx,
 				LeaderID:        1,
@@ -111,8 +120,9 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 				LeaderEpoch:     0,
 				PartitionEpoch:  0,
 
-				BrokerLogDirs:   map[int32]string{1: partLogDir},
-				NextOffset:      nextOffset,
+				BrokerLogDirs: map[int32]string{1: partLogDir},
+				NextOffset:    nextOffset,
+				LogEndOffset:  nextOffset,
 			})
 		}
 	}
@@ -153,8 +163,25 @@ func (m *Manager) LoadTopicsFromDisk(logDir string) error {
 			if p.ReplicaLastSeen == nil {
 				p.ReplicaLastSeen = make(map[int32]int64)
 			}
+			for _, bid := range p.ReplicaNodes {
+				leo := p.NextOffset
+				if bid != p.LeaderID {
+					var err error
+					leo, err = recoverNextOffset(p.BrokerLogDirs[bid])
+					if err != nil {
+						return err
+					}
+					if leo > p.NextOffset {
+						return fmt.Errorf("replica %d of %s-%d is ahead of the recovered leader", bid, topic.Name, p.Index)
+					}
+				}
+				p.ReplicaLEO[bid] = leo
+			}
+			p.AdvanceHighWatermark()
 		}
-		m.topics[topic.Name] = topic
+	}
+	for name, topic := range topicsFound {
+		m.topics[name] = topic
 	}
 
 	return nil
@@ -192,36 +219,71 @@ func parseTopicDirName(dirName string) (string, int, error) {
 	return topicName, partitionIndex, nil
 }
 
-// recoverNextOffset counts RecordBatches across all segments to recover NextOffset.
-// It streams 12-byte batch headers from the last (active) segment rather than reading
-// the whole file into memory, avoiding a potential 1 GB allocation at startup.
-func recoverNextOffset(logDir string) int64 {
-	segs := listSegments(logDir)
-	if len(segs) == 0 {
-		return 0
-	}
-	last := segs[len(segs)-1]
-	logFile := filepath.Join(logDir, last.name)
-	f, err := os.Open(logFile)
+func validateBrokerLogs(dir string) error {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		// File listed but unreadable — fall back to base offset
-		return last.baseOffset
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, _, err := parseTopicDirName(entry.Name()); err != nil {
+			continue
+		}
+		if _, err := recoverNextOffset(filepath.Join(dir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recoverNextOffset validates every batch without modifying any log files.
+// Incomplete, corrupt or noncontiguous logs require explicit repair.
+func recoverNextOffset(logDir string) (int64, error) {
+	segs, err := listSegments(logDir)
+	if err != nil {
+		return 0, err
+	}
+	if len(segs) == 0 {
+		return 0, nil
+	}
+	next := segs[0].baseOffset
+	for _, segment := range segs {
+		if segment.baseOffset != next {
+			return 0, fmt.Errorf("noncontiguous segment %s: expected offset %d", segment.name, next)
+		}
+		path := filepath.Join(logDir, segment.name)
+		next, err = recoverSegment(path, next)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return next, nil
+}
+
+func recoverSegment(path string, next int64) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
 	}
 	defer f.Close()
 
-	var count int64
-	hdr := make([]byte, 12) // baseOffset(8) + batchLength(4)
+	var position int64
 	for {
-		if _, err := io.ReadFull(f, hdr); err != nil {
-			break // EOF or truncated — done
+		batch, err := storage.ReadRecordBatch(f)
+		if err == io.EOF {
+			return next, nil
 		}
-		batchLength := int64(binary.BigEndian.Uint32(hdr[8:12]))
-		if _, err := f.Seek(batchLength, io.SeekCurrent); err != nil {
-			break
+		if err != nil {
+			return 0, fmt.Errorf("recover %s at byte %d: %w", path, position, err)
 		}
-		count++
+		if batch.BaseOffset != next || next > math.MaxInt64-int64(batch.RecordsCount) {
+			return 0, fmt.Errorf("recover %s at byte %d: invalid offset %d, expected %d", path, position, batch.BaseOffset, next)
+		}
+		next += int64(batch.RecordsCount)
+		position += int64(len(batch.Data))
 	}
-	return last.baseOffset + count
 }
 
 // parseClusterMetadataForTopics reads __cluster_metadata log using proper

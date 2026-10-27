@@ -79,7 +79,8 @@ func main() {
 
 	// Load existing topics from disk
 	if err := metaMgr.LoadTopicsFromDisk(logDir); err != nil {
-		logger.L.Warn("failed to load topics from disk", "err", err)
+		logger.L.Error("failed to recover partition logs; files were preserved", "err", err)
+		os.Exit(1)
 	}
 
 	// Load committed offsets from disk

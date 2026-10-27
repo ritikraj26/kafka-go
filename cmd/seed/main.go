@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 const logDir = "/tmp/kraft-broker-logs"
@@ -88,7 +89,11 @@ func main() {
 			records := t.records[pi]
 			for offset, rec := range records {
 				filePos := int32(logBuf.Len())
-				batch := buildRecordBatch(int64(offset), rec.key, rec.value)
+				batch, err := storage.EncodeRecordBatch(int64(offset), []storage.Record{{Key: rec.key, Value: rec.value}})
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "encode %s: %v\n", logFile, err)
+					os.Exit(1)
+				}
 				logBuf.Write(batch)
 
 				binary.Write(&indexBuf, binary.BigEndian, int32(offset))
@@ -109,63 +114,4 @@ func main() {
 	}
 
 	fmt.Printf("\nDone. Start the broker with:\n  go run app/main.go\n")
-}
-
-func writeZigzagVarint(buf *bytes.Buffer, v int64) {
-	uv := uint64((v << 1) ^ (v >> 63))
-	for uv >= 0x80 {
-		buf.WriteByte(byte(uv) | 0x80)
-		uv >>= 7
-	}
-	buf.WriteByte(byte(uv))
-}
-
-func buildRecordBatch(baseOffset int64, key, value []byte) []byte {
-	var record bytes.Buffer
-	record.WriteByte(0x00)
-	record.WriteByte(0x00)
-	record.WriteByte(0x00)
-
-	if key == nil {
-		record.WriteByte(0x01)
-	} else {
-		writeZigzagVarint(&record, int64(len(key)))
-		record.Write(key)
-	}
-
-	writeZigzagVarint(&record, int64(len(value)))
-	record.Write(value)
-	record.WriteByte(0x00)
-
-	recBytes := record.Bytes()
-
-	var recWithLen bytes.Buffer
-	writeZigzagVarint(&recWithLen, int64(len(recBytes)))
-	recWithLen.Write(recBytes)
-
-	now := time.Now().UnixMilli()
-
-	var batch bytes.Buffer
-	binary.Write(&batch, binary.BigEndian, baseOffset)
-	batchLengthPos := batch.Len()
-	binary.Write(&batch, binary.BigEndian, int32(0))
-	binary.Write(&batch, binary.BigEndian, int32(0))
-	batch.WriteByte(2)
-	binary.Write(&batch, binary.BigEndian, uint32(0))
-	binary.Write(&batch, binary.BigEndian, int16(0))
-	binary.Write(&batch, binary.BigEndian, int32(0))
-	binary.Write(&batch, binary.BigEndian, now)
-	binary.Write(&batch, binary.BigEndian, now)
-	binary.Write(&batch, binary.BigEndian, int64(-1))
-	binary.Write(&batch, binary.BigEndian, int16(-1))
-	binary.Write(&batch, binary.BigEndian, int32(-1))
-	binary.Write(&batch, binary.BigEndian, int32(1))
-
-	batch.Write(recWithLen.Bytes())
-
-	result := batch.Bytes()
-	batchLen := int32(len(result) - 12)
-	binary.BigEndian.PutUint32(result[batchLengthPos:batchLengthPos+4], uint32(batchLen))
-
-	return result
 }
