@@ -341,7 +341,7 @@ func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) 
 			// Find the matching partition to write records
 			for _, p := range parts {
 				if p.topic.Name == topicName && p.partition.Index == partIdx {
-					replicaLogDir := fm.metaMgr.PartitionLogDir(fm.localID, topicName, partIdx)
+					replicaLogDir := p.partition.LogDirForBroker(fm.localID)
 					if writeErr := p.partition.AppendReplicaRecords(recordSet, replicaLogDir, p.leo); writeErr != nil {
 						logger.L.Error("follower: write records failed",
 							"topic", topicName, "partition", partIdx, "err", writeErr)

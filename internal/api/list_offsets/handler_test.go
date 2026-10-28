@@ -6,6 +6,7 @@ import (
 
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 // parseFirstPartition parses error_code, timestamp, and offset for the first partition of the first topic.
@@ -39,8 +40,8 @@ func TestListOffsets_UnknownTopic(t *testing.T) {
 }
 
 func TestListOffsets_Latest(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("orders", 1)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "orders", 1)
 	req := &protocol.ListOffsetsRequest{
 		Topics: []protocol.ListOffsetsTopic{
 			{Name: "orders", Partitions: []protocol.ListOffsetsPartition{{Index: 0, Timestamp: -1}}},
@@ -57,8 +58,8 @@ func TestListOffsets_Latest(t *testing.T) {
 }
 
 func TestListOffsets_Earliest(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("orders", 1)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "orders", 1)
 	req := &protocol.ListOffsetsRequest{
 		Topics: []protocol.ListOffsetsTopic{
 			{Name: "orders", Partitions: []protocol.ListOffsetsPartition{{Index: 0, Timestamp: -2}}},
@@ -75,8 +76,8 @@ func TestListOffsets_Earliest(t *testing.T) {
 }
 
 func TestListOffsets_UnknownPartition(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("orders", 1)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "orders", 1)
 	req := &protocol.ListOffsetsRequest{
 		Topics: []protocol.ListOffsetsTopic{
 			{Name: "orders", Partitions: []protocol.ListOffsetsPartition{{Index: 99, Timestamp: -1}}},

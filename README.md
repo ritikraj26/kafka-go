@@ -59,6 +59,7 @@ internal/
 │   └── broker.go            Broker registry for simulated multi-broker cluster
 ├── metadata/
 │   ├── metadata.go          Thread-safe topic/partition manager (RWMutex)
+│   ├── persistence.go       Atomic topic catalog (IDs, replicas, paths, leader epochs)
 │   ├── topic.go             Topic/Partition: append, sparse index, HW, LEO, replicas
 │   ├── leader_election.go   Simple leader election within ISR
 │   └── loader.go            Disk recovery: log scanning, cluster metadata parsing
@@ -79,15 +80,15 @@ internal/
 - **Checked record batches** — Accepts uncompressed, nontransactional magic-v2 batches; validates CRC32C, record framing, counts, offset deltas, and headers before any append. Compressed and unsupported batch formats return explicit Kafka errors.
 - **Record-based offsets** — Assigns base offsets and leader epochs without modifying producer buffers; advances offsets by the number of records across every batch in a request. Index offsets are relative to their segment.
 - **Log segment rolling** — Active segment rolls to a new `%020d.log` / `%020d.index` pair when the file exceeds `MaxSegmentBytes` (default 1 GB); `SeekToOffset` selects the correct segment before binary-searching its index
-- **Cluster metadata recovery** — Parses `__cluster_metadata` KIP-631 records on startup to recover topic UUIDs
+- **Persistent topic metadata** — Atomically saves topic UUIDs, partition replicas, leader IDs/epochs, and relative log paths in `broker-metadata.json`; recovers topics in both supported log layouts, including empty topics
 - **Consumer groups** — Full eager-rebalance protocol: FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup with session timeout expiry and automatic rebalance triggers
 - **Offset management** — OffsetCommit/OffsetFetch for consumer group offset tracking; ListOffsets for earliest/latest offset discovery
 - **Simulated replication** — Configurable multi-broker cluster (in-process) with round-robin replica assignment, follower fetch simulation, and high watermark advancement
 - **LeaderEpoch validation** — Fetch requests carrying a `current_leader_epoch` are fenced: stale epoch → `ErrFencedLeaderEpoch (74)`, epoch newer than the leader's → `ErrNotLeaderOrFollower (6)`; epoch `-1` (Fetch v0 / old clients) skips validation
 - **ISR management** — Automatic ISR shrink when a replica exceeds the lag timeout **or** falls more than 10,000 messages behind the leader LEO (dual check); ISR expand when the replica catches up
 - **Produce acks** — `acks=-1` waits for the end offset of the entire append and returns `REQUEST_TIMED_OUT` when that boundary is not reached. Replica-progress correctness and the network behavior of `acks=0` still need hardening.
-- **Leader election** — Simple ISR-based leader election with epoch tracking
-- **Offset recovery** — Validates every segment of discovered partition logs, restores record-based LEOs, and derives HW from recovered ISR replica offsets. Corrupt, incomplete, or noncontiguous logs cause startup to fail without truncating data.
+- **Leader election** — Simple ISR-based leader election; persists the new leader and epoch before publishing them in memory
+- **Offset recovery** — Validates every saved replica log, restores record-based LEOs, verifies followers are byte-identical prefixes of the saved leader, and initially derives HW from all assigned replicas. Corrupt, incomplete, noncontiguous, or divergent logs cause startup to fail without truncating data.
 - **Concurrency** — Goroutine-per-connection with `sync.RWMutex` on metadata and per-partition mutex on writes
 - **Graceful shutdown** — `SIGINT`/`SIGTERM` handling via `signal.NotifyContext`; listener close + `WaitGroup` drain
 - **Size guards** — 100 MB maximum request frame and record batch size; aggregate connection/memory limits remain future work
@@ -120,11 +121,50 @@ path did not assign valid per-record offsets. Those logs may now be rejected.
 Back up existing data before investigating or explicitly repairing it. Do not
 run the seed script over data you want to preserve: it overwrites its seed files.
 
-The current loader discovers topics from the legacy `{log.dirs}/{topic}-{partition}`
-layout. It also validates logs inside `broker-N` directories and recovers known
-replica offsets, but does **not** yet reconstruct topics stored exclusively in
-that layout or persist new topic UUIDs/leader metadata. These are separate
-metadata-recovery tasks; this step does not establish full cluster restart safety.
+### Persistent topic catalog
+
+The broker stores a versioned `broker-metadata.json` in `log.dirs`. Updates use a
+same-directory temporary file, file synchronization, atomic rename, and directory
+synchronization. Topic creation initializes empty replica logs before publishing
+the catalog, so an empty topic also survives restart. Creation and leader-election
+errors are returned to their callers; an ambiguous metadata I/O failure fences
+further metadata changes until restart. A failed leader change also fences writes
+to that partition. Partial creation can leave untracked directories; recovery
+reports them instead of silently adopting them.
+
+The catalog preserves topic IDs, partition counts, ordered replica assignments,
+leader IDs/epochs, and relative log paths. New topics use
+`broker-{id}/{topic}-{partition}`. Replica placement sorts broker IDs and honors
+`REPLICATION_FACTOR`; changing that default does not reassign existing topics.
+Topic names use Kafka's ASCII letters/digits/`.`/`_`/`-` subset (maximum 249 bytes);
+reserved internal names are rejected. The current safety limits are 10,000
+partitions per topic and a 16 MiB catalog.
+
+On the first startup without a catalog, the loader can import a partition with
+exactly one discovered owner from either a flat `{topic}-{partition}` directory
+(broker 1) or a `broker-N` directory. Existing UUIDs from a valid legacy
+`__cluster_metadata` topic-record log are retained; otherwise an ID is assigned
+once and saved. Partition gaps and multiple possible owners are rejected rather
+than guessing a leader. Import does not add replicas based on today's default RF.
+Old multi-replica directories without authoritative metadata therefore require
+explicit operator recovery. Do not delete the catalog to bypass validation.
+
+Startup fails if a saved directory or its entire segment set is missing, a
+configured broker is missing from the registry, an untracked partition is found,
+or a replica is ahead of/diverges from the saved leader. Malformed catalogs and
+unsafe saved paths are rejected. Temporary metadata files are never promoted
+automatically. Logs are not repaired or truncated by recovery.
+
+ISR membership and replica heartbeat timestamps are runtime state, not durable
+consensus state. Startup initially includes all assigned replicas in ISR and
+calculates a conservative HW from their verified on-disk ends; a lagging replica
+may delay visibility until catch-up. This is not a persisted commit watermark,
+and does not fix the outstanding runtime replication/ISR issues.
+
+Use only one active broker process/manager per log directory. The catalog is for
+this in-process simulator, not a multi-process controller quorum or a distributed
+metadata service. Schemas and consumer-group membership are not persisted here;
+consumer offsets continue to use their separate log.
 
 ### Environment Variables
 
@@ -133,7 +173,7 @@ metadata-recovery tasks; this step does not establish full cluster restart safet
 | `LOG_LEVEL` | `info` | Logging verbosity: `debug`, `info`, `warn`, `error` |
 | `BROKER_ID` | `1` | This broker's ID in the cluster |
 | `NUM_BROKERS` | `3` | Number of simulated brokers in the cluster |
-| `REPLICATION_FACTOR` | `3` | Default replication factor for new topics |
+| `REPLICATION_FACTOR` | `3` | Replica count for new topics; must not exceed configured brokers |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint for schema inference |
 | `OLLAMA_MODEL` | `llama3.2` | LLM model for schema inference |
 
@@ -170,19 +210,19 @@ go test ./internal/storage -run='^$' -fuzz=FuzzParseRecordBatches -fuzztime=30s
 | `protocol` | Encoder/decoder roundtrip, varint encoding, compact strings, UUID, all 13 request parsers, `CurrentLeaderEpoch` field in Fetch v16, v0 epoch defaults to -1 |
 | `schema` | Validation (missing field, wrong type, not JSON), inference from JSON, integer↔number coercion |
 | `storage` | CRC32C and record validation, independent wire fixture, multiple batches, null values, headers, malformed input, bounded recovery reads, parser fuzzing |
-| `metadata` | Multi-record offsets, unchanged input buffers, relative indexes beyond INT32 offsets, segment rolling, recovery of every segment, corruption preservation, replica validation, append fencing, HW timeouts |
+| `metadata` | Record offsets/indexes, corruption preservation, persistent topic/leader recovery across processes, legacy import, divergent/missing replicas, malformed catalogs, atomic DLQ creation, persistence-failure fencing |
 | `coordinator` | Single/multi-member join, sync group, heartbeat, leave + rebalance, offset commit/fetch |
 | `replication` | Follower HW advancement, ISR shrink on time lag, ISR shrink on LEO lag (>10 000 messages), ISR expand on catch-up |
 | `api/api_versions` | All 13 API keys present, error propagation |
 | `api/produce` | Invalid-batch error codes and no write side effects, multi-batch offsets, whole-append acknowledgement target, valid DLQ batches and persistence-error propagation |
 | `app` | Subprocess test proving damaged logs cause nonzero startup exit and remain unchanged |
 | `api/fetch` | Unknown topic ID error, known topic with records, `ErrFencedLeaderEpoch` (stale epoch), `ErrNotLeaderOrFollower` (epoch too new) |
-| `network` | End-to-end ApiVersions roundtrip, full consumer group lifecycle integration test |
+| `network` | ApiVersions roundtrip, consumer group lifecycle, TCP produce followed by server restart and exact record fetch |
 
 ## Limitations & Future Work
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
-- **Remaining correctness work** — Full topic/cluster metadata recovery, durable follower acknowledgements, fetch visibility/batch boundaries, API-version compatibility, and runtime data races are not resolved by record-batch validation
+- **Remaining correctness work** — Durable follower acknowledgements, persisted commit/ISR state, fetch visibility/batch boundaries, API-version compatibility, and runtime data races are still outstanding; the local topic catalog is not distributed consensus
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported
 - **Partial DLQ filtering** — When some (not all) records in a batch fail schema validation, the full batch still writes to the main topic (individual record filtering from binary RecordBatch is not supported)

@@ -11,6 +11,7 @@ import (
 	"github.com/ritiraj/kafka-go/internal/protocol"
 	"github.com/ritiraj/kafka-go/internal/schema"
 	"github.com/ritiraj/kafka-go/internal/storage"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 func TestBuildBody_UnknownTopic(t *testing.T) {
@@ -64,11 +65,8 @@ func TestBuildBody_UnknownTopic(t *testing.T) {
 }
 
 func TestBuildBody_ValidTopic(t *testing.T) {
-	metaMgr := metadata.NewManager()
-	dir := t.TempDir()
-	metaMgr.SetLogDir(dir)
-
-	metaMgr.CreateTopic("orders", 1)
+	metaMgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, metaMgr, "orders", 1)
 	metaMgr.Schemas.Register("orders", &schema.SimpleSchema{Fields: map[string]schema.FieldType{"value": schema.TypeString}})
 
 	req := &protocol.ProduceRequest{
@@ -163,10 +161,9 @@ func responseError(t *testing.T, data []byte) int16 {
 
 func produceManager(t *testing.T) (*metadata.Manager, *metadata.Partition) {
 	t.Helper()
-	m := metadata.NewManager()
-	m.SetLogDir(t.TempDir())
+	m := testutil.NewMetadataManager(t)
 	m.Schemas.Register("orders", &schema.SimpleSchema{Fields: map[string]schema.FieldType{"value": schema.TypeString}})
-	return m, &m.CreateTopic("orders", 1).Partitions[0]
+	return m, &testutil.CreateTopic(t, m, "orders", 1).Partitions[0]
 }
 
 func TestProduceRejectsInvalidBatches(t *testing.T) {
@@ -194,8 +191,9 @@ func TestProduceRejectsInvalidBatches(t *testing.T) {
 			if p.GetLogEndOffset() != 0 || m.GetTopic("orders.dlq") != nil {
 				t.Fatal("invalid batches caused write side effects")
 			}
-			if _, err := os.Stat(p.LogDirForBroker(1)); !os.IsNotExist(err) {
-				t.Fatalf("invalid records touched the partition directory: %v", err)
+			data, err := metadata.ReadPartitionLog(p)
+			if err != nil || len(data) != 0 {
+				t.Fatalf("invalid records changed the pre-created log: %v", err)
 			}
 		})
 	}
@@ -260,7 +258,10 @@ func TestDLQWritesValidBatches(t *testing.T) {
 
 func TestDLQPersistenceFailureIsReported(t *testing.T) {
 	m, p := produceManager(t)
-	dlq := m.GetOrCreateDLQTopic("orders")
+	dlq, err := m.GetOrCreateDLQTopic("orders")
+	if err != nil {
+		t.Fatal(err)
+	}
 	blocker := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(blocker, []byte("not a directory"), 0600); err != nil {
 		t.Fatal(err)
@@ -272,5 +273,23 @@ func TestDLQPersistenceFailureIsReported(t *testing.T) {
 	}
 	if p.GetLogEndOffset() != 0 {
 		t.Fatal("source log advanced after failed routing")
+	}
+}
+
+func TestDLQMetadataFailureIsReported(t *testing.T) {
+	m, p := produceManager(t)
+	path := filepath.Join(m.GetLogDir(), "broker-metadata.json")
+	if err := os.Rename(path, filepath.Join(m.GetLogDir(), "metadata-backup")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	body := BuildBody(produceRequest(produceBatch(t, `{"value":1}`)), m, 1)
+	if code := responseError(t, body); code != protocol.ErrUnknownServerError {
+		t.Fatalf("DLQ metadata failure returned %d", code)
+	}
+	if m.GetTopic("orders.dlq") != nil || p.GetLogEndOffset() != 0 {
+		t.Fatal("DLQ metadata failure published a topic or wrote to the source log")
 	}
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 // readCompactString reads a COMPACT_STRING (unsigned varint length, then bytes).
@@ -59,8 +60,8 @@ func TestDescribeTopics_UnknownTopic(t *testing.T) {
 }
 
 func TestDescribeTopics_KnownTopic(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("orders", 1)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "orders", 1)
 	req := &protocol.DescribeTopicPartitionsRequest{
 		TopicNames: []string{"orders"},
 	}
@@ -80,9 +81,9 @@ func TestDescribeTopics_KnownTopic(t *testing.T) {
 }
 
 func TestDescribeTopics_SortedAlphabetically(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("zebra", 1)
-	mgr.CreateTopic("apple", 1)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "zebra", 1)
+	testutil.CreateTopic(t, mgr, "apple", 1)
 	req := &protocol.DescribeTopicPartitionsRequest{
 		TopicNames: []string{"zebra", "apple"},
 	}
@@ -99,8 +100,8 @@ func TestDescribeTopics_SortedAlphabetically(t *testing.T) {
 }
 
 func TestDescribeTopics_MultipleTopicsMixed(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("exists", 1)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "exists", 1)
 	req := &protocol.DescribeTopicPartitionsRequest{
 		TopicNames: []string{"exists", "missing"},
 	}

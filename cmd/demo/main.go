@@ -253,7 +253,10 @@ func main() {
 	metaMgr := metadata.NewManager()
 	metaMgr.Brokers = reg
 	metaMgr.ReplicationFactor = 3
-	metaMgr.SetLogDir(logDir)
+	if err := metaMgr.SetLogDir(logDir); err != nil {
+		fail(fmt.Sprintf("Configure log directory: %v", err))
+		return
+	}
 	coord := coordinator.NewCoordinator()
 	coord.RebalanceDelay = 500 * time.Millisecond // allow all members to arrive before completing join
 
@@ -280,7 +283,11 @@ func main() {
 
 	// STEP 1
 	banner("STEP 1: Create Topic 'orders' (1 partition, RF=3)")
-	topic := metaMgr.CreateTopic("orders", 1)
+	topic, err := metaMgr.CreateTopic("orders", 1)
+	if err != nil {
+		fail(fmt.Sprintf("Create topic: %v", err))
+		return
+	}
 	p := &topic.Partitions[0]
 	ok(fmt.Sprintf("Topic created \u2014 Leader: broker %d, Replicas: %v, ISR: %v",
 		p.LeaderID, p.ReplicaNodes, p.ISRNodes))

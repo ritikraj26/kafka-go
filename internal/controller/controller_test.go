@@ -9,10 +9,11 @@ import (
 
 	"github.com/ritiraj/kafka-go/internal/broker"
 	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 func TestController_DetectsDeadBrokerAndElectsLeader(t *testing.T) {
-	metaMgr := metadata.NewManager()
+	metaMgr := testutil.NewMetadataManager(t)
 	reg := broker.NewRegistry(1)
 
 	// Broker 1: listening on a real port
@@ -31,10 +32,10 @@ func TestController_DetectsDeadBrokerAndElectsLeader(t *testing.T) {
 	metaMgr.Brokers = reg
 
 	// Create a topic with leader=2 (the dead broker), replicas=[2,1], ISR=[2,1]
-	topic := metaMgr.CreateTopic("test-topic", 1)
-	topic.Partitions[0].LeaderID = 2
-	topic.Partitions[0].ReplicaNodes = []int32{2, 1}
-	topic.Partitions[0].ISRNodes = []int32{2, 1}
+	topic := testutil.CreateTopic(t, metaMgr, "test-topic", 1)
+	if err := metaMgr.ElectLeader("test-topic", 0); err != nil {
+		t.Fatal(err)
+	}
 
 	ctrl := NewController(metaMgr, reg, 100*time.Millisecond)
 	ctrl.failureThreshold = 2
@@ -73,7 +74,7 @@ func TestController_DetectsDeadBrokerAndElectsLeader(t *testing.T) {
 }
 
 func TestController_HealthyBrokersNoElection(t *testing.T) {
-	metaMgr := metadata.NewManager()
+	metaMgr := testutil.NewMetadataManager(t)
 	reg := broker.NewRegistry(1)
 
 	l1, err := net.Listen("tcp", "127.0.0.1:0")
@@ -94,7 +95,7 @@ func TestController_HealthyBrokersNoElection(t *testing.T) {
 	reg.Register(&broker.Broker{ID: 2, Host: "127.0.0.1", Port: int32(port2)})
 	metaMgr.Brokers = reg
 
-	topic := metaMgr.CreateTopic("test-topic", 1)
+	topic := testutil.CreateTopic(t, metaMgr, "test-topic", 1)
 	origLeader := topic.Partitions[0].LeaderID
 
 	ctrl := NewController(metaMgr, reg, 100*time.Millisecond)

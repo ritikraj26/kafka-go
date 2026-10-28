@@ -2,6 +2,9 @@ package metadata
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/ritiraj/kafka-go/internal/broker"
@@ -13,25 +16,44 @@ type Manager struct {
 	mu                sync.RWMutex
 	topics            map[string]*Topic // topic_name -> Topic
 	logDir            string            // Base directory for log files
-	Schemas           *schema.Registry  // AI schema registry (topic -> inferred schema)
-	Brokers           *broker.Registry  // Cluster broker registry
-	ReplicationFactor int               // Default replication factor for new topics
+	loaded            bool
+	catalog           map[string]topicMetadata
+	persistenceErr    error
+	Schemas           *schema.Registry // AI schema registry (topic -> inferred schema)
+	Brokers           *broker.Registry // Cluster broker registry
+	ReplicationFactor int              // Default replication factor for new topics
 }
 
 // NewManager creates a new metadata manager
 func NewManager() *Manager {
 	return &Manager{
 		topics:  make(map[string]*Topic),
+		catalog: make(map[string]topicMetadata),
 		logDir:  "/tmp/kraft-broker-logs", // Default
 		Schemas: schema.NewRegistry(),
 	}
 }
 
 // SetLogDir sets the log directory path
-func (m *Manager) SetLogDir(dir string) {
+func (m *Manager) SetLogDir(dir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.logDir = dir
+	return m.setLogDir(dir)
+}
+
+func (m *Manager) setLogDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("log directory must not be empty")
+	}
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	if m.loaded && absolute != m.logDir {
+		return fmt.Errorf("cannot change log directory after metadata initialization")
+	}
+	m.logDir = absolute
+	return nil
 }
 
 // GetLogDir returns the log directory path
@@ -53,25 +75,86 @@ func (m *Manager) PartitionLogDir(brokerID int32, topicName string, partitionInd
 	return fmt.Sprintf("%s/%s-%d", m.BrokerLogDir(brokerID), topicName, partitionIndex)
 }
 
-// CreateTopic creates a new topic with the given name and number of partitions
-func (m *Manager) CreateTopic(name string, numPartitions int) *Topic {
+// CreateTopic persists the definition before exposing the topic to callers.
+// Repeating the same creation returns the existing topic without replacing it.
+func (m *Manager) CreateTopic(name string, numPartitions int) (*Topic, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if err := validateTopicName(name); err != nil {
+		return nil, err
+	}
+	if numPartitions < 1 || numPartitions > maxTopicPartitions {
+		return nil, fmt.Errorf("partition count must be between 1 and %d", maxTopicPartitions)
+	}
+	if m.persistenceErr != nil {
+		return nil, fmt.Errorf("metadata writes fenced until restart: %w", m.persistenceErr)
+	}
+	if !m.loaded {
+		if err := m.loadTopics(); err != nil {
+			return nil, err
+		}
+	}
+	if topic := m.topics[name]; topic != nil {
+		if len(topic.Partitions) != numPartitions {
+			return nil, fmt.Errorf("topic %s already exists with %d partitions", name, len(topic.Partitions))
+		}
+		return topic, nil
+	}
 	var brokerIDs []int32
 	if m.Brokers != nil {
 		brokerIDs = m.Brokers.IDs()
+		if len(brokerIDs) == 0 {
+			return nil, fmt.Errorf("cannot create a topic with an empty broker registry")
+		}
+	} else {
+		brokerIDs = []int32{1}
 	}
-	topic := NewTopic(name, numPartitions, brokerIDs)
-	// Set BrokerLogDirs for all replicas
-	for i := range topic.Partitions {
-		p := &topic.Partitions[i]
-		for _, brokerID := range p.ReplicaNodes {
-			p.BrokerLogDirs[brokerID] = fmt.Sprintf("%s/broker-%d/%s-%d", m.logDir, brokerID, name, p.Index)
+	slices.Sort(brokerIDs)
+	for _, id := range brokerIDs {
+		if id <= 0 {
+			return nil, fmt.Errorf("invalid broker ID %d", id)
 		}
 	}
+	rf := m.ReplicationFactor
+	if rf == 0 {
+		rf = len(brokerIDs)
+	}
+	if rf < 1 || rf > len(brokerIDs) {
+		return nil, fmt.Errorf("replication factor %d exceeds available brokers or is invalid", rf)
+	}
+	topic := newTopic(name, numPartitions, brokerIDs, rf)
+	definition := topicMetadata{Name: name, ID: topic.ID, Partitions: make([]partitionMetadata, numPartitions)}
+	for i := range topic.Partitions {
+		p := &topic.Partitions[i]
+		d := partitionMetadata{Index: p.Index, LeaderID: p.LeaderID, Replicas: slices.Clone(p.ReplicaNodes), LogDirs: make(map[int32]string)}
+		for _, id := range p.ReplicaNodes {
+			relative := filepath.Join(fmt.Sprintf("broker-%d", id), fmt.Sprintf("%s-%d", name, p.Index))
+			d.LogDirs[id] = relative
+			p.BrokerLogDirs[id] = filepath.Join(m.logDir, relative)
+			if _, err := os.Lstat(p.BrokerLogDirs[id]); !os.IsNotExist(err) {
+				if err == nil {
+					err = fmt.Errorf("partition directory already exists: %s", relative)
+				}
+				m.persistenceErr = err
+				return nil, err
+			}
+			if err := initializeLog(p.BrokerLogDirs[id]); err != nil {
+				m.persistenceErr = err
+				return nil, fmt.Errorf("initialize %s: %w", relative, err)
+			}
+		}
+		definition.Partitions[i] = d
+	}
+	next := cloneCatalog(m.catalog)
+	next[name] = definition
+	if err := m.persistCatalog(next); err != nil {
+		m.persistenceErr = err
+		return nil, err
+	}
+	m.catalog = next
 	m.topics[name] = topic
-	return topic
+	return topic, nil
 }
 
 // GetTopic retrieves a topic by name, returns nil if not found
@@ -105,13 +188,8 @@ func (m *Manager) TopicExists(name string) bool {
 
 // GetOrCreateDLQTopic returns the dead-letter-queue topic for the given source
 // topic, creating it (with 1 partition) if it does not yet exist.
-func (m *Manager) GetOrCreateDLQTopic(sourceTopic string) *Topic {
-	dlqName := sourceTopic + ".dlq"
-	if t := m.GetTopic(dlqName); t != nil {
-		return t
-	}
-	// CreateTopic already populates BrokerLogDirs from the manager's logDir.
-	return m.CreateTopic(dlqName, 1)
+func (m *Manager) GetOrCreateDLQTopic(sourceTopic string) (*Topic, error) {
+	return m.CreateTopic(sourceTopic+".dlq", 1)
 }
 
 // GetTopicByID retrieves a topic by UUID, returns nil if not found

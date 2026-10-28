@@ -4,12 +4,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 func TestFollowerManager_EncodeFetchV0(t *testing.T) {
-	metaMgr := metadata.NewManager()
-	topic := metaMgr.CreateTopic("test-topic", 1)
+	metaMgr := testutil.NewMetadataManager(t)
+	topic := testutil.CreateTopic(t, metaMgr, "test-topic", 1)
 	p := &topic.Partitions[0]
 	p.BrokerLogDirs[p.LeaderID] = t.TempDir()
 
@@ -33,8 +33,8 @@ func TestFollowerManager_EncodeFetchV0(t *testing.T) {
 }
 
 func TestFollowerManager_ReplicateAllSkipsLeader(t *testing.T) {
-	metaMgr := metadata.NewManager()
-	topic := metaMgr.CreateTopic("test-topic", 1)
+	metaMgr := testutil.NewMetadataManager(t)
+	topic := testutil.CreateTopic(t, metaMgr, "test-topic", 1)
 	p := &topic.Partitions[0]
 	p.LeaderID = 1 // This broker is the leader
 	p.BrokerLogDirs[p.LeaderID] = t.TempDir()

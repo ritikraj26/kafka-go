@@ -132,7 +132,10 @@ func validateRecords(batches []storage.RecordBatch, topic string, metaMgr *metad
 }
 
 func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager) error {
-	dlq := metaMgr.GetOrCreateDLQTopic(sourceTopic)
+	dlq, err := metaMgr.GetOrCreateDLQTopic(sourceTopic)
+	if err != nil {
+		return err
+	}
 	if len(dlq.Partitions) == 0 {
 		return fmt.Errorf("DLQ %s has no partitions", dlq.Name)
 	}

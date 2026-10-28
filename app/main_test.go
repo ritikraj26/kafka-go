@@ -27,6 +27,29 @@ func TestStartupRejectsCorruptPartitionLog(t *testing.T) {
 	if err := os.WriteFile(logPath, damaged, 0600); err != nil {
 		t.Fatal(err)
 	}
+	assertRecoveryStartupFailure(t, dir)
+	after, err := os.ReadFile(logPath)
+	if err != nil || !bytes.Equal(after, damaged) {
+		t.Fatalf("startup modified the damaged log: %v", err)
+	}
+}
+
+func TestStartupRejectsMalformedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "broker-metadata.json")
+	data := []byte(`{"version":1,`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	assertRecoveryStartupFailure(t, dir)
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(after, data) {
+		t.Fatalf("startup modified malformed metadata: %v", err)
+	}
+}
+
+func assertRecoveryStartupFailure(t *testing.T, dir string) {
+	t.Helper()
 	props := filepath.Join(dir, "server.properties")
 	if err := os.WriteFile(props, []byte("log.dirs="+dir+"\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -42,9 +65,5 @@ func TestStartupRejectsCorruptPartitionLog(t *testing.T) {
 	}
 	if !bytes.Contains(output, []byte("failed to recover partition logs")) || bytes.Contains(output, []byte("broker listening")) {
 		t.Fatalf("unexpected startup output: %s", output)
-	}
-	after, err := os.ReadFile(logPath)
-	if err != nil || !bytes.Equal(after, damaged) {
-		t.Fatalf("startup modified the damaged log: %v", err)
 	}
 }

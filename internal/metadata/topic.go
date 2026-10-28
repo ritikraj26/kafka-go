@@ -376,6 +376,9 @@ func listSegments(logDir string) ([]logSegment, error) {
 		if filepath.Ext(name) != ".log" {
 			continue
 		}
+		if !e.Type().IsRegular() {
+			return nil, fmt.Errorf("segment is not a regular file: %s", filepath.Join(logDir, name))
+		}
 		base, err := strconv.ParseInt(strings.TrimSuffix(name, ".log"), 10, 64)
 		if err != nil || base < 0 || len(name) != 24 || name != segmentNameForOffset(base) {
 			return nil, fmt.Errorf("invalid segment name: %s", name)
@@ -446,10 +449,8 @@ func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64) (
 	return logFile, filePosBefore, nil
 }
 
-// create a new topic with the given name and ID
-// brokerIDs and replicationFactor control replica placement. If brokerIDs is
-// nil or empty, falls back to a single-broker default (broker 1).
-func NewTopic(name string, numPartitions int, brokerIDs ...[]int32) *Topic {
+// newTopic constructs a topic after the manager validates its configuration.
+func newTopic(name string, numPartitions int, ids []int32, rf int) *Topic {
 	topic := &Topic{
 		Name:       name,
 		ID:         uuid.New(),
@@ -457,18 +458,9 @@ func NewTopic(name string, numPartitions int, brokerIDs ...[]int32) *Topic {
 		Partitions: make([]Partition, numPartitions),
 	}
 
-	// Determine broker list
-	var ids []int32
-	if len(brokerIDs) > 0 && len(brokerIDs[0]) > 0 {
-		ids = brokerIDs[0]
-	} else {
-		ids = []int32{1}
-	}
-
 	// initialise partitions with round-robin replica assignment
 	for i := 0; i < numPartitions; i++ {
 		// Pick replicas starting at (i % len(ids)), wrapping around
-		rf := len(ids)
 		replicas := make([]int32, rf)
 		for r := 0; r < rf; r++ {
 			replicas[r] = ids[(i+r)%len(ids)]

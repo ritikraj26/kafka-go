@@ -8,6 +8,7 @@ import (
 
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 func TestBuildBody_UnknownTopic(t *testing.T) {
@@ -79,10 +80,10 @@ func TestBuildBody_UnknownTopic(t *testing.T) {
 }
 
 func TestBuildBody_KnownTopicWithRecords(t *testing.T) {
-	metaMgr := metadata.NewManager()
+	metaMgr := testutil.NewMetadataManager(t)
 	dir := t.TempDir()
 
-	topic := metaMgr.CreateTopic("events", 1)
+	topic := testutil.CreateTopic(t, metaMgr, "events", 1)
 
 	topicID := topic.ID
 	var topicIDBytes [16]byte
@@ -138,8 +139,8 @@ func partitionErrCode(t *testing.T, body []byte) int16 {
 }
 
 func TestBuildBody_FencedLeaderEpoch(t *testing.T) {
-	metaMgr := metadata.NewManager()
-	topic := metaMgr.CreateTopic("epoch-topic", 1)
+	metaMgr := testutil.NewMetadataManager(t)
+	topic := testutil.CreateTopic(t, metaMgr, "epoch-topic", 1)
 	topic.Partitions[0].LeaderEpoch = 2
 	topic.Partitions[0].LeaderID = 1
 
@@ -171,8 +172,8 @@ func TestBuildBody_FencedLeaderEpoch(t *testing.T) {
 }
 
 func TestBuildBody_EpochTooNew(t *testing.T) {
-	metaMgr := metadata.NewManager()
-	topic := metaMgr.CreateTopic("epoch-new-topic", 1)
+	metaMgr := testutil.NewMetadataManager(t)
+	topic := testutil.CreateTopic(t, metaMgr, "epoch-new-topic", 1)
 	topic.Partitions[0].LeaderEpoch = 2
 	topic.Partitions[0].LeaderID = 1
 

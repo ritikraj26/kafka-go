@@ -2,20 +2,28 @@ package metadata
 
 import (
 	"testing"
+
+	"github.com/ritiraj/kafka-go/internal/broker"
 )
 
 func TestElectLeader(t *testing.T) {
 	m := NewManager()
-	topic := m.CreateTopic("elect-topic", 1)
+	if err := m.SetLogDir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	m.Brokers = broker.NewRegistry(1)
+	for id := int32(1); id <= 3; id++ {
+		m.Brokers.Register(&broker.Broker{ID: id})
+	}
+	topic, err := m.CreateTopic("elect-topic", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Initially leader is first replica
 	origLeader := topic.Partitions[0].LeaderID
 
-	// Set ISR with multiple brokers
-	topic.Partitions[0].ReplicaNodes = []int32{1, 2, 3}
-	topic.Partitions[0].ISRNodes = []int32{1, 2, 3}
-
-	err := m.ElectLeader("elect-topic", 0)
+	err = m.ElectLeader("elect-topic", 0)
 	if err != nil {
 		t.Fatalf("ElectLeader error: %v", err)
 	}

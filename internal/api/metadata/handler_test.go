@@ -7,6 +7,7 @@ import (
 	"github.com/ritiraj/kafka-go/internal/broker"
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
 // readUvarint reads an unsigned varint from buf at position pos.
@@ -72,8 +73,8 @@ func TestMetadata_WithBrokerRegistry(t *testing.T) {
 }
 
 func TestMetadata_SpecificTopic(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("orders", 3)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "orders", 3)
 	req := &protocol.MetadataRequest{TopicNames: []string{"orders"}}
 	body := BuildBody(req, mgr)
 	if len(body) == 0 {
@@ -82,9 +83,9 @@ func TestMetadata_SpecificTopic(t *testing.T) {
 }
 
 func TestMetadata_AllTopics(t *testing.T) {
-	mgr := metadata.NewManager()
-	mgr.CreateTopic("t1", 1)
-	mgr.CreateTopic("t2", 2)
+	mgr := testutil.NewMetadataManager(t)
+	testutil.CreateTopic(t, mgr, "t1", 1)
+	testutil.CreateTopic(t, mgr, "t2", 2)
 	req := &protocol.MetadataRequest{TopicNames: nil} // nil = all topics
 	body := BuildBody(req, mgr)
 	// Find topics compact array after brokers section.
