@@ -62,6 +62,7 @@ internal/
 │   ├── persistence.go       Atomic topic catalog (IDs, replicas, paths, leader epochs)
 │   ├── topic.go             Topic/Partition: append, sparse index, HW, LEO, replicas
 │   ├── fetch.go             Locked, bounded cross-segment reads and replica progress
+│   ├── produce.go           Atomic produce admission, ISR policy, acknowledgement waits
 │   ├── leader_election.go   Simple leader election within ISR
 │   └── loader.go            Disk recovery: log scanning, cluster metadata parsing
 ├── replication/
@@ -87,8 +88,8 @@ internal/
 - **Simulated replication** — Configurable multi-broker cluster (in-process) with round-robin replica assignment, follower fetch simulation, and high watermark advancement
 - **LeaderEpoch validation** — Fetch requests carrying a `current_leader_epoch` are fenced: stale epoch → `ErrFencedLeaderEpoch (74)`, epoch newer than the leader's → `ErrUnknownLeaderEpoch (75)`; wrong broker or unassigned replica → `ErrNotLeaderOrFollower (6)`. Epoch `-1` (Fetch v0 / old clients) skips epoch validation.
 - **Complete-batch fetches** — Reads across segments using sparse-index seeks (or scanning when an index is absent), retains partition byte budgets, and prevents consumer data above HW from entering a response
-- **ISR management** — Automatic ISR shrink when a replica exceeds the lag timeout **or** falls more than 10,000 messages behind the leader LEO (dual check); ISR expand when the replica catches up
-- **Produce acks** — `acks=-1` waits for the end offset of the entire append and returns `REQUEST_TIMED_OUT` when that boundary is not reached. Follower positions advance after disk synchronization, not when the leader constructs a response. ISR/minimum-replica policy, crash durability, and the network behavior of `acks=0` still need hardening.
+- **ISR management** — Removes offline, fenced, timed-out, or excessively lagging replicas; removed followers must fully catch up before rejoining. Membership changes update the partition epoch, recompute HW, and wake pending producers.
+- **Produce acks** — Validates `acks=0/1/-1`; `acks=0` sends no response, `acks=1` requires the local append, and `acks=-1` requires the whole append below HW with at least `MIN_INSYNC_REPLICAS` members (default 2). Admission checks and append are atomic under the partition lock.
 - **Leader election** — Simple ISR-based leader election; persists the new leader and epoch before publishing them in memory
 - **Offset recovery** — Validates every saved replica log, restores record-based LEOs, verifies followers are byte-identical prefixes of the saved leader, and initially derives HW from all assigned replicas. Corrupt, incomplete, noncontiguous, or divergent logs cause startup to fail without truncating data.
 - **Concurrency** — Goroutine-per-connection with `sync.RWMutex` on metadata and per-partition mutex on writes
@@ -106,6 +107,9 @@ go run ./app/main.go
 
 # With a custom config file
 go run ./app/main.go /path/to/server.properties
+
+# Explicitly opt into one-copy acknowledgements for a single-broker run
+NUM_BROKERS=1 REPLICATION_FACTOR=1 MIN_INSYNC_REPLICAS=1 go run ./app/main.go
 ```
 
 The broker reads `log.dirs` from the properties file to locate partition logs on disk.
@@ -213,6 +217,47 @@ use session ID 0, and requests for a nonzero session return
 write path rejects transactional/control batches); follower-read routing and
 divergent-log truncation are also outside the supported subset.
 
+### Producer acknowledgement policy
+
+`MIN_INSYNC_REPLICAS` defaults to **2**, including when existing topic definitions
+are loaded. It is a broker-wide startup policy, not persisted per-topic metadata.
+Invalid values (including an explicitly empty value) fail startup rather than
+silently falling back. A topic with fewer assigned replicas may still be read
+or written using `acks=0/1`, but cannot satisfy `acks=-1` until the policy or
+replica assignment is explicitly changed. The single-broker example above opts
+into the weaker minimum of 1.
+
+| Request/outcome | Behavior |
+|-----------------|----------|
+| `acks=0` | Append locally without waiting for replicas and send no response. A partition failure is logged and closes the connection without response bytes. |
+| `acks=1` | Respond after the local append/fsync; the minimum-ISR policy does not apply. |
+| `acks=-1` | Check minimum ISR before append, then wait for the exclusive end offset of the entire append to reach HW. |
+| Any other `acks` value | `INVALID_REQUIRED_ACKS` (21), without source or DLQ writes. |
+| Negative `timeout_ms` | `INVALID_REQUEST` (42), without writes. |
+| Too few ISR members before append | `NOT_ENOUGH_REPLICAS` (19), without appending. |
+| Minimum lost while waiting | `NOT_ENOUGH_REPLICAS_AFTER_APPEND` (20); the local append remains. |
+| Replication wait expires | `REQUEST_TIMED_OUT` (7); the local append may already exist. |
+| Leader/epoch changes while waiting | `NOT_LEADER_OR_FOLLOWER` (6), without claiming successful replication. |
+
+The minimum is an admission floor, **not a quorum target**: with ISR `[1,2,3]`
+and minimum 2, `acks=-1` waits for all three until ISR legitimately shrinks.
+Shrinking to two caught-up members can complete the wait; shrinking below two
+fails pending acknowledgements even if ISR recovers before the waiter runs.
+Controller-marked offline brokers cannot be re-added by a maintenance tick just
+because they fetched recently. Reachability alone is not sufficient to rejoin.
+
+All partitions and DLQ writes in one Produce request share one replication-wait
+deadline. This does not cancel an in-progress filesystem write or undo an append;
+later partitions can still append after the wait budget expires. DLQ routing
+uses the original acknowledgement setting and minimum-ISR policy rather than
+silently returning success after a leader-only write. The source and DLQ writes
+are not an atomic transaction.
+
+After a timeout, connection loss, or post-append error, a retry may duplicate
+records. There is no idempotent-producer or exactly-once guarantee. Acknowledged
+runtime replication is also not a substitute for persisted commit/ISR state,
+independent failure domains, safe divergent-log recovery, or broker authentication.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -221,6 +266,7 @@ divergent-log truncation are also outside the supported subset.
 | `BROKER_ID` | `1` | This broker's ID in the cluster |
 | `NUM_BROKERS` | `3` | Number of simulated brokers in the cluster |
 | `REPLICATION_FACTOR` | `3` | Replica count for new topics; must not exceed configured brokers |
+| `MIN_INSYNC_REPLICAS` | `2` | Minimum ISR for `acks=-1`; explicitly use `1` for single-copy acknowledgements |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint for schema inference |
 | `OLLAMA_MODEL` | `llama3.2` | LLM model for schema inference |
 
@@ -252,6 +298,9 @@ go test ./internal/storage -run='^$' -fuzz=FuzzParseRecordBatches -fuzztime=30s
 # Fetch visibility, byte budgets, follower progress, and malformed request parsing
 go test -race ./internal/api/fetch ./internal/metadata ./internal/replication ./internal/network ./internal/protocol
 go test ./internal/protocol -run='^$' -fuzz=FuzzFetchRequests -fuzztime=30s
+
+# Acknowledgement, ISR-transition, configuration, and wire-level failure tests
+go test -race ./internal/api/produce ./internal/metadata ./internal/replication ./internal/network ./app
 ```
 
 ### Test Coverage
@@ -265,15 +314,15 @@ go test ./internal/protocol -run='^$' -fuzz=FuzzFetchRequests -fuzztime=30s
 | `coordinator` | Single/multi-member join, sync group, heartbeat, leave + rebalance, offset commit/fetch |
 | `replication` | TCP follower persistence and subsequent HW acknowledgement, batches exceeding 1 MiB, failed-write fencing, ISR shrink/expand |
 | `api/api_versions` | All 13 API keys present, error propagation |
-| `api/produce` | Invalid-batch error codes and no write side effects, multi-batch offsets, whole-append acknowledgement target, valid DLQ batches and persistence-error propagation |
-| `app` | Subprocess test proving damaged logs cause nonzero startup exit and remain unchanged |
+| `api/produce` | Invalid inputs without side effects, minimum ISR, shared request deadline, whole-append waits, DLQ acknowledgement and persistence-error propagation |
+| `app` | Startup rejection of corrupt storage and invalid minimum ISR; explicit single-copy configuration |
 | `api/fetch` | Exact record/offset assertions, HW boundaries, first-batch exception, partition/global byte limits, segment/index fallbacks, offset/leader errors, long polls, concurrent append/fetch |
-| `network` | ApiVersions roundtrip, consumer group lifecycle, TCP produce/restart/fetch, Fetch v16 consumer visibility without replica-state mutation |
+| `network` | TCP produce/restart/fetch, Fetch v16 visibility, acks=0 suppression and failure closure, ISR-loss error codes, acks=-1 with real follower disk persistence |
 
 ## Limitations & Future Work
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
-- **Remaining correctness work** — Persisted commit/ISR state, minimum-ISR policy, failover/divergence recovery, other API-version compatibility, and concurrency/lifecycle issues outside the locked fetch path are still outstanding; the local topic catalog is not distributed consensus
+- **Remaining correctness work** — Persisted commit/ISR state, failover/divergence recovery, other API-version compatibility, and concurrency/lifecycle issues outside the locked produce/fetch paths are still outstanding; the local topic catalog is not distributed consensus
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported
 - **Partial DLQ filtering** — When some (not all) records in a batch fail schema validation, the full batch still writes to the main topic (individual record filtering from binary RecordBatch is not supported)

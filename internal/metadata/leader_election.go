@@ -53,11 +53,13 @@ func (m *Manager) ElectLeader(topicName string, partitionIndex int32) error {
 		if err := m.persistCatalog(next); err != nil {
 			// A rename may have succeeded before directory synchronization failed.
 			p.appendErr = err
+			p.signalChange()
 			return err
 		}
 		m.catalog = next
 		p.LeaderID = elected
 		p.LeaderEpoch++
+		p.signalChange()
 		return nil
 	}
 

@@ -22,15 +22,17 @@ type Manager struct {
 	Schemas           *schema.Registry // AI schema registry (topic -> inferred schema)
 	Brokers           *broker.Registry // Cluster broker registry
 	ReplicationFactor int              // Default replication factor for new topics
+	MinInSyncReplicas int              // Broker-wide acks=-1 policy; configure before starting workers
 }
 
 // NewManager creates a new metadata manager
 func NewManager() *Manager {
 	return &Manager{
-		topics:  make(map[string]*Topic),
-		catalog: make(map[string]topicMetadata),
-		logDir:  "/tmp/kraft-broker-logs", // Default
-		Schemas: schema.NewRegistry(),
+		topics:            make(map[string]*Topic),
+		catalog:           make(map[string]topicMetadata),
+		logDir:            "/tmp/kraft-broker-logs", // Default
+		Schemas:           schema.NewRegistry(),
+		MinInSyncReplicas: DefaultMinInSyncReplicas,
 	}
 }
 

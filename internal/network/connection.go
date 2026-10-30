@@ -64,7 +64,14 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 
 		case *protocol.ProduceRequest:
 			// Handle Produce request (uses response header v1)
-			body = produce.BuildBody(req, metaMgr, localBrokerID)
+			var failed bool
+			body, failed = produce.Process(req, metaMgr, localBrokerID)
+			if req.Acks == 0 {
+				if failed {
+					return
+				}
+				continue
+			}
 			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
 			serializedResponse, err = response.Serialize()
 

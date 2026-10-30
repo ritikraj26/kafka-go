@@ -10,7 +10,6 @@ import (
 	"github.com/ritiraj/kafka-go/internal/broker"
 	"github.com/ritiraj/kafka-go/internal/logger"
 	"github.com/ritiraj/kafka-go/internal/metadata"
-	"github.com/ritiraj/kafka-go/internal/replication"
 )
 
 // Timing and threshold constants for the controller.
@@ -162,19 +161,21 @@ func (c *Controller) onBrokerDead(deadBrokerID int32) {
 		for i := range topic.Partitions {
 			p := &topic.Partitions[i]
 
-			// Remove dead broker from ISR
-			p.RunUnderLock(func() {
-				replication.ShrinkISR(p, deadBrokerID)
-			})
+			if err := p.SetReplicaOnline(deadBrokerID, false); err != nil {
+				logger.L.Error("controller: failed to mark replica offline", "topic", topicName, "partition", p.Index, "err", err)
+				continue
+			}
 
 			// If this broker was the leader, elect a new one
-			if p.LeaderID == deadBrokerID {
+			leader, _, _, _ := p.ReplicaPosition(deadBrokerID)
+			if leader == deadBrokerID {
 				if err := c.metaMgr.ElectLeader(topicName, p.Index); err != nil {
 					logger.L.Error("controller: leader election failed",
 						"topic", topicName, "partition", p.Index, "err", err)
 				} else {
+					leader, _, _, _ := p.ReplicaPosition(deadBrokerID)
 					logger.L.Info("controller: new leader elected",
-						"topic", topicName, "partition", p.Index, "newLeader", p.LeaderID)
+						"topic", topicName, "partition", p.Index, "newLeader", leader)
 				}
 			}
 		}
@@ -185,6 +186,17 @@ func (c *Controller) onBrokerDead(deadBrokerID int32) {
 // automatically start fetching and catching up. Once caught up, the ISRManager
 // will add it back to the ISR.
 func (c *Controller) onBrokerRecovered(brokerID int32) {
+	for _, name := range c.metaMgr.ListTopics() {
+		topic := c.metaMgr.GetTopic(name)
+		if topic == nil {
+			continue
+		}
+		for i := range topic.Partitions {
+			if err := topic.Partitions[i].SetReplicaOnline(brokerID, true); err != nil {
+				logger.L.Error("controller: failed to mark replica online", "topic", name, "partition", i, "err", err)
+			}
+		}
+	}
 	logger.L.Info("controller: broker back online, will rejoin ISR after catch-up",
 		"broker", brokerID)
 }

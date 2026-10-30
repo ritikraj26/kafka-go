@@ -66,6 +66,7 @@ func TestBuildBody_UnknownTopic(t *testing.T) {
 
 func TestBuildBody_ValidTopic(t *testing.T) {
 	metaMgr := testutil.NewMetadataManager(t)
+	metaMgr.MinInSyncReplicas = 1 // Explicit single-broker opt-in.
 	testutil.CreateTopic(t, metaMgr, "orders", 1)
 	metaMgr.Schemas.Register("orders", &schema.SimpleSchema{Fields: map[string]schema.FieldType{"value": schema.TypeString}})
 
@@ -200,8 +201,8 @@ func TestProduceRejectsInvalidBatches(t *testing.T) {
 }
 
 func TestProduceWaitsForEveryRecord(t *testing.T) {
-	m, p := produceManager(t)
-	p.ISRNodes = []int32{1, 2}
+	m, topic := replicatedProduceManager(t, 1)
+	p := &topic.Partitions[0]
 	p.UpdateReplicaState(2, 1, 0)
 	req := produceRequest(produceBatch(t, `{"value":"a"}`, `{"value":"b"}`, `{"value":"c"}`))
 	req.Acks = -1

@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"slices"
 	"time"
 
 	"github.com/ritiraj/kafka-go/internal/logger"
@@ -19,15 +20,18 @@ const defaultMaxLeoLag int64 = 10000
 // based on how recently it fetched and whether its LEO has caught up.
 // lagTimeMaxMs controls the maximum allowed lag time in milliseconds.
 // Caller must hold p's lock.
-func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) {
+func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) error {
 	if p.ReplicaLastSeen == nil || p.ReplicaLEO == nil {
-		return
+		return nil
 	}
 
 	nowMs := time.Now().UnixMilli()
 
 	var newISR []int32
 	for _, brokerID := range p.ReplicaNodes {
+		if !p.ReplicaAvailable(brokerID) {
+			continue
+		}
 		if brokerID == p.LeaderID {
 			// Leader is always in ISR
 			newISR = append(newISR, brokerID)
@@ -50,7 +54,7 @@ func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) {
 		// LEO check: replica must be within defaultMaxLeoLag messages of the leader.
 		// Prevents a fast-heartbeating but slow-replicating replica from staying in ISR.
 		replicaLEO, hasLEO := p.ReplicaLEO[brokerID]
-		if !hasLEO || (p.LogEndOffset-replicaLEO) > defaultMaxLeoLag {
+		if !hasLEO || replicaLEO > p.LogEndOffset || (p.LogEndOffset-replicaLEO) > defaultMaxLeoLag {
 			logger.L.Warn("shrinking ISR: replica LEO lag",
 				"broker", brokerID,
 				"replicaLEO", replicaLEO,
@@ -58,46 +62,53 @@ func UpdateISR(p *metadata.Partition, lagTimeMaxMs int64) {
 				"lag", p.LogEndOffset-replicaLEO)
 			continue
 		}
+		// Existing ISR members may lag within the configured thresholds.
+		// A removed replica must fully catch up before rejoining.
+		if !slices.Contains(p.ISRNodes, brokerID) && replicaLEO != p.LogEndOffset {
+			continue
+		}
 
 		// Both time and LEO checks passed — keep in ISR
 		newISR = append(newISR, brokerID)
 	}
 
-	if len(newISR) != len(p.ISRNodes) {
+	if !slices.Equal(newISR, p.ISRNodes) {
 		logger.L.Info("ISR updated", "partition", p.Index,
 			"old_isr", p.ISRNodes, "new_isr", newISR)
-		p.PartitionEpoch++
 	}
 
-	p.ISRNodes = newISR
+	return p.ReplaceISR(newISR)
 }
 
 // ShrinkISR removes a specific broker from the ISR.
 // Caller must hold p's lock.
-func ShrinkISR(p *metadata.Partition, brokerID int32) {
+func ShrinkISR(p *metadata.Partition, brokerID int32) error {
 	var newISR []int32
 	for _, id := range p.ISRNodes {
 		if id != brokerID {
 			newISR = append(newISR, id)
 		}
 	}
-	p.ISRNodes = newISR
+	return p.ReplaceISR(newISR)
 }
 
 // ExpandISR adds a broker back to the ISR if it has caught up.
 // Caller must hold p's lock.
-func ExpandISR(p *metadata.Partition, brokerID int32) {
+func ExpandISR(p *metadata.Partition, brokerID int32) error {
 	for _, id := range p.ISRNodes {
 		if id == brokerID {
-			return // already in ISR
+			return nil // already in ISR
 		}
 	}
 	replicaLEO, ok := p.ReplicaLEO[brokerID]
-	if !ok {
-		return
+	if !ok || !p.ReplicaAvailable(brokerID) {
+		return nil
 	}
-	if replicaLEO >= p.LogEndOffset {
-		p.ISRNodes = append(p.ISRNodes, brokerID)
+	if replicaLEO == p.LogEndOffset {
+		if err := p.ReplaceISR(append(slices.Clone(p.ISRNodes), brokerID)); err != nil {
+			return err
+		}
 		logger.L.Info("expanded ISR", "partition", p.Index, "broker", brokerID)
 	}
+	return nil
 }

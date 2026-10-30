@@ -59,7 +59,9 @@ func (im *ISRManager) checkAll() {
 		for i := range topic.Partitions {
 			p := &topic.Partitions[i]
 			p.RunUnderLock(func() {
-				UpdateISR(p, im.lagTimeMaxMs)
+				if err := UpdateISR(p, im.lagTimeMaxMs); err != nil {
+					logger.L.Error("failed to update ISR", "topic", topicName, "partition", p.Index, "err", err)
+				}
 			})
 		}
 	}

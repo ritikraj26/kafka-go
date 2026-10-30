@@ -16,6 +16,7 @@ import (
 
 func TestIntegration_ProduceRestartFetch(t *testing.T) {
 	m := testutil.NewMetadataManager(t)
+	m.MinInSyncReplicas = 1 // Explicit single-broker opt-in.
 	topic := testutil.CreateTopic(t, m, "events", 1)
 	id, dir := topic.ID, m.GetLogDir()
 	m.Schemas.Register("events", &schema.SimpleSchema{Fields: map[string]schema.FieldType{"value": schema.TypeString}})

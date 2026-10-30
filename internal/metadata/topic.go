@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,13 +40,14 @@ type Partition struct {
 	BrokerLogDirs   map[int32]string // Per-broker log directories (brokerID -> dir)
 
 	// Offset tracking
-	NextOffset    int64 // Next record offset to assign
-	HighWatermark int64 // Exclusive offset replicated to all ISR members
-	LogEndOffset  int64 // = NextOffset (alias for replication clarity)
-	mu            sync.Mutex
-	hwCond        *sync.Cond // signalled when HighWatermark advances
-	appendErr     error      // Fence leader writes after an ambiguous disk failure
-	replicaErrors map[int32]error
+	NextOffset      int64 // Next record offset to assign
+	HighWatermark   int64 // Exclusive offset replicated to all ISR members
+	LogEndOffset    int64 // = NextOffset (alias for replication clarity)
+	mu              sync.Mutex
+	hwCond          *sync.Cond // signalled when HighWatermark advances
+	appendErr       error      // Fence leader writes after an ambiguous disk failure
+	replicaErrors   map[int32]error
+	pendingProduces map[*pendingProduce]struct{}
 
 	// Per-replica LEO for replication (broker_id -> LEO)
 	ReplicaLEO      map[int32]int64
@@ -161,10 +163,15 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	return p.appendRecords(records, batches, logDir)
+}
+
+// appendRecords requires p.mu and validated batches backed by a private buffer.
+func (p *Partition) appendRecords(records []byte, batches []storage.RecordBatch, logDir string) (int64, error) {
 	if p.appendErr != nil {
 		return -1, fmt.Errorf("partition unavailable after append failure: %w", p.appendErr)
 	}
-	baseOffset = p.NextOffset
+	baseOffset := p.NextOffset
 	nextOffset := baseOffset
 	for i := range batches {
 		batch := &batches[i]
@@ -182,12 +189,14 @@ func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int
 	writtenFile, filePosBefore, writeErr := writeRecords(logDir, records, baseOffset, nextOffset-1)
 	if writeErr != nil {
 		p.appendErr = writeErr
+		p.signalChange()
 		return -1, writeErr
 	}
 
 	segmentBase, err := strconv.ParseInt(strings.TrimSuffix(filepath.Base(writtenFile), ".log"), 10, 64)
 	if err != nil {
 		p.appendErr = err
+		p.signalChange()
 		return -1, err
 	}
 	indexPath := strings.TrimSuffix(writtenFile, ".log") + ".index"
@@ -300,13 +309,13 @@ func (p *Partition) appendReplicaRecords(records []byte, replicaLogDir string, r
 // AdvanceHighWatermark recalculates HW as min(LEO) across all ISR replicas.
 // Caller must hold p.mu. Broadcasts hwCond if HW advances.
 func (p *Partition) AdvanceHighWatermark() {
-	if len(p.ISRNodes) == 0 {
+	if !slices.Contains(p.ISRNodes, p.LeaderID) || !p.ReplicaAvailable(p.LeaderID) {
 		return
 	}
 	if p.ReplicaLEO == nil {
 		return
 	}
-	minLEO := int64(math.MaxInt64)
+	minLEO := p.LogEndOffset
 	found := false
 	for _, id := range p.ISRNodes {
 		leo, ok := p.ReplicaLEO[id]

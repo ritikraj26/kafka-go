@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -47,6 +49,11 @@ func main() {
 	brokerID := int32(envInt("BROKER_ID", 1))
 	numBrokers := envInt("NUM_BROKERS", 3)
 	replicationFactor := envInt("REPLICATION_FACTOR", 3)
+	minISR, err := minInSyncReplicasFromEnv()
+	if err != nil {
+		logger.L.Error("invalid minimum ISR configuration", "err", err)
+		os.Exit(1)
+	}
 
 	// Create broker registry with simulated brokers
 	reg := broker.NewRegistry(brokerID)
@@ -62,6 +69,7 @@ func main() {
 	metaMgr := metadata.NewManager()
 	metaMgr.Brokers = reg
 	metaMgr.ReplicationFactor = replicationFactor
+	metaMgr.MinInSyncReplicas = minISR
 
 	// Create consumer group coordinator
 	coord := coordinator.NewCoordinator()
@@ -156,4 +164,16 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func minInSyncReplicasFromEnv() (int, error) {
+	value, present := os.LookupEnv("MIN_INSYNC_REPLICAS")
+	if !present {
+		return metadata.DefaultMinInSyncReplicas, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 || n > math.MaxInt32 {
+		return 0, fmt.Errorf("MIN_INSYNC_REPLICAS must be an integer between 1 and %d, got %q", math.MaxInt32, value)
+	}
+	return n, nil
 }

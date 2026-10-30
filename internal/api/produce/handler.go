@@ -13,6 +13,27 @@ import (
 
 // BuildBody builds a Produce v11 response.
 func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32) []byte {
+	body, _ := Process(req, metaMgr, localBrokerID)
+	return body
+}
+
+// Process also reports whether any partition failed, so acks=0 callers can
+// close the connection on error without sending an unsolicited response.
+func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32) ([]byte, bool) {
+	requestError := protocol.ErrNone
+	if req.Acks != -1 && req.Acks != 0 && req.Acks != 1 {
+		requestError = protocol.ErrInvalidRequiredAcks
+	} else if req.TimeoutMs < 0 {
+		requestError = protocol.ErrInvalidRequest
+	}
+	if requestError != protocol.ErrNone {
+		logger.L.Warn("rejecting invalid produce settings", "acks", req.Acks, "timeout_ms", req.TimeoutMs, "error_code", requestError)
+	}
+	options := metadata.ProduceOptions{
+		BrokerID: localBrokerID, Acks: req.Acks, MinISR: metaMgr.MinInSyncReplicas,
+		Deadline: time.Now().Add(time.Duration(req.TimeoutMs) * time.Millisecond),
+	}
+	failed := requestError != protocol.ErrNone
 	encoder := protocol.NewEncoder()
 	encoder.WriteUnsignedVarint(uint64(len(req.Topics) + 1))
 	for _, reqTopic := range req.Topics {
@@ -23,22 +44,24 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBro
 			encoder.WriteInt32(reqPartition.Index)
 			errorCode := protocol.ErrUnknownTopicOrPartition
 			baseOffset, logAppendTime, logStartOffset := int64(-1), int64(-1), int64(-1)
-			if topic != nil {
+			if requestError != protocol.ErrNone {
+				errorCode = requestError
+			} else if topic != nil {
 				for i := range topic.Partitions {
 					p := &topic.Partitions[i]
 					if p.Index != reqPartition.Index {
 						continue
 					}
-					if p.LeaderID != localBrokerID {
-						errorCode = protocol.ErrNotLeaderOrFollower
-					} else {
-						baseOffset, logAppendTime, errorCode = appendPartition(req, reqPartition.Records, reqTopic.Name, metaMgr, p, localBrokerID)
-						if baseOffset >= 0 {
-							logStartOffset = 0
-						}
+					baseOffset, logAppendTime, errorCode = appendPartition(reqPartition.Records, reqTopic.Name, metaMgr, p, options)
+					if baseOffset >= 0 {
+						logStartOffset = 0
 					}
 					break
 				}
+			}
+			if errorCode != protocol.ErrNone {
+				failed = true
+				logger.L.Warn("produce partition failed", "topic", reqTopic.Name, "partition", reqPartition.Index, "acks", req.Acks, "error_code", errorCode)
 			}
 			encoder.WriteInt16(errorCode)
 			encoder.WriteInt64(baseOffset)
@@ -52,28 +75,30 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBro
 	}
 	encoder.WriteInt32(0) // throttle_time_ms
 	encoder.WriteTagBuffer()
-	return encoder.Bytes()
+	return encoder.Bytes(), failed
 }
 
-func appendPartition(req *protocol.ProduceRequest, records []byte, topic string, metaMgr *metadata.Manager, p *metadata.Partition, brokerID int32) (int64, int64, int16) {
+func appendPartition(records []byte, topic string, metaMgr *metadata.Manager, p *metadata.Partition, options metadata.ProduceOptions) (int64, int64, int16) {
+	if err := p.CheckProduce(options); err != nil {
+		return -1, -1, recordErrorCode(err)
+	}
 	if len(records) == 0 {
-		return p.GetLogEndOffset(), -1, protocol.ErrNone
+		offset, err := p.ProduceRecords(nil, options)
+		if err != nil {
+			return -1, -1, recordErrorCode(err)
+		}
+		return offset, -1, protocol.ErrNone
 	}
 	batches, err := storage.ParseRecordBatches(records)
 	if err != nil {
 		logger.L.Warn("rejecting invalid record set", "topic", topic, "partition", p.Index, "err", err)
 		return -1, -1, recordErrorCode(err)
 	}
-	var recordCount int64
-	for _, batch := range batches {
-		recordCount += int64(batch.RecordsCount)
-	}
-
 	failed, allFailed := validateRecords(batches, topic, metaMgr)
 	if len(failed) > 0 {
-		if err := routeToDLQ(topic, failed, metaMgr); err != nil {
+		if err := routeToDLQ(topic, failed, metaMgr, options); err != nil {
 			logger.L.Error("failed to write to DLQ", "topic", topic, "err", err)
-			return -1, -1, protocol.ErrUnknownServerError
+			return -1, -1, recordErrorCode(err)
 		}
 	}
 	if allFailed {
@@ -83,20 +108,27 @@ func appendPartition(req *protocol.ProduceRequest, records []byte, topic string,
 		logger.L.Warn("partial schema violation: writing full batch; failed records also in DLQ", "topic", topic, "failed", len(failed))
 	}
 
-	offset, err := p.AppendRecords(records, p.LogDirForBroker(brokerID))
+	offset, err := p.ProduceRecords(records, options)
 	if err != nil {
 		logger.L.Error("failed to append records", "topic", topic, "partition", p.Index, "err", err)
-		return -1, -1, recordErrorCode(err)
+		return offset, -1, recordErrorCode(err)
 	}
 	appendTime := time.Now().UnixMilli()
-	if req.Acks == -1 && !p.WaitForHighWatermark(offset+recordCount, time.Duration(req.TimeoutMs)*time.Millisecond) {
-		return offset, appendTime, protocol.ErrRequestTimedOut
-	}
 	return offset, appendTime, protocol.ErrNone
 }
 
 func recordErrorCode(err error) int16 {
 	switch {
+	case errors.Is(err, metadata.ErrNotLeader):
+		return protocol.ErrNotLeaderOrFollower
+	case errors.Is(err, metadata.ErrInvalidRequiredAcks):
+		return protocol.ErrInvalidRequiredAcks
+	case errors.Is(err, metadata.ErrNotEnoughReplicas):
+		return protocol.ErrNotEnoughReplicas
+	case errors.Is(err, metadata.ErrNotEnoughReplicasAfterAppend):
+		return protocol.ErrNotEnoughReplicasAfterAppend
+	case errors.Is(err, metadata.ErrProduceTimeout):
+		return protocol.ErrRequestTimedOut
 	case errors.Is(err, storage.ErrCorruptRecord):
 		return protocol.ErrCorruptMessage
 	case errors.Is(err, storage.ErrUnsupportedCompression):
@@ -131,7 +163,7 @@ func validateRecords(batches []storage.RecordBatch, topic string, metaMgr *metad
 	return failed, len(failed) == len(values)
 }
 
-func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager) error {
+func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager, options metadata.ProduceOptions) error {
 	dlq, err := metaMgr.GetOrCreateDLQTopic(sourceTopic)
 	if err != nil {
 		return err
@@ -148,6 +180,8 @@ func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager) 
 		return err
 	}
 	p := &dlq.Partitions[0]
-	_, err = p.AppendRecords(batch, p.LogDirForBroker(p.LeaderID))
+	leader, _, _, _ := p.ReplicaPosition(0)
+	options.BrokerID = leader
+	_, err = p.ProduceRecords(batch, options)
 	return err
 }

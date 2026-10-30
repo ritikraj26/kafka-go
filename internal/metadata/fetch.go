@@ -42,7 +42,8 @@ func (p *Partition) FetchRecords(options FetchOptions) (FetchResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	result := FetchResult{HighWatermark: p.HighWatermark}
-	if options.BrokerID != p.LeaderID ||
+	if options.BrokerID != p.LeaderID || !p.ReplicaAvailable(options.BrokerID) ||
+		(options.ReplicaID >= 0 && !p.ReplicaAvailable(options.ReplicaID)) ||
 		(options.ReplicaID >= 0 && (options.ReplicaID == p.LeaderID || !slices.Contains(p.ReplicaNodes, options.ReplicaID))) {
 		return result, ErrNotLeader
 	}
@@ -244,7 +245,7 @@ func (p *Partition) ReplicaPosition(id int32) (leader int32, epoch int32, offset
 func (p *Partition) AppendFetchedRecords(id, leader, epoch int32, offset int64, records []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.LeaderID != leader || p.LeaderEpoch != epoch || id == leader || !slices.Contains(p.ReplicaNodes, id) {
+	if p.LeaderID != leader || p.LeaderEpoch != epoch || id == leader || !slices.Contains(p.ReplicaNodes, id) || !p.ReplicaAvailable(id) {
 		return ErrNotLeader
 	}
 	if p.replicaErrors[id] != nil {
@@ -259,6 +260,12 @@ func (p *Partition) AppendFetchedRecords(id, leader, epoch int32, offset int64, 
 			p.replicaErrors = make(map[int32]error)
 		}
 		p.replicaErrors[id] = err
+		nodes := slices.DeleteFunc(slices.Clone(p.ISRNodes), func(node int32) bool { return node == id })
+		if isrErr := p.ReplaceISR(nodes); isrErr != nil {
+			p.appendErr = errors.Join(err, isrErr)
+			p.signalChange()
+			return p.appendErr
+		}
 		return err
 	}
 	if p.ReplicaLEO == nil {
