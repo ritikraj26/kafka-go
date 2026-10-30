@@ -1,6 +1,8 @@
 # kafka-go — Kafka Broker from Scratch in Go
 
-A Kafka-compatible broker implemented from scratch in Go, supporting the binary wire protocol, on-disk persistence with sparse indexing, and AI-powered schema validation with dead-letter queue routing.
+A broker implemented from scratch in Go with a tested Kafka protocol subset,
+on-disk persistence with sparse indexing, and experimental schema validation
+with dead-letter queue routing. It is not a production-ready Kafka replacement.
 
 
 ## Supported APIs
@@ -8,10 +10,10 @@ A Kafka-compatible broker implemented from scratch in Go, supporting the binary 
 | API | Key | Versions | Description |
 |-----|-----|----------|-------------|
 | **ApiVersions** | 18 | 0–4 | Broker capability discovery & version negotiation |
-| **Produce** | 0 | 0–11 | Write record batches (supports acks=0/1/-1) |
+| **Produce** | 0 | 11 | Uncompressed, nontransactional record batches; acks=0/1/-1 |
 | **Fetch** | 1 | 16; legacy 0 | Complete-batch reads within visibility and byte limits; only v16 is advertised |
 | **ListOffsets** | 2 | 1 | Earliest/latest offset lookup per partition |
-| **Metadata** | 3 | 0–12 | Broker & topic metadata (UUID, partitions, ISR) |
+| **Metadata** | 3 | 12 | Broker & topic metadata by name or UUID, including missing-topic errors |
 | **OffsetCommit** | 8 | 2 | Commit consumer offsets to coordinator |
 | **OffsetFetch** | 9 | 1 | Fetch committed offsets for a consumer group |
 | **FindCoordinator** | 10 | 0 | Discover the group coordinator broker |
@@ -19,7 +21,7 @@ A Kafka-compatible broker implemented from scratch in Go, supporting the binary 
 | **Heartbeat** | 12 | 0 | Keep consumer group membership alive |
 | **LeaveGroup** | 13 | 0 | Gracefully leave a consumer group |
 | **SyncGroup** | 14 | 0 | Distribute partition assignments after rebalance |
-| **DescribeTopicPartitions** | 75 | 0 | Detailed partition metadata per topic |
+| **DescribeTopicPartitions** | 75 | 0 | Detailed partition metadata with partition limits and cursors |
 
 ## Architecture
 
@@ -31,6 +33,7 @@ internal/
 │   └── connection.go        Per-connection request loop & 13-API dispatch
 ├── protocol/
 │   ├── request.go           Wire-format request header (with maxRequestSize guard)
+│   ├── versions.go          Supported versions and shared header/body decoding
 │   ├── response.go          Wire-format response framing (v0 / v1 headers)
 │   ├── decoder.go           BigEndian binary reader (varints, compact strings, UUIDs)
 │   ├── encoder.go           BigEndian binary writer (v0 non-flexible + compact formats)
@@ -77,7 +80,7 @@ internal/
 
 ## Features
 
-- **Binary wire protocol** — Full Kafka protocol serialization: varints, compact arrays, compact strings, UUIDs, TAG_BUFFERs
+- **Binary wire protocol** — Version-specific layouts for the table above, shared nullable client-ID/header handling, bounded decoding, and unknown tagged-field skipping
 - **On-disk persistence** — Records written to `.log` files per partition; sparse `.index` files with binary search for offset lookup
 - **Checked record batches** — Accepts uncompressed, nontransactional magic-v2 batches; validates CRC32C, record framing, counts, offset deltas, and headers before any append. Compressed and unsupported batch formats return explicit Kafka errors.
 - **Record-based offsets** — Assigns base offsets and leader epochs without modifying producer buffers; advances offsets by the number of records across every batch in a request. Index offsets are relative to their segment.
@@ -98,6 +101,58 @@ internal/
 - **AI schema inference** — First message to a topic triggers schema inference via local Ollama (falls back to JSON type detection)
 - **Dead-letter queue** — Rejected values are encoded as checksummed Kafka batches in `{topic}.dlq`; a DLQ write failure is reported to the producer. Successful routing remains transparent to the producer.
 - **Structured logging** — `slog.Logger` with configurable log level via `LOG_LEVEL` env var
+
+## Independent-client compatibility
+
+The test suite uses **franz-go v1.22.2** and **kmsg v1.15.0** as test-only
+dependencies; they are not used to implement the broker. The high-level client
+negotiates versions through ApiVersions without overriding the broker's
+advertisement. Tests verify:
+
+- Produce, consume, and exact preservation of keys, values, timestamps, and offsets.
+- Classic consumer-group discovery, joining, assignment, heartbeats, leaving,
+  offset commit/fetch, and resuming from the committed position with a fresh client.
+- Independent encoding/decoding of ApiVersions v0-v4 and the v0 error fallback
+  for an unsupported newer negotiation version.
+- Metadata by name/UUID, explicit errors for unknown topics, and the difference
+  between a null topic list (all topics) and an empty list (no topics).
+- DescribeTopicPartitions pagination, nullable/long client IDs, unknown tags,
+  truncated requests, and malformed collection lengths.
+
+The tested client configuration disables unsupported features:
+
+```go
+client, err := kgo.NewClient(
+    kgo.SeedBrokers("localhost:9092"),
+    kgo.DisableIdempotentWrite(),
+    kgo.ProducerBatchCompression(kgo.NoCompression()),
+    kgo.DisableFetchSessions(),
+    kgo.ConsumerGroup("example-group"),
+    kgo.ConsumeTopics("events"),
+    kgo.Balancers(kgo.RangeBalancer()),
+    kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+)
+if err != nil {
+    // Handle configuration failure before using client.
+    return err
+}
+defer client.Close()
+```
+
+Create topics before using the client; CreateTopics and automatic topic creation
+are not implemented. Tests configure one broker with an explicit minimum ISR of
+1; the normal runtime default remains 2. Interoperability testing is currently
+for one pinned Go client, not a Java/librdkafka/Sarama compatibility certification
+or a multi-node fault-tolerance test.
+
+Only advertised versions are accepted, except the documented internal Fetch v0.
+Malformed frames and unsupported non-negotiation API versions are logged and
+close the connection rather than being decoded as another version. ApiVersions
+uses version-correct arrays and always the non-flexible response header.
+Produce responses preserve CreateTime (`log_append_time_ms=-1`), and non-null
+arrays are encoded as empty rather than null. Explicit transactional IDs are
+rejected. ListOffsets supports earliest/latest sentinels only; timestamp searches
+return an explicit unsupported-format error instead of silently returning latest.
 
 ## Running
 
@@ -301,13 +356,17 @@ go test ./internal/protocol -run='^$' -fuzz=FuzzFetchRequests -fuzztime=30s
 
 # Acknowledgement, ISR-transition, configuration, and wire-level failure tests
 go test -race ./internal/api/produce ./internal/metadata ./internal/replication ./internal/network ./app
+
+# Independent-client interoperability (no external Kafka or Ollama needed)
+go test -race ./internal/network -run 'TestFranzGo|TestIndependentCodec' -v
+go test ./internal/protocol -run='^$' -fuzz=FuzzRequestDispatch -fuzztime=30s
 ```
 
 ### Test Coverage
 
 | Package | Tests |
 |---------|-------|
-| `protocol` | Encoder/decoder roundtrip, varint encoding, compact strings, UUID, all 13 request parsers, `CurrentLeaderEpoch` field in Fetch v16, v0 epoch defaults to -1 |
+| `protocol` | Shared nullable/long headers, independent-codec requests, truncation/trailing-data checks, version gating, frame boundaries, decoder bounds, dispatch fuzzing |
 | `schema` | Validation (missing field, wrong type, not JSON), inference from JSON, integer↔number coercion |
 | `storage` | CRC32C and record validation, independent wire fixture, multiple batches, null values, headers, malformed input, bounded recovery reads, parser fuzzing |
 | `metadata` | Record offsets/indexes, corruption preservation, persistent topic/leader recovery across processes, legacy import, divergent/missing replicas, malformed catalogs, atomic DLQ creation, persistence-failure fencing |
@@ -317,12 +376,13 @@ go test -race ./internal/api/produce ./internal/metadata ./internal/replication 
 | `api/produce` | Invalid inputs without side effects, minimum ISR, shared request deadline, whole-append waits, DLQ acknowledgement and persistence-error propagation |
 | `app` | Startup rejection of corrupt storage and invalid minimum ISR; explicit single-copy configuration |
 | `api/fetch` | Exact record/offset assertions, HW boundaries, first-batch exception, partition/global byte limits, segment/index fallbacks, offset/leader errors, long polls, concurrent append/fetch |
-| `network` | TCP produce/restart/fetch, Fetch v16 visibility, acks=0 suppression and failure closure, ISR-loss error codes, acks=-1 with real follower disk persistence |
+| `network` | TCP produce/restart/fetch, acknowledgement failures, real follower persistence, franz-go producer/group consumer/commit/resume, independent discovery/metadata/group/pagination codecs |
 
 ## Limitations & Future Work
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
-- **Remaining correctness work** — Persisted commit/ISR state, failover/divergence recovery, other API-version compatibility, and concurrency/lifecycle issues outside the locked produce/fetch paths are still outstanding; the local topic catalog is not distributed consensus
+- **Remaining correctness work** — Persisted commit/ISR state, offset-commit I/O error handling, failover/divergence recovery, and remaining concurrency/lifecycle issues are still outstanding; the local topic catalog is not distributed consensus
+- **Compatibility scope** — Only the listed versions and configured client subset are supported. More API versions, independent client implementations, timestamp offset lookup, static/cooperative groups, and administrative APIs require additional work.
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported
 - **Partial DLQ filtering** — When some (not all) records in a batch fail schema validation, the full batch still writes to the main topic (individual record filtering from binary RecordBatch is not supported)

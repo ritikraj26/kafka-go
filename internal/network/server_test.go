@@ -10,6 +10,7 @@ import (
 
 	"github.com/ritiraj/kafka-go/internal/coordinator"
 	"github.com/ritiraj/kafka-go/internal/metadata"
+	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 // TestIntegration_ApiVersionsRoundtrip starts the broker on a random port,
@@ -46,11 +47,13 @@ func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 
 	// Build an ApiVersions v4 request:
 	//   message_size (4) + api_key (2) + api_version (2) + correlation_id (4) + body
-	// Body: client_id compact string "test" (varint 5, then 4 bytes) + TAG_BUFFER (0x00)
-	var body []byte
-	body = append(body, 0x05)      // compact string length: 4+1 = 5
-	body = append(body, "test"...) // client_id
-	body = append(body, 0x00)      // TAG_BUFFER
+	e := protocol.NewEncoder()
+	e.WriteString("test")
+	e.WriteTagBuffer()
+	e.WriteCompactString("test-client")
+	e.WriteCompactString("1.0")
+	e.WriteTagBuffer()
+	body := e.Bytes()
 
 	// Header: api_key=18, api_version=4, correlation_id=99
 	headerSize := 2 + 2 + 4 // api_key + api_version + correlation_id

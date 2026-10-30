@@ -12,8 +12,10 @@ type Request interface {
 
 // ApiVersionsRequest request (api_key=18)
 type ApiVersionsRequest struct {
-	Header   *RequestHeader
-	ClientID string
+	Header                *RequestHeader
+	ClientID              string
+	ClientSoftwareName    string
+	ClientSoftwareVersion string
 }
 
 func (r *ApiVersionsRequest) GetHeader() *RequestHeader {
@@ -93,6 +95,12 @@ func (r *FetchRequest) GetAPIKey() int16 {
 type MetadataRequest struct {
 	Header     *RequestHeader
 	TopicNames []string // nil = all topics
+	Topics     []MetadataTopic
+}
+
+type MetadataTopic struct {
+	ID   [16]byte
+	Name *string
 }
 
 func (r *MetadataRequest) GetHeader() *RequestHeader { return r.Header }
@@ -100,8 +108,15 @@ func (r *MetadataRequest) GetAPIKey() int16          { return APIKeyMetadata }
 
 // DescribeTopicPartitionsRequest request (api_key=75) - PLACEHOLDER
 type DescribeTopicPartitionsRequest struct {
-	Header     *RequestHeader
-	TopicNames []string
+	Header                 *RequestHeader
+	TopicNames             []string
+	ResponsePartitionLimit int32
+	Cursor                 *TopicCursor
+}
+
+type TopicCursor struct {
+	TopicName      string
+	PartitionIndex int32
 }
 
 func (r *DescribeTopicPartitionsRequest) GetHeader() *RequestHeader {
@@ -284,53 +299,35 @@ func ParseRequest(header *RequestHeader) (Request, error) {
 
 // parse an ApiVersions request
 func ParseApiVersionsRequest(header *RequestHeader) (*ApiVersionsRequest, error) {
-	decoder := NewDecoder(header.GetBody())
-
-	// ApiVersions request body contains:
-	// - client_id (COMPACT_STRING for v3+)
-	// - TAG_BUFFER (1 byte)
-	clientID, err := decoder.ReadCompactString()
+	decoder, err := requestDecoder(header, APIKeyApiVersions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read client_id: %w", err)
+		return nil, err
 	}
-
-	return &ApiVersionsRequest{
-		Header:   header,
-		ClientID: clientID,
-	}, nil
+	req := &ApiVersionsRequest{Header: header}
+	if header.clientID != nil {
+		req.ClientID = *header.clientID
+	}
+	if header.GetAPIVersion() >= 3 {
+		req.ClientSoftwareName, err = decoder.ReadCompactString()
+		if err != nil {
+			return nil, err
+		}
+		req.ClientSoftwareVersion, err = decoder.ReadCompactString()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := finishRequest(decoder, header.GetAPIVersion() >= 3); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 // ParseProduceRequest parses a Produce request (v11)
 func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
-	decoder := NewDecoder(header.GetBody())
-
-	// Produce v11 uses flexible request format (KIP-482)
-	// First, parse the flexible request header fields
-
-	// 1. Read cursor field (nullable byte)
-	_, err := decoder.ReadByte()
+	decoder, err := requestDecoder(header, APIKeyProduce)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read cursor: %w", err)
-	}
-
-	// 2. Read client software identifier (length-prefixed string)
-	lengthByte, err := decoder.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read client software length: %w", err)
-	}
-
-	// Skip client software name bytes
-	for i := 0; i < int(lengthByte); i++ {
-		_, err = decoder.ReadByte()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read client software byte %d: %w", i, err)
-		}
-	}
-
-	// 3. Read TAG_BUFFER for flexible request header
-	_, err = decoder.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read header TAG_BUFFER: %w", err)
+		return nil, err
 	}
 
 	// Now read the actual Produce v11 request fields:
@@ -363,6 +360,9 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read topics array length: %w", err)
 	}
+	if err := checkCompactArray(topicsLen, decoder); err != nil {
+		return nil, err
+	}
 
 	var topics []ProduceTopic
 	if topicsLen > 0 {
@@ -378,6 +378,9 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 			partitionsLen, err := decoder.ReadUnsignedVarint()
 			if err != nil {
 				return nil, fmt.Errorf("failed to read partitions array length: %w", err)
+			}
+			if err := checkCompactArray(partitionsLen, decoder); err != nil {
+				return nil, err
 			}
 
 			var partitions []ProducePartition
@@ -402,7 +405,7 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 					})
 
 					// Skip TAG_BUFFER for partition
-					_, err = decoder.ReadByte()
+					err = decoder.ReadTaggedFields(nil)
 					if err != nil {
 						return nil, fmt.Errorf("failed to read partition TAG_BUFFER: %w", err)
 					}
@@ -415,13 +418,16 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 			})
 
 			// Skip TAG_BUFFER for topic
-			_, err = decoder.ReadByte()
+			err = decoder.ReadTaggedFields(nil)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read topic TAG_BUFFER: %w", err)
 			}
 		}
 	}
 
+	if err := finishRequest(decoder, true); err != nil {
+		return nil, err
+	}
 	return &ProduceRequest{
 		Header:          header,
 		TransactionalID: transactionalID,
@@ -438,12 +444,9 @@ func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
 	if header.GetAPIVersion() != 0 {
 		return nil, fmt.Errorf("unsupported legacy Fetch version %d", header.GetAPIVersion())
 	}
-	decoder := NewDecoder(header.GetBody())
-
-	// Skip client_id (STRING) in the v0 request header
-	_, err := decoder.ReadString()
+	decoder, err := requestDecoder(header, APIKeyFetch)
 	if err != nil {
-		return nil, fmt.Errorf("v0 fetch: failed to read client_id: %w", err)
+		return nil, err
 	}
 
 	replicaID, err := decoder.ReadInt32()
@@ -531,14 +534,9 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	if header.GetAPIVersion() != 16 {
 		return nil, fmt.Errorf("unsupported Fetch version %d", header.GetAPIVersion())
 	}
-	decoder := NewDecoder(header.GetBody())
-
-	// Even flexible request headers use an INT16-length nullable client ID.
-	if _, err := decoder.ReadString(); err != nil {
-		return nil, fmt.Errorf("fetch client ID: %w", err)
-	}
-	if err := decoder.ReadTaggedFields(nil); err != nil {
-		return nil, fmt.Errorf("fetch header tags: %w", err)
+	decoder, err := requestDecoder(header, APIKeyFetch)
+	if err != nil {
+		return nil, err
 	}
 
 	// Now parse the actual Fetch v16 request fields
@@ -584,6 +582,9 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read topics array length: %w", err)
 	}
+	if err := checkCompactArray(topicsLen, decoder); err != nil {
+		return nil, err
+	}
 
 	var topics []FetchTopic
 	if topicsLen > 0 {
@@ -603,6 +604,9 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 			partitionsLen, err := decoder.ReadUnsignedVarint()
 			if err != nil {
 				return nil, fmt.Errorf("failed to read partitions array length: %w", err)
+			}
+			if err := checkCompactArray(partitionsLen, decoder); err != nil {
+				return nil, err
 			}
 
 			var partitions []FetchPartition
@@ -684,6 +688,9 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read forgotten_topics_data length: %w", err)
 	}
+	if err := checkCompactArray(forgottenLen, decoder); err != nil {
+		return nil, err
+	}
 	// If length > 0, we need to parse the forgotten topics
 	if forgottenLen > 1 { // Remember: compact array, so 1 means 0 elements
 		actualLen := forgottenLen - 1
@@ -699,6 +706,9 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 			partLen, err := decoder.ReadUnsignedVarint()
 			if err != nil {
 				return nil, fmt.Errorf("failed to read forgotten partitions length: %w", err)
+			}
+			if err := checkCompactArray(partLen, decoder); err != nil {
+				return nil, err
 			}
 			if partLen > 1 {
 				actualPartLen := partLen - 1
@@ -766,125 +776,119 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 
 // ParseDescribeTopicPartitionsRequest parses a DescribeTopicPartitions request
 func ParseDescribeTopicPartitionsRequest(header *RequestHeader) (*DescribeTopicPartitionsRequest, error) {
-	decoder := NewDecoder(header.GetBody())
-
-	// DescribeTopicPartitions v0 uses flexible request format (KIP-482).
-	// The body includes flexible request header fields before the API-specific fields.
-
-	// 1. Read cursor field - nullable byte (0x00 = null/no cursor)
-	cursorByte, err := decoder.ReadByte()
+	d, err := requestDecoder(header, APIKeyDescribeTopicPartitions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read cursor: %w", err)
+		return nil, err
 	}
-	_ = cursorByte // Not used for this stage
-
-	// 2. Read client software identifier - simple length-prefixed string
-	// Note: This uses plain length encoding (not COMPACT_STRING +1 encoding)
-	// Format: [length_byte][string_bytes...]
-	lengthByte, err := decoder.ReadByte()
+	count, err := d.ReadUnsignedVarint()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read client software length: %w", err)
+		return nil, err
 	}
-
-	// Read the client software name bytes
-	clientBytes := make([]byte, lengthByte)
-	for i := 0; i < int(lengthByte); i++ {
-		b, err := decoder.ReadByte()
+	if count == 0 || count-1 > uint64(d.Remaining()) {
+		return nil, fmt.Errorf("invalid describe-topics array")
+	}
+	req := &DescribeTopicPartitionsRequest{Header: header}
+	for i := uint64(1); i < count; i++ {
+		name, err := d.ReadCompactString()
 		if err != nil {
-			return nil, fmt.Errorf("failed to read client software byte %d: %w", i, err)
+			return nil, err
 		}
-		clientBytes[i] = b
-	}
-	_ = clientBytes // Not used for this stage
-
-	// 3. Read TAG_BUFFER for flexible request header
-	tagBuffer, err := decoder.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read header TAG_BUFFER: %w", err)
-	}
-	_ = tagBuffer // Should be 0x00 (empty)
-
-	// Now read the actual DescribeTopicPartitions v0 request fields:
-	// - topics (COMPACT_ARRAY of topic entries)
-	// - response_partition_limit (INT32) - comes after topics
-	// - cursor (nullable complex type) - comes after limit
-	// - TAG_BUFFER for request body
-
-	// Read topics array length (compact array: length+1)
-	arrayLen, err := decoder.ReadUnsignedVarint()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read topics array length: %w", err)
-	}
-
-	var topicNames []string
-	if arrayLen > 0 {
-		actualLen := arrayLen - 1 // compact array encoding
-		for i := uint64(0); i < actualLen; i++ {
-			// Read topic_name (COMPACT_STRING)
-			topicName, err := decoder.ReadCompactString()
-			if err != nil {
-				return nil, fmt.Errorf("failed to read topic name: %w", err)
-			}
-			topicNames = append(topicNames, topicName)
-
-			// Skip TAG_BUFFER for each topic entry
-			_, err = decoder.ReadByte()
-			if err != nil {
-				return nil, fmt.Errorf("failed to read topic TAG_BUFFER: %w", err)
-			}
+		req.TopicNames = append(req.TopicNames, name)
+		if err := d.ReadTaggedFields(nil); err != nil {
+			return nil, err
 		}
 	}
-
-	return &DescribeTopicPartitionsRequest{
-		Header:     header,
-		TopicNames: topicNames,
-	}, nil
+	req.ResponsePartitionLimit, err = d.ReadInt32()
+	if err != nil {
+		return nil, err
+	}
+	if req.ResponsePartitionLimit <= 0 {
+		return nil, fmt.Errorf("response partition limit must be positive")
+	}
+	present, err := d.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if present != 0xff {
+		if present != 1 {
+			return nil, fmt.Errorf("invalid cursor presence marker")
+		}
+		name, err := d.ReadCompactString()
+		if err != nil {
+			return nil, err
+		}
+		index, err := d.ReadInt32()
+		if err != nil {
+			return nil, err
+		}
+		if index < 0 {
+			return nil, fmt.Errorf("negative cursor partition")
+		}
+		if err := d.ReadTaggedFields(nil); err != nil {
+			return nil, err
+		}
+		req.Cursor = &TopicCursor{TopicName: name, PartitionIndex: index}
+	}
+	if err := finishRequest(d, true); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
-// ParseMetadataRequest parses a Metadata request (v1–v12).
-// The topic list may be empty (nil) meaning the client wants all topics.
+// ParseMetadataRequest parses Metadata v12, preserving null (all) versus empty.
 func ParseMetadataRequest(header *RequestHeader) (*MetadataRequest, error) {
-	decoder := NewDecoder(header.GetBody())
-
-	// Flexible request header fields (same pattern as other v9+ APIs)
-	// 1. cursor byte
-	if _, err := decoder.ReadByte(); err != nil {
-		return &MetadataRequest{Header: header}, nil
-	}
-	// 2. client software name (length-prefixed)
-	lengthByte, err := decoder.ReadByte()
+	d, err := requestDecoder(header, APIKeyMetadata)
 	if err != nil {
-		return &MetadataRequest{Header: header}, nil
+		return nil, err
 	}
-	for i := 0; i < int(lengthByte); i++ {
-		if _, err := decoder.ReadByte(); err != nil {
-			return &MetadataRequest{Header: header}, nil
+	count, err := d.ReadUnsignedVarint()
+	if err != nil {
+		return nil, err
+	}
+	req := &MetadataRequest{Header: header}
+	if count > 0 {
+		if count-1 > uint64(d.Remaining()/18) {
+			return nil, fmt.Errorf("invalid metadata topic count")
+		}
+		req.Topics = make([]MetadataTopic, 0)
+		req.TopicNames = make([]string, 0)
+		for i := uint64(1); i < count; i++ {
+			var topic MetadataTopic
+			for j := range topic.ID {
+				topic.ID[j], err = d.ReadByte()
+				if err != nil {
+					return nil, err
+				}
+			}
+			topic.Name, err = d.ReadCompactNullableString()
+			if err != nil {
+				return nil, err
+			}
+			if topic.Name == nil && topic.ID == [16]byte{} {
+				return nil, fmt.Errorf("metadata topic requires a name or ID")
+			}
+			if topic.Name != nil {
+				req.TopicNames = append(req.TopicNames, *topic.Name)
+			}
+			req.Topics = append(req.Topics, topic)
+			if err := d.ReadTaggedFields(nil); err != nil {
+				return nil, err
+			}
 		}
 	}
-	// 3. TAG_BUFFER
-	if _, err := decoder.ReadByte(); err != nil {
-		return &MetadataRequest{Header: header}, nil
-	}
-
-	// topics COMPACT_ARRAY (null or empty = all topics)
-	arrayLen, err := decoder.ReadUnsignedVarint()
-	if err != nil || arrayLen == 0 {
-		// null array → all topics
-		return &MetadataRequest{Header: header, TopicNames: nil}, nil
-	}
-
-	var topicNames []string
-	actualLen := arrayLen - 1
-	for i := uint64(0); i < actualLen; i++ {
-		name, err := decoder.ReadCompactString()
+	for i := 0; i < 2; i++ { // allow_auto_topic_creation and include_topic_authorized_operations
+		flag, err := d.ReadByte()
 		if err != nil {
-			break
+			return nil, err
 		}
-		topicNames = append(topicNames, name)
-		decoder.ReadByte() // TAG_BUFFER per entry
+		if flag > 1 {
+			return nil, fmt.Errorf("invalid metadata boolean")
+		}
 	}
-
-	return &MetadataRequest{Header: header, TopicNames: topicNames}, nil
+	if err := finishRequest(d, true); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 // --- Parsers for consumer group / offset / list-offsets (v0 non-flexible) ---
@@ -895,10 +899,16 @@ func ParseFindCoordinatorRequest(header *RequestHeader) (*FindCoordinatorRequest
 	if header.GetAPIVersion() != 0 {
 		return nil, fmt.Errorf("FindCoordinator: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyFindCoordinator)
+	if err != nil {
+		return nil, err
+	}
 	key, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("FindCoordinator: read key: %w", err)
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &FindCoordinatorRequest{Header: header, Key: key}, nil
 }
@@ -908,7 +918,10 @@ func ParseJoinGroupRequest(header *RequestHeader) (*JoinGroupRequest, error) {
 	if header.GetAPIVersion() != 0 {
 		return nil, fmt.Errorf("JoinGroup: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyJoinGroup)
+	if err != nil {
+		return nil, err
+	}
 	groupID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("JoinGroup: read group_id: %w", err)
@@ -935,7 +948,7 @@ func ParseJoinGroupRequest(header *RequestHeader) (*JoinGroupRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("JoinGroup: read protocols array len: %w", err)
 	}
-	protocols := make([]GroupProtocol, 0, numProtocols)
+	var protocols []GroupProtocol
 	for i := int32(0); i < numProtocols; i++ {
 		name, err := d.ReadString()
 		if err != nil {
@@ -949,6 +962,9 @@ func ParseJoinGroupRequest(header *RequestHeader) (*JoinGroupRequest, error) {
 	}
 	if len(protocols) == 0 {
 		return nil, fmt.Errorf("JoinGroup: at least one protocol is required")
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &JoinGroupRequest{
 		Header:           header,
@@ -965,7 +981,10 @@ func ParseSyncGroupRequest(header *RequestHeader) (*SyncGroupRequest, error) {
 	if header.GetAPIVersion() != 0 {
 		return nil, fmt.Errorf("SyncGroup: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeySyncGroup)
+	if err != nil {
+		return nil, err
+	}
 	groupID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("SyncGroup: read group_id: %w", err)
@@ -985,7 +1004,7 @@ func ParseSyncGroupRequest(header *RequestHeader) (*SyncGroupRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("SyncGroup: read assignments array len: %w", err)
 	}
-	assignments := make([]SyncGroupAssignment, 0, numAssignments)
+	var assignments []SyncGroupAssignment
 	for i := int32(0); i < numAssignments; i++ {
 		mid, err := d.ReadString()
 		if err != nil {
@@ -996,6 +1015,9 @@ func ParseSyncGroupRequest(header *RequestHeader) (*SyncGroupRequest, error) {
 			return nil, fmt.Errorf("SyncGroup: read assignment data: %w", err)
 		}
 		assignments = append(assignments, SyncGroupAssignment{MemberID: mid, Assignment: data})
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &SyncGroupRequest{
 		Header:       header,
@@ -1011,7 +1033,10 @@ func ParseHeartbeatRequest(header *RequestHeader) (*HeartbeatRequest, error) {
 	if header.GetAPIVersion() != 0 {
 		return nil, fmt.Errorf("Heartbeat: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyHeartbeat)
+	if err != nil {
+		return nil, err
+	}
 	groupID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("Heartbeat: read group_id: %w", err)
@@ -1027,6 +1052,9 @@ func ParseHeartbeatRequest(header *RequestHeader) (*HeartbeatRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Heartbeat: read member_id: %w", err)
 	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
+	}
 	return &HeartbeatRequest{
 		Header:       header,
 		GroupID:      groupID,
@@ -1040,7 +1068,10 @@ func ParseLeaveGroupRequest(header *RequestHeader) (*LeaveGroupRequest, error) {
 	if header.GetAPIVersion() != 0 {
 		return nil, fmt.Errorf("LeaveGroup: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyLeaveGroup)
+	if err != nil {
+		return nil, err
+	}
 	groupID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("LeaveGroup: read group_id: %w", err)
@@ -1051,6 +1082,9 @@ func ParseLeaveGroupRequest(header *RequestHeader) (*LeaveGroupRequest, error) {
 	memberID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("LeaveGroup: read member_id: %w", err)
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &LeaveGroupRequest{
 		Header:   header,
@@ -1064,7 +1098,10 @@ func ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, erro
 	if header.GetAPIVersion() != 2 {
 		return nil, fmt.Errorf("OffsetCommit: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyOffsetCommit)
+	if err != nil {
+		return nil, err
+	}
 	groupID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("OffsetCommit: read group_id: %w", err)
@@ -1088,7 +1125,7 @@ func ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, erro
 	if err != nil {
 		return nil, fmt.Errorf("OffsetCommit: read topics array len: %w", err)
 	}
-	topics := make([]OffsetCommitTopic, 0, numTopics)
+	var topics []OffsetCommitTopic
 	for i := int32(0); i < numTopics; i++ {
 		name, err := d.ReadString()
 		if err != nil {
@@ -1098,7 +1135,7 @@ func ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, erro
 		if err != nil {
 			return nil, fmt.Errorf("OffsetCommit: read partitions array len: %w", err)
 		}
-		parts := make([]OffsetCommitPartition, 0, numParts)
+		var parts []OffsetCommitPartition
 		for j := int32(0); j < numParts; j++ {
 			idx, err := d.ReadInt32()
 			if err != nil {
@@ -1108,13 +1145,20 @@ func ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, erro
 			if err != nil {
 				return nil, fmt.Errorf("OffsetCommit: read committed_offset: %w", err)
 			}
-			meta, err := d.ReadString()
+			meta, err := d.ReadNullableString()
 			if err != nil {
 				return nil, fmt.Errorf("OffsetCommit: read metadata: %w", err)
 			}
-			parts = append(parts, OffsetCommitPartition{Index: idx, CommittedOffset: offset, Metadata: meta})
+			entry := OffsetCommitPartition{Index: idx, CommittedOffset: offset}
+			if meta != nil {
+				entry.Metadata = *meta
+			}
+			parts = append(parts, entry)
 		}
 		topics = append(topics, OffsetCommitTopic{Name: name, Partitions: parts})
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &OffsetCommitRequest{
 		Header:       header,
@@ -1131,7 +1175,10 @@ func ParseOffsetFetchRequest(header *RequestHeader) (*OffsetFetchRequest, error)
 	if header.GetAPIVersion() != 1 {
 		return nil, fmt.Errorf("OffsetFetch: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyOffsetFetch)
+	if err != nil {
+		return nil, err
+	}
 	groupID, err := d.ReadString()
 	if err != nil {
 		return nil, fmt.Errorf("OffsetFetch: read group_id: %w", err)
@@ -1143,7 +1190,7 @@ func ParseOffsetFetchRequest(header *RequestHeader) (*OffsetFetchRequest, error)
 	if err != nil {
 		return nil, fmt.Errorf("OffsetFetch: read topics array len: %w", err)
 	}
-	topics := make([]OffsetFetchTopic, 0, numTopics)
+	var topics []OffsetFetchTopic
 	for i := int32(0); i < numTopics; i++ {
 		name, err := d.ReadString()
 		if err != nil {
@@ -1153,7 +1200,7 @@ func ParseOffsetFetchRequest(header *RequestHeader) (*OffsetFetchRequest, error)
 		if err != nil {
 			return nil, fmt.Errorf("OffsetFetch: read partitions array len: %w", err)
 		}
-		parts := make([]int32, 0, numParts)
+		var parts []int32
 		for j := int32(0); j < numParts; j++ {
 			idx, err := d.ReadInt32()
 			if err != nil {
@@ -1162,6 +1209,9 @@ func ParseOffsetFetchRequest(header *RequestHeader) (*OffsetFetchRequest, error)
 			parts = append(parts, idx)
 		}
 		topics = append(topics, OffsetFetchTopic{Name: name, Partitions: parts})
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &OffsetFetchRequest{
 		Header:  header,
@@ -1176,7 +1226,10 @@ func ParseListOffsetsRequest(header *RequestHeader) (*ListOffsetsRequest, error)
 	if header.GetAPIVersion() != 1 {
 		return nil, fmt.Errorf("ListOffsets: unsupported version %d", header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	d, err := requestDecoder(header, APIKeyListOffsets)
+	if err != nil {
+		return nil, err
+	}
 	replicaID, err := d.ReadInt32()
 	if err != nil {
 		return nil, fmt.Errorf("ListOffsets: read replica_id: %w", err)
@@ -1185,7 +1238,7 @@ func ParseListOffsetsRequest(header *RequestHeader) (*ListOffsetsRequest, error)
 	if err != nil {
 		return nil, fmt.Errorf("ListOffsets: read topics array len: %w", err)
 	}
-	topics := make([]ListOffsetsTopic, 0, numTopics)
+	var topics []ListOffsetsTopic
 	for i := int32(0); i < numTopics; i++ {
 		name, err := d.ReadString()
 		if err != nil {
@@ -1195,7 +1248,7 @@ func ParseListOffsetsRequest(header *RequestHeader) (*ListOffsetsRequest, error)
 		if err != nil {
 			return nil, fmt.Errorf("ListOffsets: read partitions array len: %w", err)
 		}
-		parts := make([]ListOffsetsPartition, 0, numParts)
+		var parts []ListOffsetsPartition
 		for j := int32(0); j < numParts; j++ {
 			idx, err := d.ReadInt32()
 			if err != nil {
@@ -1208,6 +1261,9 @@ func ParseListOffsetsRequest(header *RequestHeader) (*ListOffsetsRequest, error)
 			parts = append(parts, ListOffsetsPartition{Index: idx, Timestamp: ts})
 		}
 		topics = append(topics, ListOffsetsTopic{Name: name, Partitions: parts})
+	}
+	if err := finishRequest(d, false); err != nil {
+		return nil, err
 	}
 	return &ListOffsetsRequest{
 		Header:    header,

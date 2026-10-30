@@ -1,60 +1,34 @@
 package apiversions
 
-import (
-	"bytes"
-	"encoding/binary"
-)
+import "github.com/ritiraj/kafka-go/internal/protocol"
 
-// supported API and its version range
-type APIVersion struct {
-	Key        int16
-	MinVersion int16
-	MaxVersion int16
-}
-
-// return the list of APIs supported by this broker
-func getSupportedAPIs() []APIVersion {
-	return []APIVersion{
-		{18, 0, 4},  // ApiVersions
-		{75, 0, 0},  // DescribeTopicPartitions
-		{1, 16, 16}, // Fetch; legacy v0 is accepted for the internal follower
-		{0, 0, 11},  // Produce
-		{3, 0, 12},  // Metadata
-		{2, 0, 1},   // ListOffsets
-		{8, 0, 2},   // OffsetCommit
-		{9, 0, 1},   // OffsetFetch
-		{10, 0, 0},  // FindCoordinator
-		{11, 0, 0},  // JoinGroup
-		{12, 0, 0},  // Heartbeat
-		{13, 0, 0},  // LeaveGroup
-		{14, 0, 0},  // SyncGroup
-	}
-}
-
+// BuildBody preserves the v3/v4 default for direct callers.
 func BuildBody(errorCode int16) []byte {
-	buf := new(bytes.Buffer)
+	return BuildBodyVersion(4, errorCode)
+}
 
-	// error_code
-	binary.Write(buf, binary.BigEndian, errorCode)
-
-	supportedAPIs := getSupportedAPIs()
-
-	// COMPACT_ARRAY length: N+1 (so 1 entry = 0x02, 2 entries = 0x03, etc.)
-	buf.WriteByte(byte(len(supportedAPIs) + 1))
-
-	// Write each API entry
-	for _, api := range supportedAPIs {
-		binary.Write(buf, binary.BigEndian, api.Key)        // api_key
-		binary.Write(buf, binary.BigEndian, api.MinVersion) // min_version
-		binary.Write(buf, binary.BigEndian, api.MaxVersion) // max_version
-		buf.WriteByte(0x00)                                 // TAG_BUFFER for entry
+func BuildBodyVersion(version, errorCode int16) []byte {
+	e := protocol.NewEncoder()
+	e.WriteInt16(errorCode)
+	apis := protocol.SupportedAPIs()
+	if version >= 3 {
+		e.WriteUnsignedVarint(uint64(len(apis) + 1))
+	} else {
+		e.WriteArrayLen(len(apis))
 	}
-
-	// throttle_time_ms
-	binary.Write(buf, binary.BigEndian, int32(0))
-
-	// TAG_BUFFER for response
-	buf.WriteByte(0x00)
-
-	return buf.Bytes()
+	for _, api := range apis {
+		e.WriteInt16(api.Key)
+		e.WriteInt16(api.MinVersion)
+		e.WriteInt16(api.MaxVersion)
+		if version >= 3 {
+			e.WriteTagBuffer()
+		}
+	}
+	if version >= 1 {
+		e.WriteInt32(0)
+	}
+	if version >= 3 {
+		e.WriteTagBuffer()
+	}
+	return e.Bytes()
 }

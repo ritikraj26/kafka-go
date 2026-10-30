@@ -1,10 +1,9 @@
 package network
 
 import (
+	"errors"
 	"io"
-	"log/slog"
 	"net"
-	"strings"
 	"time"
 
 	apiversions "github.com/ritiraj/kafka-go/internal/api/api_versions"
@@ -31,129 +30,83 @@ const connectionReadTimeout = 30 * time.Second
 func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
 	defer conn.Close()
 	for {
-		// Set read deadline to prevent zombie connections from holding goroutines
-		conn.SetReadDeadline(time.Now().Add(connectionReadTimeout))
-
-		requestHeader := protocol.NewRequestHeader()
-		if err := requestHeader.ReadFrom(conn); err != nil {
-			// EOF / connection-reset on read = client (or health-check probe) disconnected cleanly.
-			if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "connection reset") {
-				logger.L.Debug("client disconnected", "err", err)
+		if err := conn.SetReadDeadline(time.Now().Add(connectionReadTimeout)); err != nil {
+			logger.L.Error("failed to set request deadline", "err", err)
+			return
+		}
+		header := protocol.NewRequestHeader()
+		if err := header.ReadFrom(conn); err != nil {
+			if errors.Is(err, io.EOF) {
+				logger.L.Debug("client disconnected")
 			} else {
-				logger.L.Error("error reading request header", "err", err)
+				logger.L.Warn("failed to read request frame", "err", err)
 			}
 			return
 		}
-
-		// Parse the request into the appropriate type
-		request, err := protocol.ParseRequest(requestHeader)
-		if err != nil {
-			logger.L.Error("failed to parse request", "api_key", requestHeader.GetAPIKey(), "err", err)
-			return
-		}
-
 		var body []byte
-		var serializedResponse []byte
-
-		switch req := request.(type) {
-		case *protocol.ApiVersionsRequest:
-			// Handle ApiVersions request (uses response header v0)
-			body = apiversions.BuildBody(requestHeader.GetErrorCode())
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.ProduceRequest:
-			// Handle Produce request (uses response header v1)
-			var failed bool
-			body, failed = produce.Process(req, metaMgr, localBrokerID)
-			if req.Acks == 0 {
-				if failed {
-					return
+		if header.GetAPIKey() == protocol.APIKeyApiVersions && header.GetErrorCode() != protocol.ErrNone {
+			// Kafka's bootstrap fallback always uses ApiVersions response v0.
+			body = apiversions.BuildBodyVersion(0, protocol.ErrUnsupportedVersion)
+		} else {
+			request, err := protocol.ParseRequest(header)
+			if err != nil {
+				logger.L.Warn("rejecting request", "api_key", header.GetAPIKey(), "version", header.GetAPIVersion(), "err", err)
+				return
+			}
+			switch req := request.(type) {
+			case *protocol.ApiVersionsRequest:
+				body = apiversions.BuildBodyVersion(header.GetAPIVersion(), protocol.ErrNone)
+			case *protocol.ProduceRequest:
+				var failed bool
+				body, failed = produce.Process(req, metaMgr, localBrokerID)
+				if req.Acks == 0 {
+					if failed {
+						return
+					}
+					continue
 				}
-				continue
+			case *protocol.FetchRequest:
+				if header.GetAPIVersion() == 0 {
+					body = fetch.BuildBodyV0(req, metaMgr, localBrokerID)
+				} else {
+					body = fetch.BuildBody(req, metaMgr, localBrokerID)
+				}
+			case *protocol.DescribeTopicPartitionsRequest:
+				body = describetopics.BuildBody(req, metaMgr)
+			case *protocol.MetadataRequest:
+				body = apimetadata.BuildBody(req, metaMgr)
+			case *protocol.FindCoordinatorRequest:
+				body = findcoordinator.BuildBody(req, metaMgr.Brokers)
+			case *protocol.JoinGroupRequest:
+				body = joingroup.BuildBody(req, coord)
+			case *protocol.SyncGroupRequest:
+				body = syncgroup.BuildBody(req, coord)
+			case *protocol.HeartbeatRequest:
+				body = heartbeat.BuildBody(req, coord)
+			case *protocol.LeaveGroupRequest:
+				body = leavegroup.BuildBody(req, coord)
+			case *protocol.OffsetCommitRequest:
+				body = offsetcommit.BuildBody(req, coord)
+			case *protocol.OffsetFetchRequest:
+				body = offsetfetch.BuildBody(req, coord)
+			case *protocol.ListOffsetsRequest:
+				body = listoffsets.BuildBody(req, metaMgr, localBrokerID)
+			default:
+				logger.L.Error("unhandled request", "api_key", header.GetAPIKey())
+				return
 			}
-			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.FetchRequest:
-			// Handle Fetch request — v0 uses non-flexible response, v16 uses flexible
-			if requestHeader.GetAPIVersion() == 0 {
-				body = fetch.BuildBodyV0(req, metaMgr, localBrokerID)
-				response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-				serializedResponse, err = response.Serialize()
-			} else {
-				body = fetch.BuildBody(req, metaMgr, localBrokerID)
-				response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
-				serializedResponse, err = response.Serialize()
-			}
-
-		case *protocol.DescribeTopicPartitionsRequest:
-			// Handle DescribeTopicPartitions request (uses response header v1)
-			body = describetopics.BuildBody(req, metaMgr)
-			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.MetadataRequest:
-			// Handle Metadata request (uses response header v1 — flexible)
-			body = apimetadata.BuildBody(req, metaMgr)
-			response := protocol.NewResponseV1(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		// --- Consumer group APIs (v0, response header v0) ---
-
-		case *protocol.FindCoordinatorRequest:
-			body = findcoordinator.BuildBody(req, metaMgr.Brokers)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.JoinGroupRequest:
-			body = joingroup.BuildBody(req, coord)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.SyncGroupRequest:
-			body = syncgroup.BuildBody(req, coord)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.HeartbeatRequest:
-			body = heartbeat.BuildBody(req, coord)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.LeaveGroupRequest:
-			body = leavegroup.BuildBody(req, coord)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.OffsetCommitRequest:
-			body = offsetcommit.BuildBody(req, coord)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.OffsetFetchRequest:
-			body = offsetfetch.BuildBody(req, coord)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		case *protocol.ListOffsetsRequest:
-			body = listoffsets.BuildBody(req, metaMgr)
-			response := protocol.NewResponse(requestHeader.GetCorrelationID(), body)
-			serializedResponse, err = response.Serialize()
-
-		default:
-			logger.L.Warn("unhandled request type", "type", slog.AnyValue(req))
+		}
+		response := protocol.NewResponse(header.GetCorrelationID(), body)
+		if protocol.ResponseHeaderVersion(header.GetAPIKey(), header.GetAPIVersion()) == 1 {
+			response = protocol.NewResponseV1(header.GetCorrelationID(), body)
+		}
+		data, err := response.Serialize()
+		if err != nil {
+			logger.L.Error("failed to serialize response", "err", err)
 			return
 		}
-
-		if err != nil {
-			logger.L.Error("error serializing response", "err", err)
-			return
-		}
-
-		_, err = conn.Write(serializedResponse)
-		if err != nil {
-			logger.L.Error("error writing response", "err", err)
+		if _, err := conn.Write(data); err != nil {
+			logger.L.Warn("failed to write response", "err", err)
 			return
 		}
 	}

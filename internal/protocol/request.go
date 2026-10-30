@@ -15,6 +15,7 @@ type RequestHeader struct {
 	apiKey        int16
 	apiVersion    int16
 	correlationID int32
+	clientID      *string
 	body          []byte
 }
 
@@ -43,7 +44,7 @@ func (r *RequestHeader) GetBody() []byte {
 }
 
 func (r *RequestHeader) GetErrorCode() int16 {
-	if r.apiVersion < 0 || r.apiVersion > 4 {
+	if !SupportsVersion(r.apiKey, r.apiVersion) {
 		return ErrUnsupportedVersion
 	}
 	return ErrNone
@@ -54,31 +55,17 @@ func (r *RequestHeader) ReadFrom(conn net.Conn) error {
 		return fmt.Errorf("failed to read message_size: %w", err)
 	}
 
-	if r.messageSize < 0 || r.messageSize > maxRequestSize {
-		return fmt.Errorf("message_size %d exceeds maximum allowed %d", r.messageSize, maxRequestSize)
+	if r.messageSize < 8 || r.messageSize > maxRequestSize {
+		return fmt.Errorf("message_size %d must be between 8 and %d", r.messageSize, maxRequestSize)
 	}
-
-	if err := binary.Read(conn, binary.BigEndian, &r.apiKey); err != nil {
-		return fmt.Errorf("failed to read api_key: %w", err)
+	frame := make([]byte, r.messageSize)
+	if _, err := io.ReadFull(conn, frame); err != nil {
+		return fmt.Errorf("failed to read request frame: %w", err)
 	}
-
-	if err := binary.Read(conn, binary.BigEndian, &r.apiVersion); err != nil {
-		return fmt.Errorf("failed to read api_version: %w", err)
-	}
-
-	if err := binary.Read(conn, binary.BigEndian, &r.correlationID); err != nil {
-		return fmt.Errorf("failed to read correlation_id: %w", err)
-	}
-
-	// Read the remaining bytes of the request body
-	bytesRead := int32(8) // apiKey (2) + apiVersion (2) + correlationID (4)
-	remainingBytes := r.messageSize - bytesRead
-	if remainingBytes > 0 {
-		r.body = make([]byte, remainingBytes)
-		if _, err := io.ReadFull(conn, r.body); err != nil {
-			return fmt.Errorf("failed to read request body: %w", err)
-		}
-	}
-
+	r.apiKey = int16(binary.BigEndian.Uint16(frame[:2]))
+	r.apiVersion = int16(binary.BigEndian.Uint16(frame[2:4]))
+	r.correlationID = int32(binary.BigEndian.Uint32(frame[4:8]))
+	r.body = frame[8:]
+	r.clientID = nil
 	return nil
 }

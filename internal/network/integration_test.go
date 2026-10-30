@@ -44,11 +44,11 @@ func TestIntegration_ConsumerGroupLifecycle(t *testing.T) {
 	correlationID := int32(1)
 	sendRecv := func(apiKey int16, body []byte) []byte {
 		correlationID++
-		return sendV0Request(t, conn, apiKey, 0, correlationID, body)
+		return sendV0Request(t, conn, apiKey, 0, correlationID, append(encodeString("group-test"), body...))
 	}
 	sendRecvV := func(apiKey int16, version int16, body []byte) []byte {
 		correlationID++
-		return sendV0Request(t, conn, apiKey, version, correlationID, body)
+		return sendV0Request(t, conn, apiKey, version, correlationID, append(encodeString("group-test"), body...))
 	}
 
 	// 1. FindCoordinator (key="test-group")

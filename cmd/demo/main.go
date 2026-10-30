@@ -87,12 +87,7 @@ func encodeCompactBytes(data []byte) []byte {
 }
 
 func flexHeader() []byte {
-	var buf []byte
-	buf = append(buf, 0x00)       // cursor null
-	buf = append(buf, 0x05)       // client name length = 5
-	buf = append(buf, "demo!"...) // client name
-	buf = append(buf, 0x00)       // TAG_BUFFER
-	return buf
+	return append(encodeString("demo!"), 0) // Client ID and empty header tags.
 }
 
 func sendRequest(conn net.Conn, apiKey, apiVersion int16, corrID int32, body []byte) ([]byte, error) {
@@ -463,7 +458,9 @@ func main() {
 			pos += 4
 			rackLen, n := readUnsignedVarint(body, pos)
 			pos += n
-			pos += int(rackLen) - 1
+			if rackLen > 0 {
+				pos += int(rackLen) - 1
+			}
 			pos++
 			info(fmt.Sprintf("  Broker %d \u2192 %s:%d", bID, host, bPort))
 		}

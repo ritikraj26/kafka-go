@@ -29,7 +29,7 @@ func (d *Decoder) ReadCompactString() (string, error) {
 	}
 
 	if length == 0 {
-		return "", nil // null string
+		return "", fmt.Errorf("unexpected null compact string")
 	}
 
 	strLen := length - 1 // compact encoding is length+1
@@ -45,19 +45,33 @@ func (d *Decoder) ReadCompactString() (string, error) {
 // ReadString reads a standard STRING (INT16 length-prefixed, then UTF-8 bytes).
 // Used by v0 non-flexible APIs.
 func (d *Decoder) ReadString() (string, error) {
-	length, err := d.ReadInt16()
+	value, err := d.ReadNullableString()
 	if err != nil {
 		return "", err
 	}
-	if length < 0 {
-		return "", nil // null string
+	if value == nil {
+		return "", fmt.Errorf("unexpected null string")
+	}
+	return *value, nil
+}
+
+func (d *Decoder) ReadNullableString() (*string, error) {
+	length, err := d.ReadInt16()
+	if err != nil {
+		return nil, err
+	}
+	if length == -1 {
+		return nil, nil
+	}
+	if length < -1 {
+		return nil, fmt.Errorf("invalid string length %d", length)
 	}
 	if d.pos+int(length) > len(d.data) {
-		return "", io.ErrUnexpectedEOF
+		return nil, io.ErrUnexpectedEOF
 	}
 	str := string(d.data[d.pos : d.pos+int(length)])
 	d.pos += int(length)
-	return str, nil
+	return &str, nil
 }
 
 // ReadBytes reads standard BYTES (INT32 length-prefixed, then raw bytes).
@@ -67,8 +81,11 @@ func (d *Decoder) ReadBytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if length < 0 {
+	if length == -1 {
 		return nil, nil // null bytes
+	}
+	if length < -1 {
+		return nil, fmt.Errorf("invalid byte length %d", length)
 	}
 	if d.pos+int(length) > len(d.data) {
 		return nil, io.ErrUnexpectedEOF
@@ -81,7 +98,14 @@ func (d *Decoder) ReadBytes() ([]byte, error) {
 
 // ReadArrayLen reads an INT32 array count for standard (non-compact) arrays.
 func (d *Decoder) ReadArrayLen() (int32, error) {
-	return d.ReadInt32()
+	count, err := d.ReadInt32()
+	if err != nil {
+		return 0, err
+	}
+	if count < 0 || int64(count) > int64(d.Remaining()) {
+		return 0, fmt.Errorf("invalid array count %d", count)
+	}
+	return count, nil
 }
 
 // ReadCompactNullableString reads a COMPACT_NULLABLE_STRING

@@ -6,14 +6,12 @@ import (
 )
 
 // buildFlexHeader builds the common flexible request header prefix used by most
-// APIs: cursor(1) + client_software_name(length-prefixed) + TAG_BUFFER(1).
+// APIs: nullable client ID (INT16 length) + TAG_BUFFER.
 func buildFlexHeader() []byte {
-	var buf []byte
-	buf = append(buf, 0x00)       // cursor (null)
-	buf = append(buf, 0x05)       // client software name length = 5
-	buf = append(buf, "kafka"...) // client software name
-	buf = append(buf, 0x00)       // TAG_BUFFER
-	return buf
+	e := NewEncoder()
+	e.WriteString("kafka")
+	e.WriteTagBuffer()
+	return e.Bytes()
 }
 
 func makeRequestHeader(apiKey int16, apiVersion int16, body []byte) *RequestHeader {
@@ -27,9 +25,11 @@ func makeRequestHeader(apiKey int16, apiVersion int16, body []byte) *RequestHead
 }
 
 func TestParseApiVersionsRequest(t *testing.T) {
-	// Body: compact_string "test-client" + TAG_BUFFER
 	enc := NewEncoder()
+	enc.WriteString("test-client")
+	enc.WriteTagBuffer()
 	enc.WriteCompactString("test-client")
+	enc.WriteCompactString("1.0")
 	enc.WriteByte(0x00) // TAG_BUFFER
 
 	header := makeRequestHeader(APIKeyApiVersions, 4, enc.Bytes())
@@ -319,6 +319,8 @@ func TestParseDescribeTopicPartitionsRequest(t *testing.T) {
 	body = append(body, "bar"...)
 	body = append(body, 0x00) // TAG_BUFFER
 
+	body = binary.BigEndian.AppendUint32(body, 2000)
+	body = append(body, 0xff, 0) // null cursor and body tags
 	header := makeRequestHeader(APIKeyDescribeTopicPartitions, 0, body)
 	req, err := ParseDescribeTopicPartitionsRequest(header)
 	if err != nil {
@@ -341,7 +343,7 @@ func TestParseMetadataRequest_AllTopics(t *testing.T) {
 	body = append(body, buildFlexHeader()...)
 
 	// topics: null compact array → varint 0
-	body = append(body, 0x00)
+	body = append(body, 0x00, 0, 0, 0) // topics, auto-create, authorized operations, tags
 
 	header := makeRequestHeader(APIKeyMetadata, 12, body)
 	req, err := ParseMetadataRequest(header)
@@ -362,10 +364,12 @@ func TestParseMetadataRequest_SpecificTopics(t *testing.T) {
 	body = append(body, 0x02)
 
 	// topic: "events" (compact string: len+1 = 7)
+	body = append(body, make([]byte, 16)...) // zero topic UUID: look up by name
 	body = append(body, 0x07)
 	body = append(body, "events"...)
 	body = append(body, 0x00) // TAG_BUFFER
 
+	body = append(body, 0, 0, 0) // auto-create, authorized operations, tags
 	header := makeRequestHeader(APIKeyMetadata, 12, body)
 	req, err := ParseMetadataRequest(header)
 	if err != nil {

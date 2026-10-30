@@ -1,106 +1,110 @@
 package apimetadata
 
 import (
+	"sort"
+
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 const clusterID = "kafka-go-cluster"
 
-// BuildBody builds a Metadata v12 response body.
-func BuildBody(req *protocol.MetadataRequest, metaMgr *metadata.Manager) []byte {
-	enc := protocol.NewEncoder()
-
-	enc.WriteInt32(0) // throttle_time_ms
-
-	// Brokers array — use registry if available, else fallback
-	if metaMgr.Brokers != nil {
-		brokers := metaMgr.Brokers.All()
-		enc.WriteUnsignedVarint(uint64(len(brokers) + 1))
+// BuildBody encodes Metadata v12, including topic-by-ID and missing-topic results.
+func BuildBody(req *protocol.MetadataRequest, m *metadata.Manager) []byte {
+	e := protocol.NewEncoder()
+	e.WriteInt32(0)
+	if m.Brokers != nil {
+		brokers := m.Brokers.All()
+		sort.Slice(brokers, func(i, j int) bool { return brokers[i].ID < brokers[j].ID })
+		e.WriteUnsignedVarint(uint64(len(brokers) + 1))
 		for _, b := range brokers {
-			enc.WriteInt32(b.ID)
-			enc.WriteCompactString(b.Host)
-			enc.WriteInt32(b.Port)
-			enc.WriteCompactString("") // rack
-			enc.WriteTagBuffer()
+			e.WriteInt32(b.ID)
+			e.WriteCompactString(b.Host)
+			e.WriteInt32(b.Port)
+			e.WriteByte(0) // nullable rack
+			e.WriteTagBuffer()
 		}
-		enc.WriteCompactString(clusterID)
-		enc.WriteInt32(metaMgr.Brokers.LocalID) // controller_id
+		e.WriteCompactString(clusterID)
+		e.WriteInt32(m.Brokers.LocalID)
 	} else {
-		enc.WriteUnsignedVarint(2) // 1 broker
-		enc.WriteInt32(1)
-		enc.WriteCompactString("localhost")
-		enc.WriteInt32(9092)
-		enc.WriteCompactString("") // rack
-		enc.WriteTagBuffer()
-		enc.WriteCompactString(clusterID)
-		enc.WriteInt32(1) // controller_id
+		e.WriteUnsignedVarint(2)
+		e.WriteInt32(1)
+		e.WriteCompactString("localhost")
+		e.WriteInt32(9092)
+		e.WriteByte(0)
+		e.WriteTagBuffer()
+		e.WriteCompactString(clusterID)
+		e.WriteInt32(1)
 	}
-
-	topics := selectTopics(req, metaMgr)
-	enc.WriteUnsignedVarint(uint64(len(topics) + 1))
-
-	for _, topic := range topics {
-		enc.WriteInt16(protocol.ErrNone)
-		enc.WriteCompactString(topic.Name)
-
-		var uuidBytes [16]byte
-		copy(uuidBytes[:], topic.ID[:])
-		enc.WriteUUID(uuidBytes)
-
-		if topic.IsInternal {
-			enc.WriteByte(0x01)
+	requested := req.Topics
+	if requested == nil {
+		names := req.TopicNames
+		if names == nil {
+			names = m.ListTopics()
+			sort.Strings(names)
+		}
+		requested = make([]protocol.MetadataTopic, len(names))
+		for i, name := range names {
+			requested[i].Name = &name
+		}
+	}
+	e.WriteUnsignedVarint(uint64(len(requested) + 1))
+	for _, query := range requested {
+		var topic *metadata.Topic
+		if query.ID != [16]byte{} {
+			topic = m.GetTopicByID(query.ID)
+			if topic != nil && query.Name != nil && *query.Name != topic.Name {
+				topic = nil
+			}
+		} else if query.Name != nil {
+			topic = m.GetTopic(*query.Name)
+		}
+		if topic == nil {
+			code := protocol.ErrUnknownTopicOrPartition
+			if query.ID != [16]byte{} {
+				code = protocol.ErrUnknownTopicID
+			}
+			e.WriteInt16(code)
+			if query.Name == nil {
+				e.WriteByte(0)
+			} else {
+				e.WriteCompactString(*query.Name)
+			}
+			e.WriteUUID(query.ID)
+			e.WriteByte(0)
+			e.WriteUnsignedVarint(1)
 		} else {
-			enc.WriteByte(0x00)
-		}
-
-		enc.WriteUnsignedVarint(uint64(len(topic.Partitions) + 1))
-		for i := range topic.Partitions {
-			part := &topic.Partitions[i]
-			enc.WriteInt16(protocol.ErrNone)
-			enc.WriteInt32(part.Index)
-			enc.WriteInt32(part.LeaderID)
-			enc.WriteInt32(part.LeaderEpoch)
-
-			enc.WriteUnsignedVarint(uint64(len(part.ReplicaNodes) + 1))
-			for _, r := range part.ReplicaNodes {
-				enc.WriteInt32(r)
+			e.WriteInt16(0)
+			e.WriteCompactString(topic.Name)
+			e.WriteUUID(topic.ID)
+			if topic.IsInternal {
+				e.WriteByte(1)
+			} else {
+				e.WriteByte(0)
 			}
-			enc.WriteUnsignedVarint(uint64(len(part.ISRNodes) + 1))
-			for _, isr := range part.ISRNodes {
-				enc.WriteInt32(isr)
+			e.WriteUnsignedVarint(uint64(len(topic.Partitions) + 1))
+			for i := range topic.Partitions {
+				p := topic.Partitions[i].Snapshot()
+				e.WriteInt16(0)
+				e.WriteInt32(p.Index)
+				e.WriteInt32(p.LeaderID)
+				e.WriteInt32(p.LeaderEpoch)
+				writeNodes(e, p.Replicas)
+				writeNodes(e, p.ISR)
+				writeNodes(e, p.Offline)
+				e.WriteTagBuffer()
 			}
-
-			enc.WriteByte(0x01) // eligible_leader_replicas (empty array)
-			enc.WriteByte(0x00) // last_known_elr (null)
-			enc.WriteByte(0x00) // offline_replicas (null)
-			enc.WriteTagBuffer()
 		}
-
-		enc.WriteInt32(0x00000df8) // topic_authorized_operations
-		enc.WriteTagBuffer()
+		e.WriteInt32(-2147483648) // authorized operations were not calculated
+		e.WriteTagBuffer()
 	}
-
-	enc.WriteTagBuffer()
-	return enc.Bytes()
+	e.WriteTagBuffer()
+	return e.Bytes()
 }
 
-func selectTopics(req *protocol.MetadataRequest, metaMgr *metadata.Manager) []*metadata.Topic {
-	if req.TopicNames == nil {
-		names := metaMgr.ListTopics()
-		topics := make([]*metadata.Topic, 0, len(names))
-		for _, name := range names {
-			if t := metaMgr.GetTopic(name); t != nil {
-				topics = append(topics, t)
-			}
-		}
-		return topics
+func writeNodes(e *protocol.Encoder, nodes []int32) {
+	e.WriteUnsignedVarint(uint64(len(nodes) + 1))
+	for _, id := range nodes {
+		e.WriteInt32(id)
 	}
-	topics := make([]*metadata.Topic, 0, len(req.TopicNames))
-	for _, name := range req.TopicNames {
-		if t := metaMgr.GetTopic(name); t != nil {
-			topics = append(topics, t)
-		}
-	}
-	return topics
 }

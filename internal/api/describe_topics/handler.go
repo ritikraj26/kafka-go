@@ -1,141 +1,111 @@
 package describetopics
 
 import (
+	"slices"
 	"sort"
 
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
-// BuildBody builds a DescribeTopicPartitions response
-func BuildBody(req *protocol.DescribeTopicPartitionsRequest, metaMgr *metadata.Manager) []byte {
-	encoder := protocol.NewEncoder()
-
-	// Sort topic names alphabetically (required by Kafka protocol)
-	sortedTopics := make([]string, len(req.TopicNames))
-	copy(sortedTopics, req.TopicNames)
-	sort.Strings(sortedTopics)
-
-	// throttle_time_ms: 0
-	encoder.WriteInt32(0)
-
-	// topics array (COMPACT_ARRAY: length+1)
-	topicCount := len(sortedTopics)
-	encoder.WriteUnsignedVarint(uint64(topicCount + 1))
-
-	// Write each topic
-	for _, topicName := range sortedTopics {
-		topic := metaMgr.GetTopic(topicName)
-
+func BuildBody(req *protocol.DescribeTopicPartitionsRequest, m *metadata.Manager) []byte {
+	names := slices.Clone(req.TopicNames)
+	if len(names) == 0 {
+		names = m.ListTopics()
+	}
+	sort.Strings(names)
+	names = slices.Compact(names)
+	limit := int(req.ResponsePartitionLimit)
+	if limit <= 0 {
+		limit = 2000
+	} // Direct callers use the protocol default.
+	type page struct {
+		name       string
+		topic      *metadata.Topic
+		start, end int
+	}
+	var pages []page
+	var next *protocol.TopicCursor
+	for _, name := range names {
+		if req.Cursor != nil && name < req.Cursor.TopicName {
+			continue
+		}
+		start := 0
+		if req.Cursor != nil && name == req.Cursor.TopicName {
+			start = int(req.Cursor.PartitionIndex)
+		}
+		if limit == 0 {
+			next = &protocol.TopicCursor{TopicName: name, PartitionIndex: int32(start)}
+			break
+		}
+		topic := m.GetTopic(name)
 		if topic == nil {
-			// Unknown topic
-			writeUnknownTopic(encoder, topicName)
+			pages = append(pages, page{name: name})
+			continue
+		}
+		if start >= len(topic.Partitions) {
+			continue
+		}
+		end := min(len(topic.Partitions), start+limit)
+		pages = append(pages, page{name: name, topic: topic, start: start, end: end})
+		limit -= end - start
+		if end < len(topic.Partitions) {
+			next = &protocol.TopicCursor{TopicName: name, PartitionIndex: int32(end)}
+			break
+		}
+	}
+	e := protocol.NewEncoder()
+	e.WriteInt32(0)
+	e.WriteUnsignedVarint(uint64(len(pages) + 1))
+	for _, page := range pages {
+		if page.topic == nil {
+			e.WriteInt16(protocol.ErrUnknownTopicOrPartition)
+			e.WriteCompactString(page.name)
+			e.WriteUUID([16]byte{})
+			e.WriteByte(0)
+			e.WriteUnsignedVarint(1)
 		} else {
-			// Known topic with actual metadata
-			writeKnownTopic(encoder, topic)
+			e.WriteInt16(0)
+			e.WriteCompactString(page.name)
+			e.WriteUUID(page.topic.ID)
+			if page.topic.IsInternal {
+				e.WriteByte(1)
+			} else {
+				e.WriteByte(0)
+			}
+			e.WriteUnsignedVarint(uint64(page.end - page.start + 1))
+			for i := page.start; i < page.end; i++ {
+				p := page.topic.Partitions[i].Snapshot()
+				e.WriteInt16(0)
+				e.WriteInt32(p.Index)
+				e.WriteInt32(p.LeaderID)
+				e.WriteInt32(p.LeaderEpoch)
+				nodes(e, p.Replicas)
+				nodes(e, p.ISR)
+				e.WriteByte(0) // eligible leader replicas: null
+				e.WriteByte(0) // last known ELR: null
+				nodes(e, p.Offline)
+				e.WriteTagBuffer()
+			}
 		}
+		e.WriteInt32(-2147483648)
+		e.WriteTagBuffer()
 	}
-
-	// next_cursor: -1 (null for NULLABLE_INT8 is 0xff)
-	encoder.WriteByte(0xff)
-
-	// TAG_BUFFER for response body
-	encoder.WriteTagBuffer()
-
-	return encoder.Bytes()
-}
-
-// writeUnknownTopic writes response for an unknown topic
-func writeUnknownTopic(encoder *protocol.Encoder, topicName string) {
-	// error_code: 3 (UNKNOWN_TOPIC_OR_PARTITION)
-	encoder.WriteInt16(protocol.ErrUnknownTopicOrPartition)
-
-	// topic_name: echo back from request (COMPACT_STRING)
-	encoder.WriteCompactString(topicName)
-
-	// topic_id: 00000000-0000-0000-0000-000000000000 (16 zero bytes)
-	var zeroUUID [16]byte
-	encoder.WriteUUID(zeroUUID)
-
-	// is_internal: false
-	encoder.WriteByte(0x00)
-
-	// partitions array: empty (COMPACT_ARRAY with 0 elements = 0x01)
-	encoder.WriteByte(0x01)
-
-	// topic_authorized_operations: 0
-	encoder.WriteInt32(0)
-
-	// TAG_BUFFER for topic entry
-	encoder.WriteTagBuffer()
-}
-
-// writeKnownTopic writes response for a known topic with real metadata
-func writeKnownTopic(encoder *protocol.Encoder, topic *metadata.Topic) {
-	// error_code: 0 (NO_ERROR)
-	encoder.WriteInt16(protocol.ErrNone)
-
-	// topic_name
-	encoder.WriteCompactString(topic.Name)
-
-	// topic_id: actual UUID
-	topicIDBytes := topic.ID[:]
-	var uuidArray [16]byte
-	copy(uuidArray[:], topicIDBytes)
-	encoder.WriteUUID(uuidArray)
-
-	// is_internal
-	if topic.IsInternal {
-		encoder.WriteByte(0x01)
+	if next == nil {
+		e.WriteByte(0xff)
 	} else {
-		encoder.WriteByte(0x00)
+		e.WriteByte(1)
+		e.WriteCompactString(next.TopicName)
+		e.WriteInt32(next.PartitionIndex)
+		e.WriteTagBuffer()
 	}
+	e.WriteTagBuffer()
+	return e.Bytes()
+}
 
-	// partitions array (COMPACT_ARRAY)
-	encoder.WriteUnsignedVarint(uint64(len(topic.Partitions) + 1))
-
-	for i := range topic.Partitions {
-		partition := &topic.Partitions[i]
-		// error_code for partition: 0 (NO_ERROR)
-		encoder.WriteInt16(protocol.ErrNone)
-
-		// partition_index
-		encoder.WriteInt32(partition.Index)
-
-		// leader_id
-		encoder.WriteInt32(partition.LeaderID)
-
-		// leader_epoch
-		encoder.WriteInt32(partition.LeaderEpoch)
-
-		// replica_nodes (COMPACT_ARRAY)
-		encoder.WriteUnsignedVarint(uint64(len(partition.ReplicaNodes) + 1))
-		for _, replica := range partition.ReplicaNodes {
-			encoder.WriteInt32(replica)
-		}
-
-		// isr_nodes (COMPACT_ARRAY)
-		encoder.WriteUnsignedVarint(uint64(len(partition.ISRNodes) + 1))
-		for _, isr := range partition.ISRNodes {
-			encoder.WriteInt32(isr)
-		}
-
-		// eligible_leader_replicas (COMPACT_ARRAY) - empty for this stage
-		encoder.WriteByte(0x01) // Empty array (length 0 + 1)
-
-		// last_known_elr (COMPACT_ARRAY) - null
-		encoder.WriteByte(0x00) // Null array
-
-		// offline_replicas (COMPACT_ARRAY) - null
-		encoder.WriteByte(0x00) // Null array
-
-		// TAG_BUFFER for partition
-		encoder.WriteTagBuffer()
+func nodes(e *protocol.Encoder, ids []int32) {
+	e.WriteUnsignedVarint(uint64(len(ids) + 1))
+	for _, id := range ids {
+		e.WriteInt32(id)
 	}
-
-	// topic_authorized_operations: 0
-	encoder.WriteInt32(0)
-
-	// TAG_BUFFER for topic
-	encoder.WriteTagBuffer()
 }

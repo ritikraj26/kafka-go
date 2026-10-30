@@ -23,7 +23,7 @@ func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBroke
 	requestError := protocol.ErrNone
 	if req.Acks != -1 && req.Acks != 0 && req.Acks != 1 {
 		requestError = protocol.ErrInvalidRequiredAcks
-	} else if req.TimeoutMs < 0 {
+	} else if req.TimeoutMs < 0 || req.TransactionalID != nil {
 		requestError = protocol.ErrInvalidRequest
 	}
 	if requestError != protocol.ErrNone {
@@ -67,7 +67,7 @@ func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBroke
 			encoder.WriteInt64(baseOffset)
 			encoder.WriteInt64(logAppendTime)
 			encoder.WriteInt64(logStartOffset)
-			encoder.WriteByte(0) // record_errors
+			encoder.WriteByte(1) // empty non-null record_errors
 			encoder.WriteByte(0) // error_message
 			encoder.WriteTagBuffer()
 		}
@@ -113,8 +113,7 @@ func appendPartition(records []byte, topic string, metaMgr *metadata.Manager, p 
 		logger.L.Error("failed to append records", "topic", topic, "partition", p.Index, "err", err)
 		return offset, -1, recordErrorCode(err)
 	}
-	appendTime := time.Now().UnixMilli()
-	return offset, appendTime, protocol.ErrNone
+	return offset, -1, protocol.ErrNone // The broker preserves CreateTime timestamps.
 }
 
 func recordErrorCode(err error) int16 {
