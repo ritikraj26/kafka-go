@@ -1,6 +1,8 @@
 package fetch
 
 import (
+	"errors"
+	"math"
 	"time"
 
 	"github.com/ritiraj/kafka-go/internal/logger"
@@ -12,282 +14,178 @@ type partResult struct {
 	index   int32
 	errCode int16
 	hwm     int64
-	leo     int64 // LogEndOffset — only meaningful for replica fetch responses
+	start   int64
 	records []byte
 }
 
 type topicResult struct {
-	id           [16]byte
-	name         string // populated for v0 requests
-	unknownTopic bool
-	parts        []partResult
+	id    [16]byte
+	name  string
+	parts []partResult
 }
 
-// resolveTopic finds the topic either by UUID (v13+) or by name (v0-v12).
-func resolveTopic(reqTopic protocol.FetchTopic, metaMgr *metadata.Manager) *metadata.Topic {
-	if reqTopic.TopicName != "" {
-		return metaMgr.GetTopic(reqTopic.TopicName)
+func resolveTopic(topic protocol.FetchTopic, m *metadata.Manager) *metadata.Topic {
+	if topic.TopicName != "" {
+		return m.GetTopic(topic.TopicName)
 	}
-	return metaMgr.GetTopicByID(reqTopic.TopicID)
+	return m.GetTopicByID(topic.TopicID)
 }
 
-// collectData reads record batches for all requested partitions, respecting maxBytes.
-// When isReplicaFetch is true, data up to LogEndOffset is served (not limited to HW).
-func collectData(req *protocol.FetchRequest, metaMgr *metadata.Manager, maxBytes int, localBrokerID int32) ([]topicResult, int) {
-	isReplicaFetch := req.ReplicaID >= 0
-	totalBytes := 0
-	bytesWritten := 0
+func collectData(req *protocol.FetchRequest, m *metadata.Manager, maxBytes int, brokerID int32, modern bool) ([]topicResult, int, bool) {
+	total := 0
+	hasError := false
 	results := make([]topicResult, 0, len(req.Topics))
-
-	for _, reqTopic := range req.Topics {
-		tr := topicResult{id: reqTopic.TopicID, name: reqTopic.TopicName}
-		topic := resolveTopic(reqTopic, metaMgr)
-
-		if topic == nil {
-			tr.unknownTopic = true
-			tr.parts = []partResult{{index: 0, errCode: protocol.ErrUnknownTopicID, hwm: -1, leo: -1}}
-		} else {
-			for _, reqPart := range reqTopic.Partitions {
-				pr := partResult{index: reqPart.PartitionIndex}
-				var partition *metadata.Partition
+	for _, requestedTopic := range req.Topics {
+		tr := topicResult{id: requestedTopic.TopicID, name: requestedTopic.TopicName}
+		topic := resolveTopic(requestedTopic, m)
+		for _, requested := range requestedTopic.Partitions {
+			pr := partResult{index: requested.PartitionIndex, hwm: -1, start: -1}
+			var p *metadata.Partition
+			if topic == nil {
+				pr.errCode = protocol.ErrUnknownTopicOrPartition
+				if modern {
+					pr.errCode = protocol.ErrUnknownTopicID
+				}
+			} else {
 				for i := range topic.Partitions {
-					if topic.Partitions[i].Index == reqPart.PartitionIndex {
-						partition = &topic.Partitions[i]
+					if topic.Partitions[i].Index == requested.PartitionIndex {
+						p = &topic.Partitions[i]
 						break
 					}
 				}
-				if partition == nil {
+				if p == nil {
 					pr.errCode = protocol.ErrUnknownTopicOrPartition
-					pr.hwm = -1
-					pr.leo = -1
+				}
+			}
+			if p != nil {
+				if requested.MaxBytes < 0 || req.MaxBytes < 0 || req.MinBytes < 0 || req.MaxWaitMs < 0 {
+					pr.errCode = protocol.ErrInvalidRequest
 				} else {
-					pr.hwm = partition.HighWatermark
-					pr.leo = partition.LogEndOffset
-					pr.errCode = protocol.ErrNone
-
-					// LeaderEpoch validation — only when requester is tracking epochs (-1 = not tracking)
-					if reqPart.CurrentLeaderEpoch >= 0 {
-						if reqPart.CurrentLeaderEpoch < partition.LeaderEpoch {
-							// Requester (follower or consumer) is behind — stale epoch
-							pr.errCode = protocol.ErrFencedLeaderEpoch
-							tr.parts = append(tr.parts, pr)
-							continue
+					budget := min(max(0, maxBytes-total), int(requested.MaxBytes))
+					result, err := p.FetchRecords(metadata.FetchOptions{
+						BrokerID: brokerID, ReplicaID: req.ReplicaID, LeaderEpoch: requested.CurrentLeaderEpoch,
+						Offset: requested.FetchOffset, MaxBytes: budget, AllowOversizedBatch: modern && total == 0,
+					})
+					pr.hwm, pr.start = result.HighWatermark, result.LogStart
+					if err != nil {
+						pr.errCode = fetchErrorCode(err)
+						if pr.errCode == protocol.ErrUnknownServerError {
+							logger.L.Error("failed to fetch partition", "topic", topic.Name, "partition", requested.PartitionIndex, "err", err)
 						}
-						if !isReplicaFetch && reqPart.CurrentLeaderEpoch > partition.LeaderEpoch {
-							// Consumer thinks a newer election happened — this broker is stale
-							pr.errCode = protocol.ErrNotLeaderOrFollower
-							tr.parts = append(tr.parts, pr)
-							continue
-						}
-					}
-
-					// Determine read limit: LEO for replica fetches, HW for consumers
-					readLimit := partition.HighWatermark
-					if isReplicaFetch {
-						readLimit = partition.LogEndOffset
-					}
-
-					if reqPart.FetchOffset < readLimit && bytesWritten < maxBytes {
-						logDir := partition.LogDirForBroker(localBrokerID)
-						segFile, bytePos, seekErr := partition.SeekToOffset(reqPart.FetchOffset, logDir)
-						if seekErr != nil {
-							logger.L.Error("SeekToOffset failed", "partition", partition.Index, "err", seekErr)
-							pr.errCode = protocol.ErrUnknownServerError
-						} else {
-							records, readErr := metadata.ReadPartitionLogFrom(partition, segFile, bytePos, logDir)
-							if readErr != nil {
-								logger.L.Error("ReadPartitionLogFrom failed", "partition", partition.Index, "err", readErr)
-								pr.errCode = protocol.ErrUnknownServerError
-							} else {
-								remaining := maxBytes - bytesWritten
-								if len(records) > remaining {
-									records = records[:remaining]
-								}
-								pr.records = records
-								bytesWritten += len(records)
-								totalBytes += len(records)
-							}
-						}
+					} else {
+						pr.records = result.Records
+						total += len(pr.records)
 					}
 				}
-				tr.parts = append(tr.parts, pr)
 			}
+			hasError = hasError || pr.errCode != protocol.ErrNone
+			tr.parts = append(tr.parts, pr)
 		}
 		results = append(results, tr)
 	}
-	return results, totalBytes
+	return results, total, hasError
 }
 
-// BuildBody builds a Fetch v16 response, honouring MaxBytes, MinBytes, and MaxWaitMs.
-// After a replica fetch, it updates ReplicaLEO/ReplicaLastSeen and advances HW.
-func BuildBody(req *protocol.FetchRequest, metaMgr *metadata.Manager, localBrokerID ...int32) []byte {
-	maxBytes := int(req.MaxBytes)
-	if maxBytes <= 0 {
-		maxBytes = 1<<31 - 1
+func fetchErrorCode(err error) int16 {
+	switch {
+	case errors.Is(err, metadata.ErrOffsetOutOfRange):
+		return protocol.ErrOffsetOutOfRange
+	case errors.Is(err, metadata.ErrNotLeader):
+		return protocol.ErrNotLeaderOrFollower
+	case errors.Is(err, metadata.ErrFencedEpoch):
+		return protocol.ErrFencedLeaderEpoch
+	case errors.Is(err, metadata.ErrUnknownEpoch):
+		return protocol.ErrUnknownLeaderEpoch
+	case errors.Is(err, metadata.ErrInvalidFetch):
+		return protocol.ErrInvalidRequest
+	default:
+		return protocol.ErrUnknownServerError
 	}
-	minBytes := int(req.MinBytes)
-	if minBytes <= 0 {
-		minBytes = 1
+}
+
+func fetchData(req *protocol.FetchRequest, m *metadata.Manager, brokerID int32, modern bool) []topicResult {
+	maxBytes := int(req.MaxBytes)
+	if !modern {
+		maxBytes = math.MaxInt32 // Fetch v0 has only per-partition byte limits.
 	}
 	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
+	for {
+		topics, total, hasError := collectData(req, m, maxBytes, brokerID, modern)
+		if hasError || total >= int(req.MinBytes) || total >= maxBytes || !time.Now().Before(deadline) {
+			return topics
+		}
+		time.Sleep(min(5*time.Millisecond, time.Until(deadline)))
+	}
+}
 
-	var brokerID int32 = 1
+// BuildBody encodes Fetch v16. The first nonempty batch may exceed the byte
+// budgets to allow progress; later batches and partitions obey the remaining budget.
+func BuildBody(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ...int32) []byte {
+	brokerID := int32(1)
 	if len(localBrokerID) > 0 {
 		brokerID = localBrokerID[0]
 	}
-
-	// Poll until we have at least minBytes of data or the deadline is exceeded.
 	var topics []topicResult
-	var totalBytes int
-	for {
-		topics, totalBytes = collectData(req, metaMgr, maxBytes, brokerID)
-		if totalBytes >= minBytes || !time.Now().Before(deadline) {
-			break
-		}
-		remaining := time.Until(deadline)
-		sleep := 5 * time.Millisecond
-		if sleep > remaining {
-			sleep = remaining
-		}
-		time.Sleep(sleep)
+	errorCode := protocol.ErrNone
+	if req.SessionID != 0 {
+		errorCode = protocol.ErrFetchSessionIDNotFound
+	} else if req.MinBytes < 0 || req.MaxBytes < 0 || req.MaxWaitMs < 0 || req.ReplicaID < -1 {
+		errorCode = protocol.ErrInvalidRequest
+	} else {
+		topics = fetchData(req, m, brokerID, true)
 	}
-
-	// For replica fetches, update the replica's tracked state on the leader side.
-	if req.ReplicaID >= 0 {
-		updateReplicaState(req, topics, metaMgr)
-	}
-
-	encoder := protocol.NewEncoder()
-	encoder.WriteInt32(0)                                // throttle_time_ms
-	encoder.WriteInt16(protocol.ErrNone)                 // error_code
-	encoder.WriteInt32(req.SessionID)                    // session_id
-	encoder.WriteUnsignedVarint(uint64(len(topics) + 1)) // responses COMPACT_ARRAY
-
-	for _, tr := range topics {
-		encoder.WriteUUID(tr.id)
-
-		if tr.unknownTopic {
-			encoder.WriteUnsignedVarint(2) // 1 partition + 1
-			encoder.WriteInt32(0)
-			encoder.WriteInt16(protocol.ErrUnknownTopicID)
-			encoder.WriteInt64(-1)  // high_watermark
-			encoder.WriteInt64(-1)  // last_stable_offset
-			encoder.WriteInt64(-1)  // log_start_offset
-			encoder.WriteByte(0x00) // aborted_transactions null
-			encoder.WriteInt32(-1)  // preferred_read_replica
-			encoder.WriteByte(0x00) // records null
-			encoder.WriteTagBuffer()
-		} else {
-			encoder.WriteUnsignedVarint(uint64(len(tr.parts) + 1))
-			for _, pr := range tr.parts {
-				encoder.WriteInt32(pr.index)
-				encoder.WriteInt16(pr.errCode)
-				encoder.WriteInt64(pr.hwm) // high_watermark
-				if pr.errCode != protocol.ErrNone {
-					encoder.WriteInt64(-1)  // last_stable_offset
-					encoder.WriteInt64(-1)  // log_start_offset
-					encoder.WriteByte(0x00) // aborted_transactions null
-					encoder.WriteInt32(-1)  // preferred_read_replica
-					encoder.WriteByte(0x00) // records null
-				} else {
-					encoder.WriteInt64(pr.hwm) // last_stable_offset
-					encoder.WriteInt64(0)      // log_start_offset
-					encoder.WriteByte(0x00)    // aborted_transactions null
-					encoder.WriteInt32(-1)     // preferred_read_replica
-					if len(pr.records) == 0 {
-						encoder.WriteByte(0x00)
-					} else {
-						encoder.WriteCompactBytes(pr.records)
-					}
-				}
-				encoder.WriteTagBuffer()
+	e := protocol.NewEncoder()
+	e.WriteInt32(0)
+	e.WriteInt16(errorCode)
+	e.WriteInt32(0) // Stateless fetch: do not claim an incremental session.
+	e.WriteUnsignedVarint(uint64(len(topics) + 1))
+	for _, topic := range topics {
+		e.WriteUUID(topic.id)
+		e.WriteUnsignedVarint(uint64(len(topic.parts) + 1))
+		for _, part := range topic.parts {
+			e.WriteInt32(part.index)
+			e.WriteInt16(part.errCode)
+			e.WriteInt64(part.hwm)
+			if part.errCode == protocol.ErrNone {
+				e.WriteInt64(part.hwm) // No transactional batches are accepted.
+				e.WriteInt64(part.start)
+			} else {
+				e.WriteInt64(-1)
+				e.WriteInt64(-1)
 			}
+			e.WriteByte(0) // aborted transactions
+			e.WriteInt32(-1)
+			if len(part.records) == 0 {
+				e.WriteByte(0)
+			} else {
+				e.WriteCompactBytes(part.records)
+			}
+			e.WriteTagBuffer()
 		}
-		encoder.WriteTagBuffer()
+		e.WriteTagBuffer()
 	}
-
-	encoder.WriteTagBuffer()
-	return encoder.Bytes()
+	e.WriteTagBuffer()
+	return e.Bytes()
 }
 
-// BuildBodyV0 builds a Fetch v0 response (non-flexible, used for inter-broker replication).
-// Format: [TopicName(STRING), Partitions(ARRAY[Index(INT32), ErrorCode(INT16), HW(INT64), RecordSet(BYTES)])]
-func BuildBodyV0(req *protocol.FetchRequest, metaMgr *metadata.Manager, localBrokerID ...int32) []byte {
-	maxBytes := int(req.MaxBytes)
-	if maxBytes <= 0 {
-		maxBytes = 1<<31 - 1
-	}
-	minBytes := int(req.MinBytes)
-	if minBytes <= 0 {
-		minBytes = 1
-	}
-	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
-
-	var brokerID int32 = 1
+// BuildBodyV0 returns complete batches within strict per-partition byte limits.
+func BuildBodyV0(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ...int32) []byte {
+	brokerID := int32(1)
 	if len(localBrokerID) > 0 {
 		brokerID = localBrokerID[0]
 	}
-
-	var topics []topicResult
-	var totalBytes int
-	for {
-		topics, totalBytes = collectData(req, metaMgr, maxBytes, brokerID)
-		if totalBytes >= minBytes || !time.Now().Before(deadline) {
-			break
-		}
-		remaining := time.Until(deadline)
-		sleep := 5 * time.Millisecond
-		if sleep > remaining {
-			sleep = remaining
-		}
-		time.Sleep(sleep)
-	}
-
-	if req.ReplicaID >= 0 {
-		updateReplicaState(req, topics, metaMgr)
-	}
-
-	encoder := protocol.NewEncoder()
-	// v0 response: ARRAY of topic responses
-	encoder.WriteArrayLen(len(topics))
-	for _, tr := range topics {
-		encoder.WriteString(tr.name)
-		encoder.WriteArrayLen(len(tr.parts))
-		for _, pr := range tr.parts {
-			encoder.WriteInt32(pr.index)
-			encoder.WriteInt16(pr.errCode)
-			encoder.WriteInt64(pr.hwm)
-			encoder.WriteBytes(pr.records) // BYTES (INT32-length-prefixed)
+	topics := fetchData(req, m, brokerID, false)
+	e := protocol.NewEncoder()
+	e.WriteArrayLen(len(topics))
+	for _, topic := range topics {
+		e.WriteString(topic.name)
+		e.WriteArrayLen(len(topic.parts))
+		for _, part := range topic.parts {
+			e.WriteInt32(part.index)
+			e.WriteInt16(part.errCode)
+			e.WriteInt64(part.hwm)
+			e.WriteBytes(part.records)
 		}
 	}
-	return encoder.Bytes()
-}
-
-// updateReplicaState records the replica's fetch progress on the leader and advances HW.
-func updateReplicaState(req *protocol.FetchRequest, topics []topicResult, metaMgr *metadata.Manager) {
-	nowMs := time.Now().UnixMilli()
-	for _, tr := range topics {
-		topic := resolveTopic(protocol.FetchTopic{TopicID: tr.id, TopicName: tr.name}, metaMgr)
-		if topic == nil {
-			continue
-		}
-		for _, pr := range tr.parts {
-			if pr.errCode != protocol.ErrNone {
-				continue
-			}
-			for i := range topic.Partitions {
-				p := &topic.Partitions[i]
-				if p.Index != pr.index {
-					continue
-				}
-				// The replica has fetched up to pr.leo (the partition's LEO at fetch time).
-				// If it sent records, we assume it will apply them and its LEO will be pr.leo.
-				p.UpdateReplicaState(req.ReplicaID, pr.leo, nowMs)
-				p.RunUnderLock(func() {
-					p.AdvanceHighWatermark()
-				})
-				break
-			}
-		}
-	}
+	return e.Bytes()
 }

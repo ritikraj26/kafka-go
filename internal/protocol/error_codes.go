@@ -3,6 +3,7 @@ package protocol
 // Kafka error codes returned in response headers and bodies.
 const (
 	ErrNone                        int16 = 0
+	ErrOffsetOutOfRange            int16 = 1
 	ErrUnknownServerError          int16 = -1
 	ErrCorruptMessage              int16 = 2
 	ErrUnknownTopicOrPartition     int16 = 3
@@ -17,8 +18,10 @@ const (
 	ErrInvalidRequest              int16 = 42
 	ErrUnsupportedForMessageFormat int16 = 43
 	ErrUnsupportedCompressionType  int16 = 76
+	ErrFetchSessionIDNotFound      int16 = 70
 	ErrMemberIDRequired            int16 = 79
 	ErrGroupMaxSizeReached         int16 = 81
 	ErrUnknownTopicID              int16 = 100
 	ErrFencedLeaderEpoch           int16 = 74
+	ErrUnknownLeaderEpoch          int16 = 75
 )

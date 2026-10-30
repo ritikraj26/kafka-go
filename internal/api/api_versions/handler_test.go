@@ -39,6 +39,13 @@ func TestBuildBody_NoError(t *testing.T) {
 	pos := 3
 	for i := 0; i < numAPIs && pos+6 < len(body); i++ {
 		key := int16(binary.BigEndian.Uint16(body[pos : pos+2]))
+		if key == 1 {
+			min := binary.BigEndian.Uint16(body[pos+2 : pos+4])
+			max := binary.BigEndian.Uint16(body[pos+4 : pos+6])
+			if min != 16 || max != 16 {
+				t.Fatalf("Fetch advertised unsupported range %d-%d", min, max)
+			}
+		}
 		if _, ok := expectedKeys[key]; ok {
 			expectedKeys[key] = true
 		}

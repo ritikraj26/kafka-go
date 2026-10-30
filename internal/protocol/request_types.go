@@ -64,6 +64,7 @@ type FetchTopic struct {
 type FetchPartition struct {
 	PartitionIndex     int32
 	FetchOffset        int64
+	MaxBytes           int32
 	CurrentLeaderEpoch int32 // -1 means requester is not tracking epochs (Fetch v0 / old clients)
 }
 
@@ -434,6 +435,9 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 // Fetch v0 layout: ReplicaID(INT32), MaxWaitMs(INT32), MinBytes(INT32),
 // Topics(ARRAY[TopicName(STRING), Partitions(ARRAY[Partition(INT32), FetchOffset(INT64), MaxBytes(INT32)])])
 func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
+	if header.GetAPIVersion() != 0 {
+		return nil, fmt.Errorf("unsupported legacy Fetch version %d", header.GetAPIVersion())
+	}
 	decoder := NewDecoder(header.GetBody())
 
 	// Skip client_id (STRING) in the v0 request header
@@ -473,6 +477,9 @@ func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
 		if err != nil {
 			return nil, fmt.Errorf("v0 fetch: failed to read partitions array len: %w", err)
 		}
+		if numPartitions < 0 {
+			return nil, fmt.Errorf("v0 fetch: negative partition count")
+		}
 
 		var partitions []FetchPartition
 		for j := int32(0); j < numPartitions; j++ {
@@ -484,14 +491,17 @@ func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
 			if err != nil {
 				return nil, fmt.Errorf("v0 fetch: failed to read fetch_offset: %w", err)
 			}
-			// max_bytes per partition (INT32) — skip
-			_, err = decoder.ReadInt32()
+			partitionMaxBytes, err := decoder.ReadInt32()
 			if err != nil {
 				return nil, fmt.Errorf("v0 fetch: failed to read partition max_bytes: %w", err)
+			}
+			if partitionMaxBytes < 0 {
+				return nil, fmt.Errorf("v0 fetch: negative partition byte limit")
 			}
 			partitions = append(partitions, FetchPartition{
 				PartitionIndex:     partIdx,
 				FetchOffset:        fetchOffset,
+				MaxBytes:           partitionMaxBytes,
 				CurrentLeaderEpoch: -1, // Fetch v0 has no epoch field
 			})
 		}
@@ -504,6 +514,9 @@ func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
 		topics = append(topics, ft)
 	}
 
+	if replicaID < -1 || maxWaitMs < 0 || minBytes < 0 || numTopics < 0 || decoder.Remaining() != 0 {
+		return nil, fmt.Errorf("invalid Fetch v0 request limits or trailing data")
+	}
 	return &FetchRequest{
 		Header:    header,
 		ReplicaID: replicaID,
@@ -515,40 +528,18 @@ func ParseFetchRequestV0(header *RequestHeader) (*FetchRequest, error) {
 
 // ParseFetchRequest parses a Fetch request (v16)
 func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
+	if header.GetAPIVersion() != 16 {
+		return nil, fmt.Errorf("unsupported Fetch version %d", header.GetAPIVersion())
+	}
 	decoder := NewDecoder(header.GetBody())
 
-	// Fetch v16 uses flexible request format (KIP-482)
-	// First, parse the flexible request header fields
-
-	// 1. Read cursor field - nullable byte (0x00 = null/no cursor)
-	cursorByte, err := decoder.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read cursor: %w", err)
+	// Even flexible request headers use an INT16-length nullable client ID.
+	if _, err := decoder.ReadString(); err != nil {
+		return nil, fmt.Errorf("fetch client ID: %w", err)
 	}
-	_ = cursorByte
-
-	// 2. Read client software identifier - simple length-prefixed string
-	lengthByte, err := decoder.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read client software length: %w", err)
+	if err := decoder.ReadTaggedFields(nil); err != nil {
+		return nil, fmt.Errorf("fetch header tags: %w", err)
 	}
-
-	// Read the client software name bytes
-	clientBytes := make([]byte, lengthByte)
-	for i := 0; i < int(lengthByte); i++ {
-		b, err := decoder.ReadByte()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read client software byte %d: %w", i, err)
-		}
-		clientBytes[i] = b
-	}
-
-	// 3. Read TAG_BUFFER for flexible request header
-	tagBuffer, err := decoder.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read header TAG_BUFFER: %w", err)
-	}
-	_ = tagBuffer
 
 	// Now parse the actual Fetch v16 request fields
 
@@ -571,7 +562,7 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 	}
 
 	// isolation_level (INT8)
-	_, err = decoder.ReadByte()
+	isolation, err := decoder.ReadByte()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read isolation_level: %w", err)
 	}
@@ -648,14 +639,16 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 						return nil, fmt.Errorf("failed to read log_start_offset: %w", err)
 					}
 
-					// partition_max_bytes (INT32)
-					_, err = decoder.ReadInt32()
+					partitionMaxBytes, err := decoder.ReadInt32()
 					if err != nil {
 						return nil, fmt.Errorf("failed to read partition_max_bytes: %w", err)
 					}
+					if partitionMaxBytes < 0 {
+						return nil, fmt.Errorf("negative partition byte limit")
+					}
 
 					// TAG_BUFFER for partition
-					_, err = decoder.ReadByte()
+					err = decoder.ReadTaggedFields(nil)
 					if err != nil {
 						return nil, fmt.Errorf("failed to read partition TAG_BUFFER: %w", err)
 					}
@@ -663,6 +656,7 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 					partitions = append(partitions, FetchPartition{
 						PartitionIndex:     partitionIndex,
 						FetchOffset:        fetchOffset,
+						MaxBytes:           partitionMaxBytes,
 						CurrentLeaderEpoch: currentLeaderEpoch,
 					})
 				}
@@ -678,7 +672,7 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 			})
 
 			// TAG_BUFFER for topic
-			_, err = decoder.ReadByte()
+			err = decoder.ReadTaggedFields(nil)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read topic TAG_BUFFER: %w", err)
 			}
@@ -716,7 +710,7 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 				}
 			}
 			// TAG_BUFFER for forgotten topic
-			_, err = decoder.ReadByte()
+			err = decoder.ReadTaggedFields(nil)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read forgotten topic TAG_BUFFER: %w", err)
 			}
@@ -729,14 +723,38 @@ func ParseFetchRequest(header *RequestHeader) (*FetchRequest, error) {
 		return nil, fmt.Errorf("failed to read rack_id: %w", err)
 	}
 
-	// TAG_BUFFER for request
-	_, err = decoder.ReadByte()
+	replicaID := int32(-1)
+	err = decoder.ReadTaggedFields(func(tag uint32, data []byte) error {
+		if tag != 1 {
+			return nil
+		}
+		state := NewDecoder(data)
+		id, err := state.ReadInt32()
+		if err != nil {
+			return err
+		}
+		if _, err := state.ReadInt64(); err != nil { // replica epoch
+			return err
+		}
+		if err := state.ReadTaggedFields(nil); err != nil {
+			return err
+		}
+		if state.Remaining() != 0 || id < -1 {
+			return fmt.Errorf("invalid Fetch replica state")
+		}
+		replicaID = id
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request TAG_BUFFER: %w", err)
 	}
 
+	if maxWaitMs < 0 || minBytes < 0 || maxBytes < 0 || isolation > 1 || decoder.Remaining() != 0 {
+		return nil, fmt.Errorf("invalid Fetch v16 limits, isolation level or trailing data")
+	}
 	return &FetchRequest{
 		Header:       header,
+		ReplicaID:    replicaID,
 		MaxWaitMs:    maxWaitMs,
 		MinBytes:     minBytes,
 		MaxBytes:     maxBytes,

@@ -45,6 +45,7 @@ type Partition struct {
 	mu            sync.Mutex
 	hwCond        *sync.Cond // signalled when HighWatermark advances
 	appendErr     error      // Fence leader writes after an ambiguous disk failure
+	replicaErrors map[int32]error
 
 	// Per-replica LEO for replication (broker_id -> LEO)
 	ReplicaLEO      map[int32]int64
@@ -258,40 +259,8 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 		}
 	}
 
-	// Binary-search the chosen segment's index file.
-	indexFile := filepath.Join(dir, strings.TrimSuffix(chosen.name, ".log")+".index")
-	data, err := os.ReadFile(indexFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return chosen.name, 0, nil
-		}
-		return "", 0, err
-	}
-
-	const entrySize = 8
-	if len(data)%entrySize != 0 {
-		return "", 0, fmt.Errorf("incomplete offset index: %s", indexFile)
-	}
-	numEntries := len(data) / entrySize
-	if numEntries == 0 {
-		return chosen.name, 0, nil
-	}
-
-	// Binary search for largest relativeOffset <= targetOffset
-	lo, hi := 0, numEntries-1
-	result := int64(0)
-	for lo <= hi {
-		mid := (lo + hi) / 2
-		relOff := int64(binary.BigEndian.Uint32(data[mid*entrySize : mid*entrySize+4]))
-		filePos := int64(binary.BigEndian.Uint32(data[mid*entrySize+4 : mid*entrySize+8]))
-		if relOff <= targetOffset-chosen.baseOffset {
-			result = filePos
-			lo = mid + 1
-		} else {
-			hi = mid - 1
-		}
-	}
-	return chosen.name, result, nil
+	position, _, err := indexPosition(dir, chosen, targetOffset)
+	return chosen.name, position, err
 }
 
 // AppendReplicaRecords writes fetched record data to a follower's log directory.
@@ -302,23 +271,30 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 func (p *Partition) AppendReplicaRecords(records []byte, replicaLogDir string, replicaLEO int64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	_, err := p.appendReplicaRecords(records, replicaLogDir, replicaLEO)
+	return err
+}
 
+func (p *Partition) appendReplicaRecords(records []byte, replicaLogDir string, replicaLEO int64) (int64, error) {
 	if len(records) == 0 {
-		return nil
+		return replicaLEO, nil
 	}
 	batches, err := storage.ParseRecordBatches(records)
 	if err != nil {
-		return err
+		return replicaLEO, err
 	}
 	next := replicaLEO
 	for _, batch := range batches {
 		if batch.BaseOffset != next || next < 0 || next > math.MaxInt64-int64(batch.RecordsCount) {
-			return fmt.Errorf("%w: unexpected replica offset %d, want %d", storage.ErrCorruptRecord, batch.BaseOffset, next)
+			return replicaLEO, fmt.Errorf("%w: unexpected replica offset %d, want %d", storage.ErrCorruptRecord, batch.BaseOffset, next)
 		}
 		next += int64(batch.RecordsCount)
 	}
 	_, _, err = writeRecords(replicaLogDir, records, replicaLEO, next-1)
-	return err
+	if err != nil {
+		return replicaLEO, err
+	}
+	return next, nil
 }
 
 // AdvanceHighWatermark recalculates HW as min(LEO) across all ISR replicas.

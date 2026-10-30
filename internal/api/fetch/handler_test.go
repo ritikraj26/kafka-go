@@ -2,12 +2,11 @@ package fetch
 
 import (
 	"encoding/binary"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/storage"
 	"github.com/ritiraj/kafka-go/internal/testutil"
 )
 
@@ -81,7 +80,6 @@ func TestBuildBody_UnknownTopic(t *testing.T) {
 
 func TestBuildBody_KnownTopicWithRecords(t *testing.T) {
 	metaMgr := testutil.NewMetadataManager(t)
-	dir := t.TempDir()
 
 	topic := testutil.CreateTopic(t, metaMgr, "events", 1)
 
@@ -89,15 +87,17 @@ func TestBuildBody_KnownTopicWithRecords(t *testing.T) {
 	var topicIDBytes [16]byte
 	copy(topicIDBytes[:], topicID[:])
 
-	partDir := filepath.Join(dir, "events-0")
-	os.MkdirAll(partDir, 0755)
-	logData := []byte{0xCA, 0xFE, 0xBA, 0xBE}
-	os.WriteFile(filepath.Join(partDir, "00000000000000000000.log"), logData, 0644)
-
-	topic.Partitions[0].BrokerLogDirs[topic.Partitions[0].LeaderID] = partDir
-	topic.Partitions[0].NextOffset = 1
+	logData, err := storage.EncodeRecordBatch(0, []storage.Record{{Value: []byte("record")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &topic.Partitions[0]
+	if _, err := p.AppendRecords(logData, p.LogDirForBroker(1)); err != nil {
+		t.Fatal(err)
+	}
 
 	req := &protocol.FetchRequest{
+		ReplicaID:    -1,
 		MaxWaitMs:    0,
 		MinBytes:     1,
 		MaxBytes:     1 << 20,
@@ -106,7 +106,7 @@ func TestBuildBody_KnownTopicWithRecords(t *testing.T) {
 		Topics: []protocol.FetchTopic{
 			{
 				TopicID:    topicIDBytes,
-				Partitions: []protocol.FetchPartition{{PartitionIndex: 0, FetchOffset: 0}},
+				Partitions: []protocol.FetchPartition{{PartitionIndex: 0, FetchOffset: 0, MaxBytes: 1 << 20}},
 			},
 		},
 	}
@@ -186,7 +186,7 @@ func TestBuildBody_EpochTooNew(t *testing.T) {
 		MaxBytes:     1 << 20,
 		SessionID:    0,
 		SessionEpoch: -1,
-		ReplicaID:    -1, // consumer — too-new check only fires for consumers
+		ReplicaID:    -1,
 		Topics: []protocol.FetchTopic{
 			{
 				TopicID: topicIDBytes,
@@ -199,7 +199,7 @@ func TestBuildBody_EpochTooNew(t *testing.T) {
 
 	body := BuildBody(req, metaMgr)
 	got := partitionErrCode(t, body)
-	if got != protocol.ErrNotLeaderOrFollower {
-		t.Errorf("partition error_code = %d, want %d (ErrNotLeaderOrFollower)", got, protocol.ErrNotLeaderOrFollower)
+	if got != protocol.ErrUnknownLeaderEpoch {
+		t.Errorf("partition error_code = %d, want %d (ErrUnknownLeaderEpoch)", got, protocol.ErrUnknownLeaderEpoch)
 	}
 }

@@ -15,19 +15,19 @@ type APIVersion struct {
 // return the list of APIs supported by this broker
 func getSupportedAPIs() []APIVersion {
 	return []APIVersion{
-		{18, 0, 4}, // ApiVersions
-		{75, 0, 0}, // DescribeTopicPartitions
-		{1, 0, 16}, // Fetch
-		{0, 0, 11}, // Produce
-		{3, 0, 12}, // Metadata
-		{2, 0, 1},  // ListOffsets
-		{8, 0, 2},  // OffsetCommit
-		{9, 0, 1},  // OffsetFetch
-		{10, 0, 0}, // FindCoordinator
-		{11, 0, 0}, // JoinGroup
-		{12, 0, 0}, // Heartbeat
-		{13, 0, 0}, // LeaveGroup
-		{14, 0, 0}, // SyncGroup
+		{18, 0, 4},  // ApiVersions
+		{75, 0, 0},  // DescribeTopicPartitions
+		{1, 16, 16}, // Fetch; legacy v0 is accepted for the internal follower
+		{0, 0, 11},  // Produce
+		{3, 0, 12},  // Metadata
+		{2, 0, 1},   // ListOffsets
+		{8, 0, 2},   // OffsetCommit
+		{9, 0, 1},   // OffsetFetch
+		{10, 0, 0},  // FindCoordinator
+		{11, 0, 0},  // JoinGroup
+		{12, 0, 0},  // Heartbeat
+		{13, 0, 0},  // LeaveGroup
+		{14, 0, 0},  // SyncGroup
 	}
 }
 

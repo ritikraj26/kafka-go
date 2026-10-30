@@ -2,7 +2,9 @@ package protocol
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
+	"math"
 )
 
 // Decoder provides BigEndian binary read helpers for parsing Kafka request buffers.
@@ -31,7 +33,7 @@ func (d *Decoder) ReadCompactString() (string, error) {
 	}
 
 	strLen := length - 1 // compact encoding is length+1
-	if d.pos+int(strLen) > len(d.data) {
+	if strLen > uint64(d.Remaining()) {
 		return "", io.ErrUnexpectedEOF
 	}
 
@@ -95,7 +97,7 @@ func (d *Decoder) ReadCompactNullableString() (*string, error) {
 	}
 
 	strLen := length - 1 // compact encoding is length+1
-	if d.pos+int(strLen) > len(d.data) {
+	if strLen > uint64(d.Remaining()) {
 		return nil, io.ErrUnexpectedEOF
 	}
 
@@ -117,7 +119,7 @@ func (d *Decoder) ReadCompactBytes() ([]byte, error) {
 	}
 
 	bytesLen := length - 1 // compact encoding is length+1
-	if d.pos+int(bytesLen) > len(d.data) {
+	if bytesLen > uint64(d.Remaining()) {
 		return nil, io.ErrUnexpectedEOF
 	}
 
@@ -129,25 +131,53 @@ func (d *Decoder) ReadCompactBytes() ([]byte, error) {
 
 // ReadUnsignedVarint reads an unsigned varint
 func (d *Decoder) ReadUnsignedVarint() (uint64, error) {
-	var value uint64
-	var shift uint
-
-	for {
-		if d.pos >= len(d.data) {
-			return 0, io.ErrUnexpectedEOF
-		}
-
-		b := d.data[d.pos]
-		d.pos++
-
-		value |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
+	value, n := binary.Uvarint(d.data[d.pos:])
+	if n == 0 {
+		return 0, io.ErrUnexpectedEOF
 	}
-
+	if n < 0 {
+		return 0, fmt.Errorf("unsigned varint overflow")
+	}
+	d.pos += n
 	return value, nil
+}
+
+// ReadTaggedFields validates the tag envelope and skips unknown fields without
+// allocating. A visitor can decode known tags from their bounded byte slices.
+func (d *Decoder) ReadTaggedFields(visit func(uint32, []byte) error) error {
+	count, err := d.ReadUnsignedVarint()
+	if err != nil {
+		return err
+	}
+	if count > uint64(d.Remaining()/2) {
+		return fmt.Errorf("tag count exceeds remaining bytes")
+	}
+	var previous uint64
+	for i := uint64(0); i < count; i++ {
+		tag, err := d.ReadUnsignedVarint()
+		if err != nil {
+			return err
+		}
+		if tag > math.MaxUint32 || (i > 0 && tag <= previous) {
+			return fmt.Errorf("invalid or unordered tag ID")
+		}
+		size, err := d.ReadUnsignedVarint()
+		if err != nil {
+			return err
+		}
+		if size > math.MaxUint32 || size > uint64(d.Remaining()) {
+			return io.ErrUnexpectedEOF
+		}
+		data := d.data[d.pos : d.pos+int(size)]
+		d.pos += int(size)
+		if visit != nil {
+			if err := visit(uint32(tag), data); err != nil {
+				return err
+			}
+		}
+		previous = tag
+	}
+	return nil
 }
 
 // ReadInt16 reads a 16-bit integer

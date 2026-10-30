@@ -12,6 +12,7 @@ import (
 	"github.com/ritiraj/kafka-go/internal/logger"
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/protocol"
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 // Timing constants for follower replication.
@@ -45,6 +46,8 @@ type partInfo struct {
 	topic     *metadata.Topic
 	partition *metadata.Partition
 	leo       int64
+	leaderID  int32
+	epoch     int32
 }
 
 // NewFollowerManager creates a new follower manager.
@@ -142,32 +145,25 @@ func (fm *FollowerManager) replicateAll() {
 		}
 		for i := range topic.Partitions {
 			p := &topic.Partitions[i]
-			if p.LeaderID == fm.localID {
+			leader, epoch, leo, assigned := p.ReplicaPosition(fm.localID)
+			if leader == fm.localID {
 				continue // we are the leader, nothing to fetch
 			}
-			// Check if this broker is a replica
-			isReplica := false
-			for _, r := range p.ReplicaNodes {
-				if r == fm.localID {
-					isReplica = true
-					break
-				}
-			}
-			if !isReplica {
+			if !assigned {
 				continue
 			}
-			// Use this broker's own LEO as the fetch offset (not the leader's LEO).
-			// ReplicaLEO is set by the leader's fetch handler after each successful fetch.
-			// Initially 0 — follower starts replicating from the beginning.
-			leo := p.GetReplicaLEO(fm.localID)
-			leaderParts[p.LeaderID] = append(leaderParts[p.LeaderID], partInfo{
-				topic: topic, partition: p, leo: leo,
+			leaderParts[leader] = append(leaderParts[leader], partInfo{
+				topic: topic, partition: p, leo: leo, leaderID: leader, epoch: epoch,
 			})
 		}
 	}
 
 	for leaderID, parts := range leaderParts {
-		fm.fetchFromLeader(leaderID, parts)
+		// v0 has no whole-response byte budget. One partition per request bounds
+		// allocation while allowing any supported batch to fit its strict limit.
+		for i := range parts {
+			fm.fetchFromLeader(leaderID, parts[i:i+1])
+		}
 	}
 }
 
@@ -199,7 +195,7 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 		fm.dropConn(leaderID)
 		return
 	}
-	if msgSize <= 0 || msgSize > 100*1024*1024 {
+	if msgSize < 4 || msgSize > storage.MaxRecordBatchBytes+1024*1024 {
 		logger.L.Warn("follower: invalid msg_size", "leader", leaderID, "size", msgSize)
 		fm.dropConn(leaderID)
 		return
@@ -208,6 +204,11 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 	respBuf := make([]byte, msgSize)
 	if _, err := io.ReadFull(conn, respBuf); err != nil {
 		logger.L.Warn("follower: read response failed", "leader", leaderID, "err", err)
+		fm.dropConn(leaderID)
+		return
+	}
+	if int32(binary.BigEndian.Uint32(respBuf[:4])) != corrID {
+		logger.L.Warn("follower: correlation ID mismatch", "leader", leaderID)
 		fm.dropConn(leaderID)
 		return
 	}
@@ -265,7 +266,7 @@ func (fm *FollowerManager) encodeFetchV0(correlationID int32, parts []partInfo) 
 		for _, pp := range tg.parts {
 			enc.WriteInt32(pp.index)  // partition
 			enc.WriteInt64(pp.offset) // fetch_offset
-			enc.WriteInt32(1 << 20)   // max_bytes per partition (1MB)
+			enc.WriteInt32(storage.MaxRecordBatchBytes)
 		}
 	}
 
@@ -313,18 +314,22 @@ func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) 
 		for j := int32(0); j < numPartitions; j++ {
 			partIdx, err := dec.ReadInt32()
 			if err != nil {
+				logger.L.Warn("follower: decode partition failed", "err", err)
 				return
 			}
 			errCode, err := dec.ReadInt16()
 			if err != nil {
+				logger.L.Warn("follower: decode error code failed", "err", err)
 				return
 			}
 			_, err = dec.ReadInt64() // high_watermark
 			if err != nil {
+				logger.L.Warn("follower: decode watermark failed", "err", err)
 				return
 			}
 			recordSet, err := dec.ReadBytes()
 			if err != nil {
+				logger.L.Warn("follower: decode record set failed", "err", err)
 				return
 			}
 
@@ -341,8 +346,7 @@ func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) 
 			// Find the matching partition to write records
 			for _, p := range parts {
 				if p.topic.Name == topicName && p.partition.Index == partIdx {
-					replicaLogDir := p.partition.LogDirForBroker(fm.localID)
-					if writeErr := p.partition.AppendReplicaRecords(recordSet, replicaLogDir, p.leo); writeErr != nil {
+					if writeErr := p.partition.AppendFetchedRecords(fm.localID, p.leaderID, p.epoch, p.leo, recordSet); writeErr != nil {
 						logger.L.Error("follower: write records failed",
 							"topic", topicName, "partition", partIdx, "err", writeErr)
 					} else {
