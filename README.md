@@ -58,6 +58,7 @@ internal/
 ├── coordinator/
 │   ├── group.go             Consumer group state machine (Empty→Joining→AwaitingSync→Stable)
 │   ├── coordinator.go       Coordinator facade: join/sync/heartbeat/leave
+│   ├── lifecycle.go         Cancellation cleanup and tracked timer shutdown
 │   └── offsets.go           Checksummed commit log, durable publication, fail-closed replay
 ├── broker/
 │   └── broker.go            Broker registry for simulated multi-broker cluster
@@ -98,7 +99,7 @@ internal/
 - **Leader election** — Simple ISR-based leader election; persists the new leader and epoch before publishing them in memory
 - **Offset recovery** — Validates every saved replica log, restores record-based LEOs, verifies followers are byte-identical prefixes of the saved leader, and initially derives HW from all assigned replicas. Corrupt, incomplete, noncontiguous, or divergent logs cause startup to fail without truncating data.
 - **Concurrency** — Goroutine-per-connection with `sync.RWMutex` on metadata and per-partition mutex on writes
-- **Graceful shutdown** — `SIGINT`/`SIGTERM` handling via `signal.NotifyContext`; listener close + `WaitGroup` drain
+- **Coordinated shutdown** — Cancels listeners, active sockets, replication/group/fetch waits, follower dials, controller probes, and HTTP inference; joins request handlers, workers, and coordinator timer callbacks
 - **Size guards** — 100 MB maximum request frame and record batch size; aggregate connection/memory limits remain future work
 - **AI schema inference** — First message to a topic triggers schema inference via local Ollama (falls back to JSON type detection)
 - **Dead-letter queue** — Rejected values are encoded as checksummed Kafka batches in `{topic}.dlq`; a DLQ write failure is reported to the producer. Successful routing remains transparent to the producer.
@@ -361,6 +362,52 @@ records. There is no idempotent-producer or exactly-once guarantee. Acknowledged
 runtime replication is also not a substitute for persisted commit/ISR state,
 independent failure domains, safe divergent-log recovery, or broker authentication.
 
+### Startup, cancellation, and resource ownership
+
+Startup validates configuration and recovers storage before serving requests.
+It binds **all** configured broker listeners before starting their accept loops
+or background workers. If any bind fails, already-reserved listeners are closed
+and startup returns a nonzero exit status. An unexpected accept failure stops the
+runtime rather than spinning or leaving a partially running cluster.
+
+Each broker listens on its registered port (`9092 + broker ID - 1`); selecting a
+different `BROKER_ID` does not create a second listener on 9092. Integer settings
+are validated instead of silently falling back: broker ID must exist, replication
+factor must fit the configured broker count, and timing values must be positive.
+A missing/unreadable explicitly supplied properties file is a startup error.
+
+On SIGINT/SIGTERM, the runtime immediately:
+
+1. Cancels its root context and closes listeners and active client connections.
+2. Releases produce replication waits, fetch long polls, and pending group joins
+   and syncs, without waiting for client-controlled timeouts.
+3. Cancels follower dial/read/write operations and controller health probes.
+4. Stops admission of schema inference, cancels its HTTP requests, and joins the
+   inference workers. Inference responses are bounded to 1 MiB.
+5. Closes the coordinator, releases pending channels, stops session/rebalance
+   timers, and waits for callbacks that were already running.
+6. Waits for every listener handler and background worker before returning.
+
+Read and response-write deadlines are both 30 seconds. Shutdown closes sockets
+immediately rather than waiting for those deadlines. Ordinary client disconnects
+are detected during socket I/O; disconnecting while a handler is waiting is not
+an instantaneous cancellation signal. Request-specific timeouts still apply
+during normal operation.
+
+This is **not a hard wall-clock shutdown guarantee**: filesystem operations,
+recovery scans, or a mutex held by an in-progress disk operation cannot be forcibly
+interrupted safely. An append/fsync already in progress is allowed to finish, and
+its response may be lost during shutdown. The lifecycle tests verify prompt
+cancellation with responsive local storage and separately verify that an
+in-progress durable offset commit is not discarded.
+
+For embedded use, `Serve` owns its listener and accepted connections but does
+not own a shared coordinator or metadata manager. The caller must handle returned
+errors, cancel and join all servers/workers, call `Coordinator.Close()`, and call
+`Manager.Schemas.Close()`. Context-aware API variants should be used for cancellable
+requests; legacy direct-call wrappers intentionally use a background context.
+Worker `Start` methods reject invalid intervals and repeated starts.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -370,6 +417,7 @@ independent failure domains, safe divergent-log recovery, or broker authenticati
 | `NUM_BROKERS` | `3` | Number of simulated brokers in the cluster |
 | `REPLICATION_FACTOR` | `3` | Replica count for new topics; must not exceed configured brokers |
 | `MIN_INSYNC_REPLICAS` | `2` | Minimum ISR for `acks=-1`; explicitly use `1` for single-copy acknowledgements |
+| `REPLICA_LAG_TIME_MAX_MS` | `10000` | Positive lag timeout for ISR maintenance |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint for schema inference |
 | `OLLAMA_MODEL` | `llama3.2` | LLM model for schema inference |
 
@@ -412,6 +460,9 @@ go test ./internal/protocol -run='^$' -fuzz=FuzzRequestDispatch -fuzztime=30s
 # Offset disk-failure injection and independent-client broker-process restart
 go test -race ./internal/coordinator ./internal/api/offset_commit ./internal/api/offset_fetch ./internal/network ./app
 go test ./internal/coordinator -run='^$' -fuzz=FuzzOffsetLogReplay -fuzztime=30s
+
+# Cancellation, timer cleanup, listener failure, and startup/shutdown regressions
+go test -race ./app ./internal/network ./internal/coordinator ./internal/metadata ./internal/replication ./internal/controller ./internal/schema
 ```
 
 ### Test Coverage
@@ -419,21 +470,22 @@ go test ./internal/coordinator -run='^$' -fuzz=FuzzOffsetLogReplay -fuzztime=30s
 | Package | Tests |
 |---------|-------|
 | `protocol` | Shared nullable/long headers, independent-codec requests, truncation/trailing-data checks, version gating, frame boundaries, decoder bounds, dispatch fuzzing |
-| `schema` | Validation (missing field, wrong type, not JSON), inference from JSON, integer↔number coercion |
+| `schema` | Validation, JSON inference, integer↔number coercion, cancellation/joining of an in-flight HTTP inference request |
 | `storage` | CRC32C and record validation, independent wire fixture, multiple batches, null values, headers, malformed input, bounded recovery reads, parser fuzzing |
 | `metadata` | Record offsets/indexes, corruption preservation, persistent topic/leader recovery across processes, legacy import, divergent/missing replicas, malformed catalogs, atomic DLQ creation, persistence-failure fencing |
-| `coordinator` | Group lifecycle; offset open/write/short-write/sync/close failures; no publication before durability; CRC/legacy/truncation replay; metadata bounds; concurrent commits and generation-lock checks |
+| `coordinator` | Group lifecycle and cancelled/superseded joins/syncs; tracked timer close; stale expiry callbacks; offset I/O faults, replay, generation locking, and finishing disk sync during shutdown |
 | `replication` | TCP follower persistence and subsequent HW acknowledgement, batches exceeding 1 MiB, failed-write fencing, ISR shrink/expand |
 | `api/api_versions` | All 13 API keys present, error propagation |
 | `api/produce` | Invalid inputs without side effects, minimum ISR, shared request deadline, whole-append waits, DLQ acknowledgement and persistence-error propagation |
-| `app` | Startup rejection of corrupt storage and invalid minimum ISR; explicit single-copy configuration |
+| `app` | Corrupt storage/config rejection, partial-bind cleanup, all-broker cancellation, fatal listener errors, and non-default primary broker ports |
 | `api/fetch` | Exact record/offset assertions, HW boundaries, first-batch exception, partition/global byte limits, segment/index fallbacks, offset/leader errors, long polls, concurrent append/fetch |
 | `network` | TCP produce/restart/fetch, acknowledgement failures, follower persistence, franz-go commit/resume across separate broker test processes, offset storage-error/metadata codecs, independent discovery/group/pagination codecs |
 
 ## Limitations & Future Work
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
-- **Remaining correctness work** — Persisted replication commit/ISR state, replicated coordinator storage, failover/divergence recovery, and remaining concurrency/lifecycle issues are still outstanding; the local topic catalog is not distributed consensus
+- **Remaining correctness work** — Persisted replication commit/ISR state, replicated coordinator storage, failover/divergence recovery, remaining shared-state races outside the protected paths, and load/fault testing are still outstanding; the local topic catalog is not distributed consensus
+- **Resource limits** — There are no global connection/in-flight-memory quotas or retention limits yet. Cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
 - **Compatibility scope** — Only the listed versions and configured client subset are supported. More API versions, independent client implementations, timestamp offset lookup, static/cooperative groups, and administrative APIs require additional work.
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported

@@ -48,6 +48,7 @@ type Partition struct {
 	appendErr       error      // Fence leader writes after an ambiguous disk failure
 	replicaErrors   map[int32]error
 	pendingProduces map[*pendingProduce]struct{}
+	changed         chan struct{}
 
 	// Per-replica LEO for replication (broker_id -> LEO)
 	ReplicaLEO      map[int32]int64
@@ -332,8 +333,7 @@ func (p *Partition) AdvanceHighWatermark() {
 	}
 	if minLEO > p.HighWatermark {
 		p.HighWatermark = minLEO
-		p.initCond()
-		p.hwCond.Broadcast()
+		p.signalChange()
 	}
 }
 

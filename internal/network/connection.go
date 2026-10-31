@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -26,16 +27,23 @@ import (
 )
 
 const connectionReadTimeout = 30 * time.Second
+const connectionWriteTimeout = 30 * time.Second
 
-func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
+func handleConnection(ctx context.Context, conn net.Conn, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
 	defer conn.Close()
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		if err := conn.SetReadDeadline(time.Now().Add(connectionReadTimeout)); err != nil {
 			logger.L.Error("failed to set request deadline", "err", err)
 			return
 		}
 		header := protocol.NewRequestHeader()
 		if err := header.ReadFrom(conn); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			if errors.Is(err, io.EOF) {
 				logger.L.Debug("client disconnected")
 			} else {
@@ -43,7 +51,11 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 			}
 			return
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		var body []byte
+		var requestErr error
 		if header.GetAPIKey() == protocol.APIKeyApiVersions && header.GetErrorCode() != protocol.ErrNone {
 			// Kafka's bootstrap fallback always uses ApiVersions response v0.
 			body = apiversions.BuildBodyVersion(0, protocol.ErrUnsupportedVersion)
@@ -53,12 +65,15 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 				logger.L.Warn("rejecting request", "api_key", header.GetAPIKey(), "version", header.GetAPIVersion(), "err", err)
 				return
 			}
+			if ctx.Err() != nil {
+				return
+			}
 			switch req := request.(type) {
 			case *protocol.ApiVersionsRequest:
 				body = apiversions.BuildBodyVersion(header.GetAPIVersion(), protocol.ErrNone)
 			case *protocol.ProduceRequest:
 				var failed bool
-				body, failed = produce.Process(req, metaMgr, localBrokerID)
+				body, failed = produce.ProcessContext(ctx, req, metaMgr, localBrokerID)
 				if req.Acks == 0 {
 					if failed {
 						return
@@ -67,9 +82,9 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 				}
 			case *protocol.FetchRequest:
 				if header.GetAPIVersion() == 0 {
-					body = fetch.BuildBodyV0(req, metaMgr, localBrokerID)
+					body, requestErr = fetch.BuildBodyV0Context(ctx, req, metaMgr, localBrokerID)
 				} else {
-					body = fetch.BuildBody(req, metaMgr, localBrokerID)
+					body, requestErr = fetch.BuildBodyContext(ctx, req, metaMgr, localBrokerID)
 				}
 			case *protocol.DescribeTopicPartitionsRequest:
 				body = describetopics.BuildBody(req, metaMgr)
@@ -78,15 +93,15 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 			case *protocol.FindCoordinatorRequest:
 				body = findcoordinator.BuildBody(req, metaMgr.Brokers)
 			case *protocol.JoinGroupRequest:
-				body = joingroup.BuildBody(req, coord)
+				body = joingroup.BuildBodyContext(ctx, req, coord)
 			case *protocol.SyncGroupRequest:
-				body = syncgroup.BuildBody(req, coord)
+				body = syncgroup.BuildBodyContext(ctx, req, coord)
 			case *protocol.HeartbeatRequest:
 				body = heartbeat.BuildBody(req, coord)
 			case *protocol.LeaveGroupRequest:
 				body = leavegroup.BuildBody(req, coord)
 			case *protocol.OffsetCommitRequest:
-				body = offsetcommit.BuildBody(req, coord)
+				body = offsetcommit.BuildBodyContext(ctx, req, coord)
 			case *protocol.OffsetFetchRequest:
 				body = offsetfetch.BuildBody(req, coord)
 			case *protocol.ListOffsetsRequest:
@@ -95,6 +110,13 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 				logger.L.Error("unhandled request", "api_key", header.GetAPIKey())
 				return
 			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if requestErr != nil {
+			logger.L.Warn("request cancelled or failed", "api_key", header.GetAPIKey(), "err", requestErr)
+			return
 		}
 		response := protocol.NewResponse(header.GetCorrelationID(), body)
 		if protocol.ResponseHeaderVersion(header.GetAPIKey(), header.GetAPIVersion()) == 1 {
@@ -105,7 +127,14 @@ func handleConnection(conn net.Conn, metaMgr *metadata.Manager, coord *coordinat
 			logger.L.Error("failed to serialize response", "err", err)
 			return
 		}
+		if err := conn.SetWriteDeadline(time.Now().Add(connectionWriteTimeout)); err != nil {
+			logger.L.Error("failed to set response deadline", "err", err)
+			return
+		}
 		if _, err := conn.Write(data); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			logger.L.Warn("failed to write response", "err", err)
 			return
 		}

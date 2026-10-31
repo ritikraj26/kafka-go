@@ -139,12 +139,16 @@ func recoveryConnection(t *testing.T, m *metadata.Manager) net.Conn {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	coord := coordinator.NewCoordinator()
 	go func() {
 		defer close(done)
-		Serve(ctx, listener, m, coordinator.NewCoordinator(), 1)
+		if err := Serve(ctx, listener, m, coord, 1); err != nil {
+			t.Errorf("test server: %v", err)
+		}
 	}()
 	t.Cleanup(func() {
 		cancel()
+		coord.Close()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):

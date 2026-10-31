@@ -2,6 +2,7 @@ package schema
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,17 +12,21 @@ import (
 	"time"
 )
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
-
 // InferWithOllama calls a local Ollama instance to infer a SimpleSchema from
-// a JSON payload. It returns nil, nil if Ollama is unreachable or returns an
-// unusable response — the broker must remain functional without AI.
+// a JSON payload. The registry handles failures with explicit local inference.
 //
 // Environment variables:
 //
 //	OLLAMA_URL   base URL of the Ollama server (default: http://localhost:11434)
 //	OLLAMA_MODEL model name to use           (default: llama3.2)
 func InferWithOllama(payload []byte) (*SimpleSchema, error) {
+	return InferWithOllamaContext(context.Background(), payload)
+}
+
+func InferWithOllamaContext(ctx context.Context, payload []byte) (*SimpleSchema, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	base := os.Getenv("OLLAMA_URL")
 	if base == "" {
 		base = "http://localhost:11434"
@@ -33,33 +38,48 @@ func InferWithOllama(payload []byte) (*SimpleSchema, error) {
 
 	prompt := buildPrompt(payload)
 
-	reqBody, _ := json.Marshal(map[string]any{
+	reqBody, err := json.Marshal(map[string]any{
 		"model":  model,
 		"prompt": prompt,
 		"stream": false,
 	})
-
-	resp, err := httpClient.Post(base+"/api/generate", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-		// Ollama not running — fail open
-		return nil, nil
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/generate", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Inference is infrequent; an owned transport avoids leaving idle HTTP
+	// connections behind after the registry's final worker exits.
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil
+		return nil, fmt.Errorf("Ollama returned HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	const maxInferenceResponse = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxInferenceResponse+1))
 	if err != nil {
-		return nil, nil
+		return nil, err
+	}
+	if len(body) > maxInferenceResponse {
+		return nil, fmt.Errorf("Ollama response exceeds size limit")
 	}
 
 	var result struct {
 		Response string `json:"response"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, nil
+		return nil, err
 	}
 
 	return parseOllamaResponse(result.Response)

@@ -1,9 +1,12 @@
 package schema
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/ritiraj/kafka-go/internal/logger"
 )
 
 // FieldType represents the JSON type of a field.
@@ -29,11 +32,17 @@ type Registry struct {
 	mu       sync.RWMutex
 	schemas  map[string]*SimpleSchema
 	inflight sync.Map // topic → struct{}: deduplicates in-progress async inferences
+	ctx      context.Context
+	cancel   context.CancelFunc
+	closed   bool
+	done     chan struct{}
+	workers  sync.WaitGroup
 }
 
 // NewRegistry creates an empty Registry.
 func NewRegistry() *Registry {
-	return &Registry{schemas: make(map[string]*SimpleSchema)}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Registry{schemas: make(map[string]*SimpleSchema), ctx: ctx, cancel: cancel, done: make(chan struct{})}
 }
 
 // Register stores a schema for a topic. Overwrites any existing schema.
@@ -126,20 +135,56 @@ func checkType(field string, val any, expected FieldType) error {
 // InferAsync kicks off schema inference in a background goroutine.
 // Uses sync.Map to ensure only one inference runs per topic.
 func (r *Registry) InferAsync(topic string, payload []byte) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		logger.L.Debug("schema inference skipped after shutdown", "topic", topic)
+		return
+	}
 	if _, loaded := r.inflight.LoadOrStore(topic, struct{}{}); loaded {
+		r.mu.Unlock()
 		return // inference already in progress
 	}
+	r.workers.Add(1)
+	r.mu.Unlock()
 	// Copy payload to prevent races on the caller's buffer.
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
 	go func() {
+		defer r.workers.Done()
 		defer r.inflight.Delete(topic)
-		s, err := InferWithOllama(buf)
+		s, err := InferWithOllamaContext(r.ctx, buf)
+		if r.ctx.Err() != nil {
+			return
+		}
 		if err != nil || s == nil {
+			logger.L.Debug("using local schema inference", "topic", topic, "err", err)
 			s, err = InferFromJSON(buf)
 		}
 		if s != nil && err == nil {
-			r.Register(topic, s)
+			r.mu.Lock()
+			if !r.closed {
+				r.schemas[topic] = s
+			}
+			r.mu.Unlock()
+		} else if err != nil {
+			logger.L.Debug("schema inference unavailable", "topic", topic, "err", err)
 		}
 	}()
+}
+
+// Close cancels HTTP inference and joins every owned worker. No new inference
+// can be admitted once closing starts.
+func (r *Registry) Close() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		<-r.done
+		return
+	}
+	r.closed = true
+	r.cancel()
+	r.mu.Unlock()
+	r.workers.Wait()
+	close(r.done)
 }

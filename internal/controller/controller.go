@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -38,7 +39,8 @@ type Controller struct {
 	failures map[int32]int  // brokerID -> consecutive failure count
 	alive    map[int32]bool // brokerID -> currently considered alive
 
-	wg sync.WaitGroup
+	wg      sync.WaitGroup
+	started bool
 }
 
 // NewController creates a controller that checks broker health at the given interval.
@@ -54,7 +56,19 @@ func NewController(metaMgr *metadata.Manager, registry *broker.Registry, interva
 }
 
 // Start begins the background health-check and failover loop.
-func (c *Controller) Start(ctx context.Context) {
+func (c *Controller) Start(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		return fmt.Errorf("controller already started")
+	}
+	if c.interval <= 0 {
+		return fmt.Errorf("controller interval must be positive")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.started = true
 	// Mark all brokers as alive initially.
 	for _, b := range c.registry.All() {
 		c.alive[b.ID] = true
@@ -70,10 +84,11 @@ func (c *Controller) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				c.healthCheck()
+				c.healthCheck(ctx)
 			}
 		}
 	}()
+	return nil
 }
 
 // Wait blocks until the controller loop exits.
@@ -84,7 +99,10 @@ func (c *Controller) Wait() {
 // healthCheck probes every broker concurrently and handles newly-dead or newly-recovered brokers.
 // Running probes in parallel ensures the entire round completes in probeTimeout regardless of
 // how many brokers are unresponsive, instead of taking N × probeTimeout serially.
-func (c *Controller) healthCheck() {
+func (c *Controller) healthCheck(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	brokers := c.registry.All()
 
 	type result struct {
@@ -92,13 +110,18 @@ func (c *Controller) healthCheck() {
 		reachable bool
 	}
 	results := make(chan result, len(brokers))
+	var probes sync.WaitGroup
+	defer probes.Wait()
 	for _, b := range brokers {
-		b := b // capture loop variable
-		go func() { results <- result{b, c.probe(b)} }()
+		probes.Add(1)
+		go func() { defer probes.Done(); results <- result{b, c.probe(ctx, b)} }()
 	}
 
 	for range brokers {
 		r := <-results
+		if ctx.Err() != nil {
+			continue
+		}
 		b := r.b
 
 		c.mu.Lock()
@@ -139,9 +162,9 @@ func (c *Controller) healthCheck() {
 }
 
 // probe checks if a broker's TCP port is accepting connections.
-func (c *Controller) probe(b *broker.Broker) bool {
-	addr := fmt.Sprintf("%s:%d", b.Host, b.Port)
-	conn, err := net.DialTimeout("tcp", addr, probeTimeout)
+func (c *Controller) probe(ctx context.Context, b *broker.Broker) bool {
+	addr := net.JoinHostPort(b.Host, strconv.Itoa(int(b.Port)))
+	conn, err := (&net.Dialer{Timeout: probeTimeout}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return false
 	}

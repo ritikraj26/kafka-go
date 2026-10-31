@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,7 +64,7 @@ type offsetLogFile interface {
 func (c *Coordinator) LoadOffsets(logDir string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.offsetReady || c.offsetErr != nil {
+	if c.closed || c.offsetReady || c.offsetErr != nil {
 		return fmt.Errorf("offset store is already initialized or fenced; restart with a new coordinator")
 	}
 	if logDir == "" {
@@ -306,6 +307,14 @@ func (c *Coordinator) CommitOffset(groupID string, generationID int32, memberID,
 // CommitOffsetWithMetadata holds c.mu then g.mu through persistence. Membership
 // cannot change between validation and the durable append; memory is published last.
 func (c *Coordinator) CommitOffsetWithMetadata(groupID string, generationID int32, memberID, topic string, partition int32, offset int64, metadata *string) int16 {
+	return c.CommitOffsetWithMetadataContext(context.Background(), groupID, generationID, memberID, topic, partition, offset, metadata)
+}
+
+func (c *Coordinator) CommitOffsetWithMetadataContext(ctx context.Context, groupID string, generationID int32, memberID, topic string, partition int32, offset int64, metadata *string) int16 {
+	if ctx.Err() != nil {
+		logger.L.Debug("offset commit cancelled before validation")
+		return protocol.ErrRequestTimedOut
+	}
 	record := offsetRecord{Group: groupID, Topic: topic, Partition: partition, Offset: offset, Metadata: copyOffsetMetadata(metadata)}
 	data, err := encodeOffsetRecord(record)
 	if err != nil {
@@ -327,6 +336,10 @@ func (c *Coordinator) CommitOffsetWithMetadata(groupID string, generationID int3
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if ctx.Err() != nil {
+		logger.L.Debug("offset commit cancelled before persistence")
+		return protocol.ErrRequestTimedOut
+	}
 	if _, exists := g.Members[memberID]; !exists {
 		return protocol.ErrUnknownMemberID
 	}
@@ -343,6 +356,9 @@ func (c *Coordinator) CommitOffsetWithMetadata(groupID string, generationID int3
 }
 
 func (c *Coordinator) offsetStoreError() int16 {
+	if c.closed {
+		return protocol.ErrCoordinatorNotAvailable
+	}
 	if c.offsetErr != nil {
 		return protocol.ErrKafkaStorageError
 	}

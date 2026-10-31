@@ -18,6 +18,7 @@ import (
 func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 	metaMgr := metadata.NewManager()
 	coord := coordinator.NewCoordinator()
+	defer coord.Close()
 
 	// Bind to a random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -31,7 +32,9 @@ func TestIntegration_ApiVersionsRoundtrip(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		Serve(ctx, listener, metaMgr, coord, 1)
+		if err := Serve(ctx, listener, metaMgr, coord, 1); err != nil {
+			t.Errorf("serve: %v", err)
+		}
 		close(done)
 	}()
 

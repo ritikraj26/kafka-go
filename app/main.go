@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,162 +25,215 @@ import (
 	"github.com/ritiraj/kafka-go/internal/replication"
 )
 
-// Timing constants for the broker runtime. Adjust these to tune replication,
-// failover detection, and consumer group rebalance behaviour.
 const (
-	// rebalanceDelay is how long the coordinator holds a join round open so that
-	// all group members can arrive before assignments are computed.
-	// Equivalent to Kafka's group.initial.rebalance.delay.ms (default 3 s).
-	rebalanceDelay = 3 * time.Second
-
-	// isrCheckInterval is how often the ISR manager evaluates replica lag.
-	isrCheckInterval = 1 * time.Second
-
-	// controllerHealthInterval is how often the controller probes broker TCP ports.
-	controllerHealthInterval = 2 * time.Second
-
-	// followerReplicationInterval is how often each FollowerManager sends a
-	// Fetch request to its leader(s) to pull new records.
+	rebalanceDelay              = 3 * time.Second
+	isrCheckInterval            = time.Second
+	controllerHealthInterval    = 2 * time.Second
 	followerReplicationInterval = 100 * time.Millisecond
 )
 
 func main() {
-	// Graceful shutdown on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// Broker configuration from env (defaults: 3 simulated brokers, ID=1, RF=3)
-	brokerID := int32(envInt("BROKER_ID", 1))
-	numBrokers := envInt("NUM_BROKERS", 3)
-	replicationFactor := envInt("REPLICATION_FACTOR", 3)
-	minISR, err := minInSyncReplicasFromEnv()
-	if err != nil {
-		logger.L.Error("invalid minimum ISR configuration", "err", err)
+	if err := run(ctx, os.Args[1:]); err != nil && !(errors.Is(err, context.Canceled) && ctx.Err() != nil) {
+		logger.L.Error("broker failed", "err", err)
 		os.Exit(1)
 	}
-
-	// Create broker registry with simulated brokers
-	reg := broker.NewRegistry(brokerID)
-	for i := 0; i < numBrokers; i++ {
-		reg.Register(&broker.Broker{
-			ID:   int32(i + 1),
-			Host: "localhost",
-			Port: int32(9092 + i),
-		})
-	}
-
-	// Create metadata manager
-	metaMgr := metadata.NewManager()
-	metaMgr.Brokers = reg
-	metaMgr.ReplicationFactor = replicationFactor
-	metaMgr.MinInSyncReplicas = minISR
-
-	// Create consumer group coordinator
-	coord := coordinator.NewCoordinator()
-	coord.RebalanceDelay = rebalanceDelay
-
-	// Parse server.properties if provided
-	logDir := "/tmp/kraft-broker-logs" // Default log directory
-
-	if len(os.Args) > 1 {
-		propsFile := os.Args[1]
-		if dir, err := parseLogDir(propsFile); err == nil && dir != "" {
-			logDir = dir
-		}
-	}
-
-	// Load existing topics from disk
-	if err := metaMgr.LoadTopicsFromDisk(logDir); err != nil {
-		logger.L.Error("failed to recover partition logs; files were preserved", "err", err)
-		os.Exit(1)
-	}
-
-	// Load committed offsets from disk
-	if err := coord.LoadOffsets(logDir); err != nil {
-		logger.L.Error("failed to recover consumer offsets; files were preserved", "err", err)
-		os.Exit(1)
-	}
-
-	// Start ISR maintenance (evaluates ISR every 1s)
-	lagTimeMaxMs := int64(envInt("REPLICA_LAG_TIME_MAX_MS", 10000))
-	isrMgr := replication.NewISRManager(metaMgr, isrCheckInterval, lagTimeMaxMs)
-	isrMgr.Start(ctx)
-
-	// Start controller for broker health monitoring and automatic leader failover
-	ctrl := controller.NewController(metaMgr, reg, controllerHealthInterval)
-	ctrl.Start(ctx)
-
-	// Start a FollowerManager + TCP listener per broker.
-	// Each broker replicates partitions where it is a follower from the leader.
-	var followers []*replication.FollowerManager
-	for _, b := range reg.All() {
-		fm := replication.NewFollowerManager(metaMgr, b.ID, followerReplicationInterval)
-		fm.Start(ctx)
-		followers = append(followers, fm)
-
-		// The primary broker (brokerID) listens on the main goroutine below.
-		// All other brokers listen in background goroutines.
-		if b.ID != brokerID {
-			go network.StartOnPort(ctx, b.Port, metaMgr, coord, b.ID)
-		}
-	}
-
-	// Start primary broker listener (blocks until ctx is cancelled)
-	network.Start(ctx, metaMgr, coord, brokerID)
-
-	// Wait for all followers and ISR manager to finish
-	for _, fm := range followers {
-		fm.Wait()
-	}
-	isrMgr.Wait()
-	ctrl.Wait()
 }
 
-// parseLogDir reads server.properties and extracts log.dirs property
+type runtimeConfig struct {
+	brokerID                              int32
+	numBrokers, replicationFactor, minISR int
+	lagTimeMaxMs                          int64
+	logDir                                string
+}
+
+type listenFunc func(context.Context, string, string) (net.Listener, error)
+
+func run(ctx context.Context, args []string) error {
+	cfg, err := loadConfig(args)
+	if err != nil {
+		return err
+	}
+	return runWithConfig(ctx, cfg, (&net.ListenConfig{}).Listen)
+}
+
+func runWithConfig(parent context.Context, cfg runtimeConfig, listen listenFunc) error {
+	ctx, cancel := context.WithCancel(parent)
+	reg := broker.NewRegistry(cfg.brokerID)
+	for i := 0; i < cfg.numBrokers; i++ {
+		reg.Register(&broker.Broker{ID: int32(i + 1), Host: "localhost", Port: int32(9092 + i)})
+	}
+	m := metadata.NewManager()
+	m.Brokers, m.ReplicationFactor, m.MinInSyncReplicas = reg, cfg.replicationFactor, cfg.minISR
+	c := coordinator.NewCoordinator()
+	c.RebalanceDelay = rebalanceDelay
+	isr := replication.NewISRManager(m, isrCheckInterval, cfg.lagTimeMaxMs)
+	ctrl := controller.NewController(m, reg, controllerHealthInterval)
+	var followers []*replication.FollowerManager
+	var listeners map[int32]net.Listener
+	var servers sync.WaitGroup
+	defer func() {
+		cancel()
+		closeListeners(listeners)
+		m.Schemas.Close()
+		c.Close()
+		servers.Wait()
+		for _, fm := range followers {
+			fm.Wait()
+		}
+		isr.Wait()
+		ctrl.Wait()
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.LoadTopicsFromDisk(cfg.logDir); err != nil {
+		return fmt.Errorf("failed to recover partition logs; files were preserved: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.LoadOffsets(cfg.logDir); err != nil {
+		return fmt.Errorf("failed to recover consumer offsets; files were preserved: %w", err)
+	}
+	var err error
+	listeners, err = bindListeners(ctx, reg, listen)
+	if err != nil {
+		return err
+	}
+	results := make(chan error, len(listeners))
+	for id, listener := range listeners {
+		servers.Add(1)
+		go func() {
+			defer servers.Done()
+			results <- network.Serve(ctx, listener, m, c, id)
+		}()
+	}
+	if err := isr.Start(ctx); err != nil {
+		return err
+	}
+	if err := ctrl.Start(ctx); err != nil {
+		return err
+	}
+	for _, b := range reg.All() {
+		fm := replication.NewFollowerManager(m, b.ID, followerReplicationInterval)
+		if err := fm.Start(ctx); err != nil {
+			return err
+		}
+		followers = append(followers, fm)
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-results:
+		return err
+	}
+}
+
+func bindListeners(ctx context.Context, reg *broker.Registry, listen listenFunc) (map[int32]net.Listener, error) {
+	listeners := make(map[int32]net.Listener)
+	ids := reg.IDs()
+	slices.Sort(ids)
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			closeListeners(listeners)
+			return nil, err
+		}
+		b := reg.Get(id)
+		listener, err := listen(ctx, "tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(int(b.Port))))
+		if err != nil {
+			closeListeners(listeners)
+			return nil, fmt.Errorf("bind broker %d on port %d: %w", id, b.Port, err)
+		}
+		listeners[id] = listener
+		if addr, ok := listener.Addr().(*net.TCPAddr); ok {
+			b.Port = int32(addr.Port)
+		}
+	}
+	return listeners, nil
+}
+
+func closeListeners(listeners map[int32]net.Listener) {
+	for id, listener := range listeners {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.L.Warn("failed to close broker listener", "broker", id, "err", err)
+		}
+	}
+}
+
+func loadConfig(args []string) (runtimeConfig, error) {
+	var cfg runtimeConfig
+	var err error
+	if len(args) > 1 {
+		return cfg, fmt.Errorf("expected at most one server.properties path")
+	}
+	cfg.logDir = "/tmp/kraft-broker-logs"
+	if len(args) == 1 {
+		dir, err := parseLogDir(args[0])
+		if err != nil {
+			return cfg, fmt.Errorf("read server properties: %w", err)
+		}
+		if dir != "" {
+			cfg.logDir = dir
+		}
+	}
+	cfg.numBrokers, err = envIntInRange("NUM_BROKERS", 3, 1, 65535-9092+1)
+	if err != nil {
+		return cfg, err
+	}
+	id, err := envIntInRange("BROKER_ID", 1, 1, cfg.numBrokers)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.brokerID = int32(id)
+	cfg.replicationFactor, err = envIntInRange("REPLICATION_FACTOR", 3, 1, cfg.numBrokers)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.minISR, err = minInSyncReplicasFromEnv()
+	if err != nil {
+		return cfg, fmt.Errorf("invalid minimum ISR configuration: %w", err)
+	}
+	lag, err := envIntInRange("REPLICA_LAG_TIME_MAX_MS", 10000, 1, math.MaxInt32)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.lagTimeMaxMs = int64(lag)
+	return cfg, nil
+}
+
 func parseLogDir(propsFile string) (string, error) {
 	file, err := os.Open(propsFile)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
-		// Skip comments and empty lines
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
-		// Look for log.dirs property
 		if strings.HasPrefix(line, "log.dirs=") {
-			value := strings.TrimPrefix(line, "log.dirs=")
-			return strings.TrimSpace(value), nil
+			return strings.TrimSpace(strings.TrimPrefix(line, "log.dirs=")), nil
 		}
 	}
-
 	return "", scanner.Err()
 }
 
-// envInt reads an integer from an environment variable with a default.
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+func envIntInRange(key string, def, min, max int) (int, error) {
+	value, present := os.LookupEnv(key)
+	if !present {
+		value = strconv.Itoa(def)
 	}
-	return def
+	n, err := strconv.Atoi(value)
+	if err != nil || n < min || n > max {
+		return 0, fmt.Errorf("%s must be between %d and %d, got %q", key, min, max, value)
+	}
+	return n, nil
 }
 
 func minInSyncReplicasFromEnv() (int, error) {
-	value, present := os.LookupEnv("MIN_INSYNC_REPLICAS")
-	if !present {
-		return metadata.DefaultMinInSyncReplicas, nil
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 1 || n > math.MaxInt32 {
-		return 0, fmt.Errorf("MIN_INSYNC_REPLICAS must be an integer between 1 and %d, got %q", math.MaxInt32, value)
-	}
-	return n, nil
+	return envIntInRange("MIN_INSYNC_REPLICAS", metadata.DefaultMinInSyncReplicas, 1, math.MaxInt32)
 }

@@ -1,6 +1,7 @@
 package produce
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -20,6 +21,14 @@ func BuildBody(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBro
 // Process also reports whether any partition failed, so acks=0 callers can
 // close the connection on error without sending an unsolicited response.
 func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32) ([]byte, bool) {
+	return ProcessContext(context.Background(), req, metaMgr, localBrokerID)
+}
+
+func ProcessContext(ctx context.Context, req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32) ([]byte, bool) {
+	if ctx.Err() != nil {
+		logger.L.Debug("produce cancelled before dispatch")
+		return nil, true
+	}
 	requestError := protocol.ErrNone
 	if req.Acks != -1 && req.Acks != 0 && req.Acks != 1 {
 		requestError = protocol.ErrInvalidRequiredAcks
@@ -41,6 +50,10 @@ func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBroke
 		encoder.WriteUnsignedVarint(uint64(len(reqTopic.Partitions) + 1))
 		topic := metaMgr.GetTopic(reqTopic.Name)
 		for _, reqPartition := range reqTopic.Partitions {
+			if ctx.Err() != nil {
+				logger.L.Debug("produce cancelled between partitions")
+				return nil, true
+			}
 			encoder.WriteInt32(reqPartition.Index)
 			errorCode := protocol.ErrUnknownTopicOrPartition
 			baseOffset, logAppendTime, logStartOffset := int64(-1), int64(-1), int64(-1)
@@ -52,12 +65,16 @@ func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBroke
 					if p.Index != reqPartition.Index {
 						continue
 					}
-					baseOffset, logAppendTime, errorCode = appendPartition(reqPartition.Records, reqTopic.Name, metaMgr, p, options)
+					baseOffset, logAppendTime, errorCode = appendPartition(ctx, reqPartition.Records, reqTopic.Name, metaMgr, p, options)
 					if baseOffset >= 0 {
 						logStartOffset = 0
 					}
 					break
 				}
+			}
+			if ctx.Err() != nil {
+				logger.L.Debug("produce response abandoned during shutdown")
+				return nil, true
 			}
 			if errorCode != protocol.ErrNone {
 				failed = true
@@ -78,12 +95,18 @@ func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBroke
 	return encoder.Bytes(), failed
 }
 
-func appendPartition(records []byte, topic string, metaMgr *metadata.Manager, p *metadata.Partition, options metadata.ProduceOptions) (int64, int64, int16) {
+func appendPartition(ctx context.Context, records []byte, topic string, metaMgr *metadata.Manager, p *metadata.Partition, options metadata.ProduceOptions) (int64, int64, int16) {
+	if err := ctx.Err(); err != nil {
+		return -1, -1, recordErrorCode(err)
+	}
 	if err := p.CheckProduce(options); err != nil {
 		return -1, -1, recordErrorCode(err)
 	}
+	if err := ctx.Err(); err != nil {
+		return -1, -1, recordErrorCode(err)
+	}
 	if len(records) == 0 {
-		offset, err := p.ProduceRecords(nil, options)
+		offset, err := p.ProduceRecordsContext(ctx, nil, options)
 		if err != nil {
 			return -1, -1, recordErrorCode(err)
 		}
@@ -96,7 +119,7 @@ func appendPartition(records []byte, topic string, metaMgr *metadata.Manager, p 
 	}
 	failed, allFailed := validateRecords(batches, topic, metaMgr)
 	if len(failed) > 0 {
-		if err := routeToDLQ(topic, failed, metaMgr, options); err != nil {
+		if err := routeToDLQ(ctx, topic, failed, metaMgr, options); err != nil {
 			logger.L.Error("failed to write to DLQ", "topic", topic, "err", err)
 			return -1, -1, recordErrorCode(err)
 		}
@@ -108,9 +131,13 @@ func appendPartition(records []byte, topic string, metaMgr *metadata.Manager, p 
 		logger.L.Warn("partial schema violation: writing full batch; failed records also in DLQ", "topic", topic, "failed", len(failed))
 	}
 
-	offset, err := p.ProduceRecords(records, options)
+	offset, err := p.ProduceRecordsContext(ctx, records, options)
 	if err != nil {
-		logger.L.Error("failed to append records", "topic", topic, "partition", p.Index, "err", err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			logger.L.Debug("produce wait cancelled", "topic", topic, "partition", p.Index)
+		} else {
+			logger.L.Error("failed to append records", "topic", topic, "partition", p.Index, "err", err)
+		}
 		return offset, -1, recordErrorCode(err)
 	}
 	return offset, -1, protocol.ErrNone // The broker preserves CreateTime timestamps.
@@ -118,6 +145,8 @@ func appendPartition(records []byte, topic string, metaMgr *metadata.Manager, p 
 
 func recordErrorCode(err error) int16 {
 	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return protocol.ErrRequestTimedOut
 	case errors.Is(err, metadata.ErrNotLeader):
 		return protocol.ErrNotLeaderOrFollower
 	case errors.Is(err, metadata.ErrInvalidRequiredAcks):
@@ -162,7 +191,10 @@ func validateRecords(batches []storage.RecordBatch, topic string, metaMgr *metad
 	return failed, len(failed) == len(values)
 }
 
-func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager, options metadata.ProduceOptions) error {
+func routeToDLQ(ctx context.Context, sourceTopic string, values [][]byte, metaMgr *metadata.Manager, options metadata.ProduceOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dlq, err := metaMgr.GetOrCreateDLQTopic(sourceTopic)
 	if err != nil {
 		return err
@@ -181,6 +213,6 @@ func routeToDLQ(sourceTopic string, values [][]byte, metaMgr *metadata.Manager, 
 	p := &dlq.Partitions[0]
 	leader, _, _, _ := p.ReplicaPosition(0)
 	options.BrokerID = leader
-	_, err = p.ProduceRecords(batch, options)
+	_, err = p.ProduceRecordsContext(ctx, batch, options)
 	return err
 }

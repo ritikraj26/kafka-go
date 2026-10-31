@@ -1,6 +1,8 @@
 package coordinator
 
 import (
+	"bytes"
+	"context"
 	"sync"
 	"time"
 
@@ -20,6 +22,9 @@ type Coordinator struct {
 	offsetReady    bool
 	offsetErr      error
 	openOffsetLog  func(string) (offsetLogFile, error)
+	closed         bool
+	done           chan struct{}
+	closeDone      chan struct{}
 }
 
 // NewCoordinator creates an empty Coordinator.
@@ -30,13 +35,22 @@ func NewCoordinator() *Coordinator {
 		openOffsetLog:  openOffsetLogFile,
 		RebalanceDelay: 0,
 		MaxGroupSize:   256,
+		done:           make(chan struct{}),
+		closeDone:      make(chan struct{}),
 	}
 }
 
 // getOrCreateGroup returns the group, creating it if needed.
 func (c *Coordinator) getOrCreateGroup(groupID string) *ConsumerGroup {
+	return c.getOrCreateGroupContext(context.Background(), groupID)
+}
+
+func (c *Coordinator) getOrCreateGroupContext(ctx context.Context, groupID string) *ConsumerGroup {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed || ctx.Err() != nil {
+		return nil
+	}
 	g, ok := c.groups[groupID]
 	if !ok {
 		g = newConsumerGroup(groupID, c.handleSessionExpired)
@@ -49,19 +63,40 @@ func (c *Coordinator) getOrCreateGroup(groupID string) *ConsumerGroup {
 func (c *Coordinator) FindGroup(groupID string) *ConsumerGroup {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.closed {
+		return nil
+	}
 	return c.groups[groupID]
 }
 
 // JoinGroup implements the JoinGroup protocol. It may block until all members join.
 func (c *Coordinator) JoinGroup(groupID string, memberID string, sessionTimeoutMs int32,
 	protocolType string, protocols []MemberProtocol) *JoinGroupResult {
+	return c.JoinGroupContext(context.Background(), groupID, memberID, sessionTimeoutMs, protocolType, protocols)
+}
 
-	g := c.getOrCreateGroup(groupID)
+func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memberID string, sessionTimeoutMs int32,
+	protocolType string, protocols []MemberProtocol) *JoinGroupResult {
+	if ctx.Err() != nil {
+		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
+	}
+
+	g := c.getOrCreateGroupContext(ctx, groupID)
+	if g == nil {
+		if ctx.Err() != nil {
+			return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
+		}
+		return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable}
+	}
 	g.mu.Lock()
 
 	if g.State == GroupDead {
 		g.mu.Unlock()
 		return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable}
+	}
+	if ctx.Err() != nil {
+		g.mu.Unlock()
+		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
 	}
 
 	// Enforce max group size
@@ -89,6 +124,8 @@ func (c *Coordinator) JoinGroup(groupID string, memberID string, sessionTimeoutM
 		m.SessionTimeout = time.Duration(sessionTimeoutMs) * time.Millisecond
 	}
 
+	m.joinAttempt++
+	attempt := m.joinAttempt
 	g.ProtocolType = protocolType
 	g.startSessionTimer(m)
 
@@ -103,6 +140,9 @@ func (c *Coordinator) JoinGroup(groupID string, memberID string, sessionTimeoutM
 
 	// Create a channel to wait for the join to complete
 	ch := make(chan *JoinGroupResult, 1)
+	if previous := g.pendingJoins[memberID]; previous != nil {
+		close(previous)
+	}
 	g.pendingJoins[memberID] = ch
 
 	// Check if all members have rejoined (pendingJoins == Members count)
@@ -112,9 +152,14 @@ func (c *Coordinator) JoinGroup(groupID string, memberID string, sessionTimeoutM
 		if c.RebalanceDelay > 0 && g.rebalanceTimer == nil {
 			// Start a timer — complete join after delay (allows more members to arrive)
 			delay := c.RebalanceDelay
-			g.rebalanceTimer = time.AfterFunc(delay, func() {
+			g.rebalanceSequence++
+			sequence := g.rebalanceSequence
+			g.rebalanceTimer = g.after(delay, func() {
 				g.mu.Lock()
 				defer g.mu.Unlock()
+				if g.rebalanceSequence != sequence {
+					return
+				}
 				g.rebalanceTimer = nil
 				if g.State == GroupJoining && len(g.pendingJoins) > 0 {
 					g.completeJoinPhase()
@@ -131,18 +176,22 @@ func (c *Coordinator) JoinGroup(groupID string, memberID string, sessionTimeoutM
 	g.mu.Unlock()
 
 	// Wait for result (with timeout)
-	timeout := time.Duration(sessionTimeoutMs) * time.Millisecond
+	timeout := time.NewTimer(time.Duration(sessionTimeoutMs) * time.Millisecond)
+	defer timeout.Stop()
 	select {
+	case <-ctx.Done():
+		c.cancelJoin(g, memberID, attempt)
+		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut, MemberID: memberID}
+	case <-c.done:
+		return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable, MemberID: memberID}
 	case result, ok := <-ch:
 		if !ok || result == nil {
 			return &JoinGroupResult{ErrorCode: protocol.ErrRebalanceInProgress, MemberID: memberID}
 		}
 		return result
-	case <-time.After(timeout):
+	case <-timeout.C:
 		// Timeout — remove member and return error
-		g.mu.Lock()
-		g.removeMember(memberID)
-		g.mu.Unlock()
+		c.cancelJoin(g, memberID, attempt)
 		return &JoinGroupResult{ErrorCode: protocol.ErrRebalanceInProgress, MemberID: memberID}
 	}
 }
@@ -150,6 +199,14 @@ func (c *Coordinator) JoinGroup(groupID string, memberID string, sessionTimeoutM
 // SyncGroup implements the SyncGroup protocol for the leader and followers.
 func (c *Coordinator) SyncGroup(groupID string, generationID int32, memberID string,
 	assignments []SyncGroupAssignment) ([]byte, int16) {
+	return c.SyncGroupContext(context.Background(), groupID, generationID, memberID, assignments)
+}
+
+func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, generationID int32, memberID string,
+	assignments []SyncGroupAssignment) ([]byte, int16) {
+	if ctx.Err() != nil {
+		return nil, protocol.ErrRequestTimedOut
+	}
 
 	g := c.FindGroup(groupID)
 	if g == nil {
@@ -157,6 +214,10 @@ func (c *Coordinator) SyncGroup(groupID string, generationID int32, memberID str
 	}
 
 	g.mu.Lock()
+	if ctx.Err() != nil {
+		g.mu.Unlock()
+		return nil, protocol.ErrRequestTimedOut
+	}
 
 	m, ok := g.Members[memberID]
 	if !ok {
@@ -172,8 +233,9 @@ func (c *Coordinator) SyncGroup(groupID string, generationID int32, memberID str
 	if g.State != GroupAwaitingSync {
 		if g.State == GroupStable {
 			// Already synced — return cached assignment
+			assignment := bytes.Clone(m.Assignment)
 			g.mu.Unlock()
-			return m.Assignment, protocol.ErrNone
+			return assignment, protocol.ErrNone
 		}
 		g.mu.Unlock()
 		return nil, protocol.ErrRebalanceInProgress
@@ -185,7 +247,7 @@ func (c *Coordinator) SyncGroup(groupID string, generationID int32, memberID str
 	if memberID == g.LeaderID && len(assignments) > 0 {
 		for _, a := range assignments {
 			if mem, ok := g.Members[a.MemberID]; ok {
-				mem.Assignment = a.Assignment
+				mem.Assignment = bytes.Clone(a.Assignment)
 			}
 		}
 
@@ -203,24 +265,41 @@ func (c *Coordinator) SyncGroup(groupID string, generationID int32, memberID str
 		}
 
 		// Return leader's own assignment
+		assignment := bytes.Clone(m.Assignment)
 		g.mu.Unlock()
-		return m.Assignment, protocol.ErrNone
+		return assignment, protocol.ErrNone
 	}
 
 	// Follower — wait for leader to send assignments
 	// Use this member's session timeout instead of a hardcoded value.
 	syncTimeout := m.SessionTimeout
 	ch := make(chan []byte, 1)
+	if previous := g.pendingSyncs[memberID]; previous != nil {
+		close(previous)
+	}
 	g.pendingSyncs[memberID] = ch
 	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.pendingSyncs[memberID] == ch {
+			delete(g.pendingSyncs, memberID)
+		}
+	}()
 
+	timer := time.NewTimer(syncTimeout)
+	defer timer.Stop()
 	select {
+	case <-ctx.Done():
+		return nil, protocol.ErrRequestTimedOut
+	case <-c.done:
+		return nil, protocol.ErrCoordinatorNotAvailable
 	case data, ok := <-ch:
 		if !ok || data == nil {
 			return nil, protocol.ErrRebalanceInProgress
 		}
-		return data, protocol.ErrNone
-	case <-time.After(syncTimeout):
+		return bytes.Clone(data), protocol.ErrNone
+	case <-timer.C:
 		return nil, protocol.ErrRebalanceInProgress
 	}
 }
@@ -282,10 +361,13 @@ func (c *Coordinator) LeaveGroup(groupID string, memberID string) int16 {
 
 // handleSessionExpired is called when a member's session timer fires.
 func (c *Coordinator) handleSessionExpired(g *ConsumerGroup, memberID string) {
-	logger.L.Warn("session expired", "group", g.GroupID, "member", memberID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-
+	m := g.Members[memberID]
+	if g.State == GroupDead || m == nil || time.Since(m.LastHeartbeat) < m.SessionTimeout {
+		return
+	}
+	logger.L.Warn("session expired", "group", g.GroupID, "member", memberID)
 	g.removeMember(memberID)
 	if len(g.Members) > 0 {
 		g.triggerRebalance()

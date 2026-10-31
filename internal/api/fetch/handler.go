@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"context"
 	"errors"
 	"math"
 	"time"
@@ -32,6 +33,10 @@ func resolveTopic(topic protocol.FetchTopic, m *metadata.Manager) *metadata.Topi
 }
 
 func collectData(req *protocol.FetchRequest, m *metadata.Manager, maxBytes int, brokerID int32, modern bool) ([]topicResult, int, bool) {
+	return collectDataContext(context.Background(), req, m, maxBytes, brokerID, modern)
+}
+
+func collectDataContext(ctx context.Context, req *protocol.FetchRequest, m *metadata.Manager, maxBytes int, brokerID int32, modern bool) ([]topicResult, int, bool) {
 	total := 0
 	hasError := false
 	results := make([]topicResult, 0, len(req.Topics))
@@ -39,6 +44,9 @@ func collectData(req *protocol.FetchRequest, m *metadata.Manager, maxBytes int, 
 		tr := topicResult{id: requestedTopic.TopicID, name: requestedTopic.TopicName}
 		topic := resolveTopic(requestedTopic, m)
 		for _, requested := range requestedTopic.Partitions {
+			if ctx.Err() != nil {
+				return results, total, true
+			}
 			pr := partResult{index: requested.PartitionIndex, hwm: -1, start: -1}
 			var p *metadata.Partition
 			if topic == nil {
@@ -62,7 +70,7 @@ func collectData(req *protocol.FetchRequest, m *metadata.Manager, maxBytes int, 
 					pr.errCode = protocol.ErrInvalidRequest
 				} else {
 					budget := min(max(0, maxBytes-total), int(requested.MaxBytes))
-					result, err := p.FetchRecords(metadata.FetchOptions{
+					result, err := p.FetchRecordsContext(ctx, metadata.FetchOptions{
 						BrokerID: brokerID, ReplicaID: req.ReplicaID, LeaderEpoch: requested.CurrentLeaderEpoch,
 						Offset: requested.FetchOffset, MaxBytes: budget, AllowOversizedBatch: modern && total == 0,
 					})
@@ -88,6 +96,8 @@ func collectData(req *protocol.FetchRequest, m *metadata.Manager, maxBytes int, 
 
 func fetchErrorCode(err error) int16 {
 	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return protocol.ErrRequestTimedOut
 	case errors.Is(err, metadata.ErrOffsetOutOfRange):
 		return protocol.ErrOffsetOutOfRange
 	case errors.Is(err, metadata.ErrNotLeader):
@@ -103,24 +113,44 @@ func fetchErrorCode(err error) int16 {
 	}
 }
 
-func fetchData(req *protocol.FetchRequest, m *metadata.Manager, brokerID int32, modern bool) []topicResult {
+func fetchData(ctx context.Context, req *protocol.FetchRequest, m *metadata.Manager, brokerID int32, modern bool) ([]topicResult, error) {
 	maxBytes := int(req.MaxBytes)
 	if !modern {
 		maxBytes = math.MaxInt32 // Fetch v0 has only per-partition byte limits.
 	}
 	deadline := time.Now().Add(time.Duration(req.MaxWaitMs) * time.Millisecond)
 	for {
-		topics, total, hasError := collectData(req, m, maxBytes, brokerID, modern)
-		if hasError || total >= int(req.MinBytes) || total >= maxBytes || !time.Now().Before(deadline) {
-			return topics
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		time.Sleep(min(5*time.Millisecond, time.Until(deadline)))
+		topics, total, hasError := collectDataContext(ctx, req, m, maxBytes, brokerID, modern)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if hasError || total >= int(req.MinBytes) || total >= maxBytes || !time.Now().Before(deadline) {
+			return topics, nil
+		}
+		timer := time.NewTimer(min(5*time.Millisecond, time.Until(deadline)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
 // BuildBody encodes Fetch v16. The first nonempty batch may exceed the byte
 // budgets to allow progress; later batches and partitions obey the remaining budget.
 func BuildBody(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ...int32) []byte {
+	body, _ := BuildBodyContext(context.Background(), req, m, localBrokerID...)
+	return body
+}
+
+func BuildBodyContext(ctx context.Context, req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ...int32) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	brokerID := int32(1)
 	if len(localBrokerID) > 0 {
 		brokerID = localBrokerID[0]
@@ -132,7 +162,11 @@ func BuildBody(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ..
 	} else if req.MinBytes < 0 || req.MaxBytes < 0 || req.MaxWaitMs < 0 || req.ReplicaID < -1 {
 		errorCode = protocol.ErrInvalidRequest
 	} else {
-		topics = fetchData(req, m, brokerID, true)
+		var err error
+		topics, err = fetchData(ctx, req, m, brokerID, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 	e := protocol.NewEncoder()
 	e.WriteInt32(0)
@@ -165,16 +199,24 @@ func BuildBody(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ..
 		e.WriteTagBuffer()
 	}
 	e.WriteTagBuffer()
-	return e.Bytes()
+	return e.Bytes(), nil
 }
 
 // BuildBodyV0 returns complete batches within strict per-partition byte limits.
 func BuildBodyV0(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ...int32) []byte {
+	body, _ := BuildBodyV0Context(context.Background(), req, m, localBrokerID...)
+	return body
+}
+
+func BuildBodyV0Context(ctx context.Context, req *protocol.FetchRequest, m *metadata.Manager, localBrokerID ...int32) ([]byte, error) {
 	brokerID := int32(1)
 	if len(localBrokerID) > 0 {
 		brokerID = localBrokerID[0]
 	}
-	topics := fetchData(req, m, brokerID, false)
+	topics, err := fetchData(ctx, req, m, brokerID, false)
+	if err != nil {
+		return nil, err
+	}
 	e := protocol.NewEncoder()
 	e.WriteArrayLen(len(topics))
 	for _, topic := range topics {
@@ -187,5 +229,5 @@ func BuildBodyV0(req *protocol.FetchRequest, m *metadata.Manager, localBrokerID 
 			e.WriteBytes(part.records)
 		}
 	}
-	return e.Bytes()
+	return e.Bytes(), nil
 }

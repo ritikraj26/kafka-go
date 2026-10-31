@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -39,9 +40,19 @@ type FetchResult struct {
 // FetchRecords holds the partition lock through a bounded read so append, election,
 // visibility and replica-progress checks all observe the same partition state.
 func (p *Partition) FetchRecords(options FetchOptions) (FetchResult, error) {
+	return p.FetchRecordsContext(context.Background(), options)
+}
+
+func (p *Partition) FetchRecordsContext(ctx context.Context, options FetchOptions) (FetchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return FetchResult{}, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	result := FetchResult{HighWatermark: p.HighWatermark}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if options.BrokerID != p.LeaderID || !p.ReplicaAvailable(options.BrokerID) ||
 		(options.ReplicaID >= 0 && !p.ReplicaAvailable(options.ReplicaID)) ||
 		(options.ReplicaID >= 0 && (options.ReplicaID == p.LeaderID || !slices.Contains(p.ReplicaNodes, options.ReplicaID))) {
@@ -78,10 +89,13 @@ func (p *Partition) FetchRecords(options FetchOptions) (FetchResult, error) {
 		limit = p.LogEndOffset
 	}
 	if options.Offset < limit {
-		result.Records, err = readBatches(dir, segments, options, limit)
+		result.Records, err = readBatches(ctx, dir, segments, options, limit)
 		if err != nil {
 			return result, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return FetchResult{}, err
 	}
 	if options.ReplicaID >= 0 {
 		// The offset in this request describes earlier durable receipt, not the
@@ -142,7 +156,7 @@ func indexPosition(dir string, segment logSegment, offset int64) (int64, int64, 
 	return position, base, nil
 }
 
-func readBatches(dir string, segments []logSegment, options FetchOptions, limit int64) ([]byte, error) {
+func readBatches(ctx context.Context, dir string, segments []logSegment, options FetchOptions, limit int64) ([]byte, error) {
 	start := 0
 	for i, segment := range segments {
 		if segment.baseOffset > options.Offset {
@@ -156,6 +170,9 @@ func readBatches(dir string, segments []logSegment, options FetchOptions, limit 
 	}
 	var records []byte
 	for i := start; i < len(segments) && next < limit; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if i > start {
 			position = 0
 			if segments[i].baseOffset != next {
@@ -167,7 +184,7 @@ func readBatches(dir string, segments []logSegment, options FetchOptions, limit 
 		if err != nil {
 			return nil, err
 		}
-		part, end, stopped, readErr := readSegmentBatches(f, position, next, options, limit, len(records))
+		part, end, stopped, readErr := readSegmentBatches(ctx, f, position, next, options, limit, len(records))
 		closeErr := f.Close()
 		if readErr != nil {
 			return nil, fmt.Errorf("fetch %s: %w", path, readErr)
@@ -187,9 +204,12 @@ func readBatches(dir string, segments []logSegment, options FetchOptions, limit 
 	return records, nil
 }
 
-func readSegmentBatches(f *os.File, position, next int64, options FetchOptions, limit int64, alreadyRead int) ([]byte, int64, bool, error) {
+func readSegmentBatches(ctx context.Context, f *os.File, position, next int64, options FetchOptions, limit int64, alreadyRead int) ([]byte, int64, bool, error) {
 	var records []byte
 	for next < limit {
+		if err := ctx.Err(); err != nil {
+			return nil, next, false, err
+		}
 		var header [27]byte
 		n, err := f.ReadAt(header[:], position)
 		if err == io.EOF && n == 0 {
@@ -243,8 +263,15 @@ func (p *Partition) ReplicaPosition(id int32) (leader int32, epoch int32, offset
 // AppendFetchedRecords advances the local follower position only after fsync.
 // A response from a superseded leader is rejected, not appended to the new log.
 func (p *Partition) AppendFetchedRecords(id, leader, epoch int32, offset int64, records []byte) error {
+	return p.AppendFetchedRecordsContext(context.Background(), id, leader, epoch, offset, records)
+}
+
+func (p *Partition) AppendFetchedRecordsContext(ctx context.Context, id, leader, epoch int32, offset int64, records []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if p.LeaderID != leader || p.LeaderEpoch != epoch || id == leader || !slices.Contains(p.ReplicaNodes, id) || !p.ReplicaAvailable(id) {
 		return ErrNotLeader
 	}

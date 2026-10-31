@@ -13,6 +13,7 @@ func NewMetadataManager(t testing.TB) *metadata.Manager {
 	if err := m.SetLogDir(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(m.Schemas.Close)
 	return m
 }
 

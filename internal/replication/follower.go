@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -39,6 +40,7 @@ type FollowerManager struct {
 	conns map[int32]net.Conn
 
 	correlationSeq int32
+	started        bool
 }
 
 // partInfo groups a topic/partition with its current LEO for fetch batching.
@@ -61,22 +63,40 @@ func NewFollowerManager(metaMgr *metadata.Manager, localID int32, interval time.
 }
 
 // Start begins the background replication loop. Call with a cancellable context.
-func (fm *FollowerManager) Start(ctx context.Context) {
-	fm.wg.Add(1)
+func (fm *FollowerManager) Start(ctx context.Context) error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if fm.started {
+		return fmt.Errorf("follower manager already started")
+	}
+	if fm.interval <= 0 {
+		return fmt.Errorf("follower interval must be positive")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	fm.started = true
+	fm.wg.Add(2)
 	go func() {
 		defer fm.wg.Done()
+		<-ctx.Done()
+		fm.closeAll()
+	}()
+	go func() {
+		defer fm.wg.Done()
+		defer fm.closeAll()
 		ticker := time.NewTicker(fm.interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				fm.closeAll()
 				return
 			case <-ticker.C:
-				fm.replicateAll()
+				fm.replicateAllContext(ctx)
 			}
 		}
 	}()
+	return nil
 }
 
 // Wait blocks until the replication loop exits.
@@ -95,9 +115,12 @@ func (fm *FollowerManager) closeAll() {
 }
 
 // getConn returns a persistent connection to the given leader broker, dialing if necessary.
-func (fm *FollowerManager) getConn(leaderID int32) (net.Conn, error) {
+func (fm *FollowerManager) getConn(ctx context.Context, leaderID int32) (net.Conn, error) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if c, ok := fm.conns[leaderID]; ok {
 		return c, nil
@@ -108,9 +131,13 @@ func (fm *FollowerManager) getConn(leaderID int32) (net.Conn, error) {
 		return nil, fmt.Errorf("unknown leader broker %d", leaderID)
 	}
 	addr := net.JoinHostPort(b.Host, fmt.Sprintf("%d", b.Port))
-	c, err := net.DialTimeout("tcp", addr, followerDialTimeout)
+	c, err := (&net.Dialer{Timeout: followerDialTimeout}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	if err := ctx.Err(); err != nil {
+		c.Close()
+		return nil, err
 	}
 	fm.conns[leaderID] = c
 	return c, nil
@@ -136,9 +163,19 @@ func (fm *FollowerManager) nextCorrelationID() int32 {
 
 // replicateAll iterates over all topics/partitions and fetches from leaders via TCP.
 func (fm *FollowerManager) replicateAll() {
+	fm.replicateAllContext(context.Background())
+}
+
+func (fm *FollowerManager) replicateAllContext(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	leaderParts := make(map[int32][]partInfo)
 
 	for _, topicName := range fm.metaMgr.ListTopics() {
+		if ctx.Err() != nil {
+			return
+		}
 		topic := fm.metaMgr.GetTopic(topicName)
 		if topic == nil {
 			continue
@@ -162,16 +199,22 @@ func (fm *FollowerManager) replicateAll() {
 		// v0 has no whole-response byte budget. One partition per request bounds
 		// allocation while allowing any supported batch to fit its strict limit.
 		for i := range parts {
-			fm.fetchFromLeader(leaderID, parts[i:i+1])
+			if ctx.Err() != nil {
+				return
+			}
+			fm.fetchFromLeader(ctx, leaderID, parts[i:i+1])
 		}
 	}
 }
 
 // fetchFromLeader sends a Fetch v0 request for all partitions led by leaderID
 // and processes the response.
-func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
-	conn, err := fm.getConn(leaderID)
+func (fm *FollowerManager) fetchFromLeader(ctx context.Context, leaderID int32, parts []partInfo) {
+	conn, err := fm.getConn(ctx, leaderID)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		logger.L.Warn("follower: cannot connect to leader", "leader", leaderID, "err", err)
 		return
 	}
@@ -180,9 +223,17 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 	reqBytes := fm.encodeFetchV0(corrID, parts)
 
 	// Set write + read deadline
-	conn.SetDeadline(time.Now().Add(followerRequestDeadline))
+	if err := conn.SetDeadline(time.Now().Add(followerRequestDeadline)); err != nil {
+		logger.L.Warn("follower: failed to set deadline", "err", err)
+		fm.dropConn(leaderID)
+		return
+	}
 
 	if _, err := conn.Write(reqBytes); err != nil {
+		if ctx.Err() != nil {
+			fm.dropConn(leaderID)
+			return
+		}
 		logger.L.Warn("follower: write failed", "leader", leaderID, "err", err)
 		fm.dropConn(leaderID)
 		return
@@ -191,6 +242,10 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 	// Read response: message_size (4 bytes) + rest
 	var msgSize int32
 	if err := binary.Read(conn, binary.BigEndian, &msgSize); err != nil {
+		if ctx.Err() != nil {
+			fm.dropConn(leaderID)
+			return
+		}
 		logger.L.Warn("follower: read msg_size failed", "leader", leaderID, "err", err)
 		fm.dropConn(leaderID)
 		return
@@ -203,6 +258,10 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 
 	respBuf := make([]byte, msgSize)
 	if _, err := io.ReadFull(conn, respBuf); err != nil {
+		if ctx.Err() != nil {
+			fm.dropConn(leaderID)
+			return
+		}
 		logger.L.Warn("follower: read response failed", "leader", leaderID, "err", err)
 		fm.dropConn(leaderID)
 		return
@@ -214,9 +273,13 @@ func (fm *FollowerManager) fetchFromLeader(leaderID int32, parts []partInfo) {
 	}
 
 	// Clear deadline
-	conn.SetDeadline(time.Time{})
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		logger.L.Warn("follower: failed to clear deadline", "err", err)
+		fm.dropConn(leaderID)
+		return
+	}
 
-	fm.decodeFetchV0Response(respBuf, parts)
+	fm.decodeFetchV0ResponseContext(ctx, respBuf, parts)
 }
 
 // encodeFetchV0 builds a Fetch v0 wire-format request.
@@ -283,6 +346,10 @@ func (fm *FollowerManager) encodeFetchV0(correlationID int32, parts []partInfo) 
 //
 //	partitions(ARRAY[index(INT32), error_code(INT16), hw(INT64), record_set(BYTES)])])
 func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) {
+	fm.decodeFetchV0ResponseContext(context.Background(), data, parts)
+}
+
+func (fm *FollowerManager) decodeFetchV0ResponseContext(ctx context.Context, data []byte, parts []partInfo) {
 	dec := protocol.NewDecoder(data)
 
 	// correlation_id (4 bytes)
@@ -299,6 +366,9 @@ func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) 
 	}
 
 	for i := int32(0); i < numTopics; i++ {
+		if ctx.Err() != nil {
+			return
+		}
 		topicName, err := dec.ReadString()
 		if err != nil {
 			logger.L.Warn("follower: decode topicName failed", "err", err)
@@ -346,7 +416,10 @@ func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) 
 			// Find the matching partition to write records
 			for _, p := range parts {
 				if p.topic.Name == topicName && p.partition.Index == partIdx {
-					if writeErr := p.partition.AppendFetchedRecords(fm.localID, p.leaderID, p.epoch, p.leo, recordSet); writeErr != nil {
+					if writeErr := p.partition.AppendFetchedRecordsContext(ctx, fm.localID, p.leaderID, p.epoch, p.leo, recordSet); writeErr != nil {
+						if errors.Is(writeErr, context.Canceled) || errors.Is(writeErr, context.DeadlineExceeded) {
+							return
+						}
 						logger.L.Error("follower: write records failed",
 							"topic", topicName, "partition", partIdx, "err", writeErr)
 					} else {

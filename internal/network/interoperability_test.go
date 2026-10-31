@@ -39,9 +39,15 @@ func interopBroker(t *testing.T) (string, *metadata.Manager, *coordinator.Coordi
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); Serve(ctx, listener, m, coord, 1) }()
+	go func() {
+		defer close(done)
+		if err := Serve(ctx, listener, m, coord, 1); err != nil {
+			t.Errorf("interop server: %v", err)
+		}
+	}()
 	t.Cleanup(func() {
 		cancel()
+		coord.Close()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):

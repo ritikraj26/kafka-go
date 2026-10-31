@@ -17,6 +17,7 @@ import (
 func TestIntegration_ConsumerGroupLifecycle(t *testing.T) {
 	metaMgr := metadata.NewManager()
 	coord := coordinator.NewCoordinator()
+	defer coord.Close()
 	if err := coord.LoadOffsets(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +33,9 @@ func TestIntegration_ConsumerGroupLifecycle(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		Serve(ctx, listener, metaMgr, coord, 1)
+		if err := Serve(ctx, listener, metaMgr, coord, 1); err != nil {
+			t.Errorf("serve: %v", err)
+		}
 		close(done)
 	}()
 	time.Sleep(50 * time.Millisecond)

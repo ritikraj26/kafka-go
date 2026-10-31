@@ -40,7 +40,14 @@ func TestFollowerFetchPersistsBeforeAdvancingProgress(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { defer close(done); network.Serve(ctx, listener, m, coordinator.NewCoordinator(), 1) }()
+	coord := coordinator.NewCoordinator()
+	defer coord.Close()
+	go func() {
+		defer close(done)
+		if err := network.Serve(ctx, listener, m, coord, 1); err != nil {
+			t.Errorf("leader server: %v", err)
+		}
+	}()
 	fm := NewFollowerManager(m, 2, time.Millisecond)
 	defer func() {
 		fm.closeAll()

@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -65,6 +66,13 @@ func (p *Partition) checkProduce(options ProduceOptions) error {
 // ProduceRecords checks leadership and minimum ISR atomically with the local
 // append. A nonnegative offset with an error means the write may already exist.
 func (p *Partition) ProduceRecords(records []byte, options ProduceOptions) (int64, error) {
+	return p.ProduceRecordsContext(context.Background(), records, options)
+}
+
+func (p *Partition) ProduceRecordsContext(ctx context.Context, records []byte, options ProduceOptions) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	records = bytes.Clone(records)
 	var batches []storage.RecordBatch
 	if len(records) > 0 {
@@ -76,6 +84,9 @@ func (p *Partition) ProduceRecords(records []byte, options ProduceOptions) (int6
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
 	if err := p.checkProduce(options); err != nil {
 		return -1, err
 	}
@@ -84,6 +95,9 @@ func (p *Partition) ProduceRecords(records []byte, options ProduceOptions) (int6
 	}
 	offset, err := p.appendRecords(records, batches, p.LogDirForBroker(options.BrokerID))
 	if err != nil {
+		return offset, err
+	}
+	if err := ctx.Err(); err != nil {
 		return offset, err
 	}
 	if options.Acks != -1 {
@@ -96,14 +110,12 @@ func (p *Partition) ProduceRecords(records []byte, options ProduceOptions) (int6
 	}
 	p.pendingProduces[waiter] = struct{}{}
 	defer delete(p.pendingProduces, waiter)
-	p.initCond()
-	timer := time.AfterFunc(max(0, time.Until(options.Deadline)), func() {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.signalChange()
-	})
+	timer := time.NewTimer(max(0, time.Until(options.Deadline)))
 	defer timer.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return offset, err
+		}
 		if p.LeaderID != options.BrokerID || p.LeaderEpoch != epoch || !p.ReplicaAvailable(options.BrokerID) {
 			return offset, ErrNotLeader
 		}
@@ -122,13 +134,27 @@ func (p *Partition) ProduceRecords(records []byte, options ProduceOptions) (int6
 		if !time.Now().Before(options.Deadline) {
 			return offset, ErrProduceTimeout
 		}
-		p.hwCond.Wait()
+		if p.changed == nil {
+			p.changed = make(chan struct{})
+		}
+		changed := p.changed
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		case <-changed:
+		}
+		p.mu.Lock()
 	}
 }
 
 func (p *Partition) signalChange() {
 	p.initCond()
 	p.hwCond.Broadcast()
+	if p.changed != nil {
+		close(p.changed)
+		p.changed = nil
+	}
 }
 
 // ReplaceISR validates membership, advances HW and wakes pending produce requests.

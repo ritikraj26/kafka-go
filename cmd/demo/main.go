@@ -246,6 +246,7 @@ func main() {
 	}
 
 	metaMgr := metadata.NewManager()
+	defer metaMgr.Schemas.Close()
 	metaMgr.Brokers = reg
 	metaMgr.ReplicationFactor = 3
 	if err := metaMgr.SetLogDir(logDir); err != nil {
@@ -253,6 +254,7 @@ func main() {
 		return
 	}
 	coord := coordinator.NewCoordinator()
+	defer coord.Close()
 	if err := coord.LoadOffsets(logDir); err != nil {
 		fail(fmt.Sprintf("Recover consumer offsets: %v", err))
 		return
@@ -260,24 +262,60 @@ func main() {
 	coord.RebalanceDelay = 500 * time.Millisecond // allow all members to arrive before completing join
 
 	isrMgr := replication.NewISRManager(metaMgr, 500*time.Millisecond, 10000)
-	isrMgr.Start(ctx)
-
 	ctrl := controller.NewController(metaMgr, reg, 1*time.Second)
-	ctrl.Start(ctx)
-
 	var followers []*replication.FollowerManager
+	var servers sync.WaitGroup
+	listeners := make(map[int32]net.Listener)
+	defer func() {
+		stop()
+		for _, listener := range listeners {
+			listener.Close()
+		}
+		servers.Wait()
+		for _, fm := range followers {
+			fm.Wait()
+		}
+		isrMgr.Wait()
+		ctrl.Wait()
+	}()
 	brokerCancels := make(map[int32]context.CancelFunc)
 	for _, b := range reg.All() {
+		listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", b.Port))
+		if err != nil {
+			fail(fmt.Sprintf("Bind broker %d: %v", b.ID, err))
+			return
+		}
+		listeners[b.ID] = listener
+	}
+	if err := isrMgr.Start(ctx); err != nil {
+		fail(err.Error())
+		return
+	}
+	if err := ctrl.Start(ctx); err != nil {
+		fail(err.Error())
+		return
+	}
+	for _, b := range reg.All() {
 		fm := replication.NewFollowerManager(metaMgr, b.ID, 100*time.Millisecond)
-		fm.Start(ctx)
+		if err := fm.Start(ctx); err != nil {
+			fail(err.Error())
+			return
+		}
 		followers = append(followers, fm)
 
 		bCtx, bCancel := context.WithCancel(ctx)
 		brokerCancels[b.ID] = bCancel
-		go network.StartOnPort(bCtx, b.Port, metaMgr, coord, b.ID)
+		servers.Add(1)
+		go func() {
+			defer servers.Done()
+			defer bCancel()
+			if err := network.Serve(bCtx, listeners[b.ID], metaMgr, coord, b.ID); err != nil {
+				fail(fmt.Sprintf("Broker %d stopped unexpectedly: %v", b.ID, err))
+				stop()
+			}
+		}()
 	}
 
-	time.Sleep(300 * time.Millisecond)
 	ok("All 3 brokers started on ports 19092, 19093, 19094")
 
 	// STEP 1
@@ -302,7 +340,7 @@ func main() {
 	leaderPort := ports[p.LeaderID-1]
 	corrID := int32(100)
 
-	leaderConn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", leaderPort), 2*time.Second)
+	leaderConn, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", fmt.Sprintf("localhost:%d", leaderPort))
 	if err != nil {
 		fail(fmt.Sprintf("Connect to leader: %v", err))
 		stop()
@@ -350,7 +388,7 @@ func main() {
 		}
 	}
 	followerPort := ports[followerBrokerID-1]
-	followerConn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", followerPort), 2*time.Second)
+	followerConn, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", fmt.Sprintf("localhost:%d", followerPort))
 	if err != nil {
 		fail(fmt.Sprintf("Connect to follower %d: %v", followerBrokerID, err))
 	} else {
@@ -377,7 +415,9 @@ func main() {
 
 	// STEP 4
 	banner("STEP 4: Waiting for Replication (2 seconds)")
-	time.Sleep(2 * time.Second)
+	if !waitDemo(ctx, 2*time.Second) {
+		return
+	}
 	info(fmt.Sprintf("  Leader LEO:     %d", p.GetLogEndOffset()))
 	info(fmt.Sprintf("  High Watermark: %d", p.GetHighWatermark()))
 	for _, rid := range p.ReplicaNodes {
@@ -498,7 +538,7 @@ func main() {
 		cgWg.Add(1)
 		go func(idx int) {
 			defer cgWg.Done()
-			cgResults[idx] = coord.JoinGroup("demo-group", "", 10000, "consumer",
+			cgResults[idx] = coord.JoinGroupContext(ctx, "demo-group", "", 10000, "consumer",
 				[]coordinator.MemberProtocol{{Name: "range", Metadata: []byte("meta")}})
 		}(i)
 	}
@@ -536,7 +576,9 @@ func main() {
 		if p.LeaderID != oldLeader {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		if !waitDemo(ctx, 500*time.Millisecond) {
+			return
+		}
 	}
 
 	if p.LeaderID != oldLeader {
@@ -551,7 +593,7 @@ func main() {
 	if p.LeaderID != oldLeader {
 		banner(fmt.Sprintf("STEP 10: Produce to New Leader (broker %d)", p.LeaderID))
 		newLeaderPort := ports[p.LeaderID-1]
-		newConn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", newLeaderPort), 2*time.Second)
+		newConn, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", fmt.Sprintf("localhost:%d", newLeaderPort))
 		if err != nil {
 			fail(fmt.Sprintf("Connect to new leader: %v", err))
 		} else {
@@ -592,10 +634,15 @@ func main() {
 	fmt.Println("    11. Produce to newly-elected leader \u2192 SUCCESS")
 	fmt.Println()
 
-	stop()
-	for _, fm := range followers {
-		fm.Wait()
+}
+
+func waitDemo(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
-	isrMgr.Wait()
-	ctrl.Wait()
 }

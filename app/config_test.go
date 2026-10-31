@@ -49,6 +49,7 @@ func TestMinimumISRConfiguration(t *testing.T) {
 
 func TestStartupRejectsInvalidMinimumISR(t *testing.T) {
 	if os.Getenv("KAFKA_GO_TEST_INVALID_ISR") == "1" {
+		os.Args = os.Args[:1]
 		main()
 		return
 	}

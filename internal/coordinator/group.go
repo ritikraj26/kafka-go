@@ -59,7 +59,8 @@ type Member struct {
 	Protocols      []MemberProtocol
 	Assignment     []byte
 	LastHeartbeat  time.Time
-	sessionTimer   *time.Timer
+	sessionTimer   *groupTimer
+	joinAttempt    uint64
 }
 
 // MemberProtocol is a name+metadata pair from JoinGroup.
@@ -84,7 +85,9 @@ type ConsumerGroup struct {
 	pendingSyncs map[string]chan []byte
 
 	// Rebalance delay timer: when set, join completion is deferred
-	rebalanceTimer *time.Timer
+	rebalanceTimer    *groupTimer
+	rebalanceSequence uint64
+	timers            sync.WaitGroup
 
 	// Called when a member's session expires
 	onSessionExpired func(g *ConsumerGroup, memberID string)
@@ -148,6 +151,9 @@ func (g *ConsumerGroup) chooseProtocol() string {
 // increments the generation, selects protocol, picks leader, and
 // delivers JoinGroupResult to all waiting callers.
 func (g *ConsumerGroup) completeJoinPhase() {
+	if g.State == GroupDead || len(g.Members) == 0 {
+		return
+	}
 	g.GenerationID++
 	g.ProtocolName = g.chooseProtocol()
 
@@ -202,15 +208,7 @@ func (g *ConsumerGroup) startSessionTimer(m *Member) {
 	}
 	m.LastHeartbeat = time.Now()
 	memberID := m.MemberID // capture for closure
-	m.sessionTimer = time.AfterFunc(m.SessionTimeout, func() {
-		// The timer may fire after removeMember stopped it but before the
-		// goroutine was scheduled. Re-check membership under lock.
-		g.mu.Lock()
-		if _, ok := g.Members[memberID]; !ok {
-			g.mu.Unlock()
-			return
-		}
-		g.mu.Unlock()
+	m.sessionTimer = g.after(m.SessionTimeout, func() {
 		if g.onSessionExpired != nil {
 			g.onSessionExpired(g, memberID)
 		}
@@ -223,10 +221,7 @@ func (g *ConsumerGroup) resetSessionTimer(memberID string) {
 	if !ok {
 		return
 	}
-	m.LastHeartbeat = time.Now()
-	if m.sessionTimer != nil {
-		m.sessionTimer.Reset(m.SessionTimeout)
-	}
+	g.startSessionTimer(m)
 }
 
 // removeMember removes a member and cleans up its resources.
@@ -252,6 +247,9 @@ func (g *ConsumerGroup) removeMember(memberID string) {
 	}
 
 	if len(g.Members) == 0 {
+		g.rebalanceTimer.Stop()
+		g.rebalanceTimer = nil
+		g.rebalanceSequence++
 		g.State = GroupEmpty
 		g.LeaderID = ""
 	}
@@ -260,6 +258,9 @@ func (g *ConsumerGroup) removeMember(memberID string) {
 // triggerRebalance moves the group to Joining state and fails any
 // pending sync callers with REBALANCE_IN_PROGRESS (27).
 func (g *ConsumerGroup) triggerRebalance() {
+	if g.State == GroupDead {
+		return
+	}
 	logger.L.Info("triggering rebalance", "group", g.GroupID, "generation", g.GenerationID)
 	g.State = GroupJoining
 

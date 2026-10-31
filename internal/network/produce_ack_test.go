@@ -225,11 +225,23 @@ func TestIntegration_AcksAllWaitsForDurableFollower(t *testing.T) {
 	p := &testutil.CreateTopic(t, m, "events", 1).Partitions[0]
 	ctx, cancel := context.WithCancel(context.Background())
 	serverDone := make(chan struct{})
-	go func() { defer close(serverDone); Serve(ctx, listener, m, coordinator.NewCoordinator(), 1) }()
+	coord := coordinator.NewCoordinator()
+	go func() {
+		defer close(serverDone)
+		if err := Serve(ctx, listener, m, coord, 1); err != nil {
+			t.Errorf("ack server: %v", err)
+		}
+	}()
 	follower := replication.NewFollowerManager(m, 2, 5*time.Millisecond)
-	follower.Start(ctx)
+	if err := follower.Start(ctx); err != nil {
+		cancel()
+		listener.Close()
+		coord.Close()
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		cancel()
+		coord.Close()
 		follower.Wait()
 		select {
 		case <-serverDone:

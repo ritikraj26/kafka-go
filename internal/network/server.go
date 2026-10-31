@@ -2,8 +2,10 @@ package network
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 
 	"github.com/ritiraj/kafka-go/internal/coordinator"
@@ -11,62 +13,80 @@ import (
 	"github.com/ritiraj/kafka-go/internal/metadata"
 )
 
-// Start binds to port 9092 and accepts incoming Kafka client connections.
-// It blocks until ctx is cancelled, then drains in-flight connections.
-func Start(ctx context.Context, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
-	listener, err := net.Listen("tcp", "0.0.0.0:9092")
-	if err != nil {
-		logger.L.Error("failed to bind to port 9092", "err", err)
-		return
+// Start uses the local broker's advertised port, not a hard-coded primary port.
+func Start(ctx context.Context, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32) error {
+	if m.Brokers == nil || m.Brokers.Get(brokerID) == nil {
+		return fmt.Errorf("local broker %d is not registered", brokerID)
 	}
-	logger.L.Info("broker listening", "port", 9092)
-	Serve(ctx, listener, metaMgr, coord, localBrokerID)
+	return StartOnPort(ctx, m.Brokers.Get(brokerID).Port, m, c, brokerID)
 }
 
-// StartOnPort binds to the given port and accepts incoming Kafka client connections.
-// It blocks until ctx is cancelled, then drains in-flight connections.
-func StartOnPort(ctx context.Context, port int32, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		logger.L.Error("failed to bind", "port", port, "err", err)
-		return
+func StartOnPort(ctx context.Context, port int32, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	logger.L.Info("broker listening", "port", port)
-	Serve(ctx, listener, metaMgr, coord, localBrokerID)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(int(port))))
+	if err != nil {
+		return fmt.Errorf("bind broker %d: %w", brokerID, err)
+	}
+	return Serve(ctx, listener, m, c, brokerID)
 }
 
-// Serve accepts connections on an existing listener until ctx is cancelled.
-// Exported for use in integration tests with a custom listener.
-func Serve(ctx context.Context, listener net.Listener, metaMgr *metadata.Manager, coord *coordinator.Coordinator, localBrokerID int32) {
-	var wg sync.WaitGroup
-
-	// Close the listener when ctx is cancelled so Accept() unblocks.
+// Serve owns its listener and accepted connections, but not the shared metadata
+// manager or coordinator. Cancellation closes sockets and waits for every handler.
+func Serve(parent context.Context, listener net.Listener, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	var mu sync.Mutex
+	active := make(map[net.Conn]struct{})
+	var handlers sync.WaitGroup
+	closed := make(chan struct{})
 	go func() {
+		defer close(closed)
 		<-ctx.Done()
-		logger.L.Info("shutting down broker")
-		listener.Close()
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.L.Warn("failed to close listener", "broker", brokerID, "err", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for conn := range active {
+			if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				logger.L.Debug("failed to close active connection", "err", err)
+			}
+		}
 	}()
-
+	logger.L.Info("broker listening", "broker", brokerID, "address", listener.Addr())
+	var serveErr error
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			// Expected error after listener.Close() during shutdown.
-			if ctx.Err() != nil {
-				break
+			if ctx.Err() == nil {
+				serveErr = fmt.Errorf("accept broker %d: %w", brokerID, err)
 			}
-			logger.L.Error("failed to accept connection", "err", err)
-			continue
+			break
 		}
-
-		wg.Add(1)
+		mu.Lock()
+		if ctx.Err() != nil {
+			mu.Unlock()
+			conn.Close()
+			break
+		}
+		active[conn] = struct{}{}
+		handlers.Add(1)
+		mu.Unlock()
 		go func() {
-			defer wg.Done()
-			handleConnection(conn, metaMgr, coord, localBrokerID)
+			defer handlers.Done()
+			defer func() {
+				mu.Lock()
+				delete(active, conn)
+				mu.Unlock()
+			}()
+			handleConnection(ctx, conn, m, c, brokerID)
 		}()
 	}
-
-	logger.L.Info("waiting for in-flight connections to drain")
-	wg.Wait()
-	logger.L.Info("broker stopped")
+	cancel()
+	<-closed
+	handlers.Wait()
+	logger.L.Info("broker stopped", "broker", brokerID)
+	return serveErr
 }
