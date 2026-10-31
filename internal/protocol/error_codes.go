@@ -9,6 +9,8 @@ const (
 	ErrUnknownTopicOrPartition      int16 = 3
 	ErrNotLeaderOrFollower          int16 = 6
 	ErrRequestTimedOut              int16 = 7
+	ErrOffsetMetadataTooLarge       int16 = 12
+	ErrKafkaStorageError            int16 = 56
 	ErrCoordinatorNotAvailable      int16 = 15
 	ErrNotCoordinator               int16 = 16
 	ErrInvalidRequiredAcks          int16 = 21

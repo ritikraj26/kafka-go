@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ritiraj/kafka-go/internal/logger"
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 const (
@@ -83,7 +84,7 @@ func (m *Manager) persistCatalog(catalog map[string]topicMetadata) error {
 }
 
 func writeMetadata(dir string, data []byte) error {
-	if err := syncDirectoryTree(dir); err != nil {
+	if err := storage.MakeDirectory(dir); err != nil {
 		return err
 	}
 	f, err := os.CreateTemp(dir, ".broker-metadata-*")
@@ -109,49 +110,11 @@ func writeMetadata(dir string, data []byte) error {
 	if err := os.Rename(f.Name(), filepath.Join(dir, metadataFileName)); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
-}
-
-func syncDirectory(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
-
-// Newly created directory entries must be durable in their parents as well.
-func syncDirectoryTree(dir string) error {
-	// Configured ancestors such as /tmp may themselves be symlinks.
-	info, err := os.Stat(dir)
-	if err == nil {
-		if !info.IsDir() {
-			return fmt.Errorf("not a real directory: %s", dir)
-		}
-		return syncDirectory(dir)
-	}
-	if !os.IsNotExist(err) {
-		return err
-	}
-	parent := filepath.Dir(dir)
-	if parent == dir {
-		return err
-	}
-	if err := syncDirectoryTree(parent); err != nil {
-		return err
-	}
-	if err := os.Mkdir(dir, 0755); err != nil && !os.IsExist(err) {
-		return err
-	}
-	if err := syncDirectory(dir); err != nil {
-		return err
-	}
-	return syncDirectory(parent)
+	return storage.SyncDirectory(dir)
 }
 
 func initializeLog(dir string) error {
-	if err := syncDirectoryTree(dir); err != nil {
+	if err := storage.MakeDirectory(dir); err != nil {
 		return err
 	}
 	segments, err := listSegments(dir)
@@ -172,7 +135,7 @@ func initializeLog(dir string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return syncDirectory(dir)
+	return storage.SyncDirectory(dir)
 }
 
 func (m *Manager) readCatalog() (map[string]topicMetadata, error) {

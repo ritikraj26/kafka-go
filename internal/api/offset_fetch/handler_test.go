@@ -19,19 +19,25 @@ func parsePartitionOffset(body []byte) (offset int64, errCode int16) {
 	offset = int64(binary.BigEndian.Uint64(body[pos : pos+8]))
 	pos += 8
 	metaLen := int(int16(binary.BigEndian.Uint16(body[pos : pos+2])))
-	pos += 2 + metaLen
+	pos += 2 + max(0, metaLen)
 	errCode = int16(binary.BigEndian.Uint16(body[pos : pos+2]))
 	return
 }
 
-func joinAndCommit(coord *coordinator.Coordinator, groupID, topic string, partition int32, offset int64) {
+func joinAndCommit(t *testing.T, coord *coordinator.Coordinator, groupID, topic string, partition int32, offset int64) {
+	t.Helper()
 	res := coord.JoinGroup(groupID, "", 30000, "consumer",
 		[]coordinator.MemberProtocol{{Name: "range"}})
-	coord.CommitOffset(groupID, res.GenerationID, res.MemberID, topic, partition, offset)
+	if code := coord.CommitOffset(groupID, res.GenerationID, res.MemberID, topic, partition, offset); code != 0 {
+		t.Fatalf("commit failed: %d", code)
+	}
 }
 
 func TestOffsetFetch_NoCommittedOffset(t *testing.T) {
 	coord := coordinator.NewCoordinator()
+	if err := coord.LoadOffsets(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
 	req := &protocol.OffsetFetchRequest{
 		GroupID: "fetch-group",
 		Topics: []protocol.OffsetFetchTopic{
@@ -39,7 +45,10 @@ func TestOffsetFetch_NoCommittedOffset(t *testing.T) {
 		},
 	}
 	body := BuildBody(req, coord)
-	offset, _ := parsePartitionOffset(body)
+	offset, code := parsePartitionOffset(body)
+	if code != protocol.ErrNone {
+		t.Fatalf("empty initialized offset store returned %d", code)
+	}
 	if offset != -1 {
 		t.Errorf("offset = %d, want -1 (no committed offset)", offset)
 	}
@@ -47,7 +56,10 @@ func TestOffsetFetch_NoCommittedOffset(t *testing.T) {
 
 func TestOffsetFetch_WithCommittedOffset(t *testing.T) {
 	coord := coordinator.NewCoordinator()
-	joinAndCommit(coord, "fetch-group", "orders", 0, 55)
+	if err := coord.LoadOffsets(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	joinAndCommit(t, coord, "fetch-group", "orders", 0, 55)
 	req := &protocol.OffsetFetchRequest{
 		GroupID: "fetch-group",
 		Topics: []protocol.OffsetFetchTopic{

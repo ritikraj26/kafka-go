@@ -206,7 +206,7 @@ type OffsetCommitTopic struct {
 type OffsetCommitPartition struct {
 	Index           int32
 	CommittedOffset int64
-	Metadata        string
+	Metadata        *string
 }
 
 // OffsetCommitRequest (api_key=8, v2)
@@ -1149,10 +1149,7 @@ func ParseOffsetCommitRequest(header *RequestHeader) (*OffsetCommitRequest, erro
 			if err != nil {
 				return nil, fmt.Errorf("OffsetCommit: read metadata: %w", err)
 			}
-			entry := OffsetCommitPartition{Index: idx, CommittedOffset: offset}
-			if meta != nil {
-				entry.Metadata = *meta
-			}
+			entry := OffsetCommitPartition{Index: idx, CommittedOffset: offset, Metadata: meta}
 			parts = append(parts, entry)
 		}
 		topics = append(topics, OffsetCommitTopic{Name: name, Partitions: parts})

@@ -193,6 +193,9 @@ func TestLeaveGroup_TriggersRebalance(t *testing.T) {
 
 func TestOffsetCommitAndFetch(t *testing.T) {
 	coord := NewCoordinator()
+	if err := coord.LoadOffsets(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
 
 	// Join a single-member group
 	result := coord.JoinGroup("oc", "", 10000, "consumer",
@@ -225,7 +228,9 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// First coordinator — commit some offsets
 	coord1 := NewCoordinator()
-	coord1.LoadOffsets(dir)
+	if err := coord1.LoadOffsets(dir); err != nil {
+		t.Fatal(err)
+	}
 
 	jr := coord1.JoinGroup("pg", "", 10000, "consumer",
 		[]MemberProtocol{{Name: "range", Metadata: nil}})
@@ -246,7 +251,9 @@ func TestOffsetPersistence(t *testing.T) {
 
 	// Second coordinator — should recover offsets from disk
 	coord2 := NewCoordinator()
-	coord2.LoadOffsets(dir)
+	if err := coord2.LoadOffsets(dir); err != nil {
+		t.Fatal(err)
+	}
 
 	off, ec := coord2.FetchOffset("pg", "topic1", 0)
 	if ec != 0 {

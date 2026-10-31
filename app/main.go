@@ -92,7 +92,10 @@ func main() {
 	}
 
 	// Load committed offsets from disk
-	coord.LoadOffsets(logDir)
+	if err := coord.LoadOffsets(logDir); err != nil {
+		logger.L.Error("failed to recover consumer offsets; files were preserved", "err", err)
+		os.Exit(1)
+	}
 
 	// Start ISR maintenance (evaluates ISR every 1s)
 	lagTimeMaxMs := int64(envInt("REPLICA_LAG_TIME_MAX_MS", 10000))

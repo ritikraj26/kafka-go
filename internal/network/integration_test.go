@@ -17,6 +17,9 @@ import (
 func TestIntegration_ConsumerGroupLifecycle(t *testing.T) {
 	metaMgr := metadata.NewManager()
 	coord := coordinator.NewCoordinator()
+	if err := coord.LoadOffsets(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

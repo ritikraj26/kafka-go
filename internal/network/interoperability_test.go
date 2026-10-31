@@ -33,7 +33,10 @@ func interopBroker(t *testing.T) (string, *metadata.Manager, *coordinator.Coordi
 	m.Schemas.Register("events", &schema.SimpleSchema{Fields: map[string]schema.FieldType{"value": schema.TypeString}})
 	testutil.CreateTopic(t, m, "events", 1)
 	coord := coordinator.NewCoordinator()
-	coord.LoadOffsets(m.GetLogDir())
+	if err := coord.LoadOffsets(m.GetLogDir()); err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); Serve(ctx, listener, m, coord, 1) }()

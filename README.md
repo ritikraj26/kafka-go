@@ -14,8 +14,8 @@ with dead-letter queue routing. It is not a production-ready Kafka replacement.
 | **Fetch** | 1 | 16; legacy 0 | Complete-batch reads within visibility and byte limits; only v16 is advertised |
 | **ListOffsets** | 2 | 1 | Earliest/latest offset lookup per partition |
 | **Metadata** | 3 | 12 | Broker & topic metadata by name or UUID, including missing-topic errors |
-| **OffsetCommit** | 8 | 2 | Commit consumer offsets to coordinator |
-| **OffsetFetch** | 9 | 1 | Fetch committed offsets for a consumer group |
+| **OffsetCommit** | 8 | 2 | Durably commit offsets and nullable metadata for a group member |
+| **OffsetFetch** | 9 | 1 | Fetch committed offsets and metadata for a consumer group |
 | **FindCoordinator** | 10 | 0 | Discover the group coordinator broker |
 | **JoinGroup** | 11 | 0 | Join a consumer group (eager rebalance) |
 | **Heartbeat** | 12 | 0 | Keep consumer group membership alive |
@@ -57,7 +57,8 @@ internal/
 │   └── list_offsets/        ListOffsets — earliest/latest offset lookup
 ├── coordinator/
 │   ├── group.go             Consumer group state machine (Empty→Joining→AwaitingSync→Stable)
-│   └── coordinator.go       Coordinator facade: join/sync/heartbeat/leave + offset store
+│   ├── coordinator.go       Coordinator facade: join/sync/heartbeat/leave
+│   └── offsets.go           Checksummed commit log, durable publication, fail-closed replay
 ├── broker/
 │   └── broker.go            Broker registry for simulated multi-broker cluster
 ├── metadata/
@@ -75,7 +76,8 @@ internal/
 │   ├── registry.go          Thread-safe schema registry + JSON validation
 │   └── infer.go             Schema inference (Ollama LLM → local JSON fallback)
 └── storage/
-    └── record_batch.go      Checked magic-v2 batch codec (CRC32C, offsets, records)
+    ├── record_batch.go      Checked magic-v2 batch codec (CRC32C, offsets, records)
+    └── directory.go         Durable directory creation shared by metadata and offsets
 ```
 
 ## Features
@@ -87,7 +89,7 @@ internal/
 - **Log segment rolling** — Active segment rolls to a new `%020d.log` / `%020d.index` pair when the file exceeds `MaxSegmentBytes` (default 1 GB); `SeekToOffset` selects the correct segment before binary-searching its index
 - **Persistent topic metadata** — Atomically saves topic UUIDs, partition replicas, leader IDs/epochs, and relative log paths in `broker-metadata.json`; recovers topics in both supported log layouts, including empty topics
 - **Consumer groups** — Full eager-rebalance protocol: FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup with session timeout expiry and automatic rebalance triggers
-- **Offset management** — OffsetCommit/OffsetFetch for consumer group offset tracking; ListOffsets for earliest/latest offset discovery
+- **Offset management** — OffsetCommit publishes offsets and nullable metadata only after a complete append/fsync/close; storage failures fence the offset store. Streaming recovery validates checksummed records and preserves valid legacy entries. ListOffsets provides earliest/latest offset discovery.
 - **Simulated replication** — Configurable multi-broker cluster (in-process) with round-robin replica assignment, follower fetch simulation, and high watermark advancement
 - **LeaderEpoch validation** — Fetch requests carrying a `current_leader_epoch` are fenced: stale epoch → `ErrFencedLeaderEpoch (74)`, epoch newer than the leader's → `ErrUnknownLeaderEpoch (75)`; wrong broker or unassigned replica → `ErrNotLeaderOrFollower (6)`. Epoch `-1` (Fetch v0 / old clients) skips epoch validation.
 - **Complete-batch fetches** — Reads across segments using sparse-index seeks (or scanning when an index is absent), retains partition byte budgets, and prevents consumer data above HW from entering a response
@@ -227,6 +229,52 @@ this in-process simulator, not a multi-process controller quorum or a distribute
 metadata service. Schemas and consumer-group membership are not persisted here;
 consumer offsets continue to use their separate log.
 
+### Consumer-offset durability and recovery
+
+Consumer offsets live in
+`{log.dirs}/__consumer_offsets-0/00000000000000000000.log`, separately from topic
+record batches. `LoadOffsets` must succeed before serving offset APIs; the
+application and demo initialize it explicitly. An uninitialized coordinator
+returns `COORDINATOR_NOT_AVAILABLE` (15), not an in-memory commit success.
+
+For each commit, the coordinator validates the input, member and generation,
+holds the coordinator/group locks through the append, then writes, syncs, and
+closes the file before publishing the offset in memory. A stale member or
+generation cannot change during that validation/write window. Commit metadata
+is limited to **4096 UTF-8 bytes**, with `OFFSET_METADATA_TOO_LARGE` (12) on
+overflow. Null and empty metadata remain distinct through OffsetFetch and restart.
+
+Open/write/short-write/sync/close failures return `KAFKA_STORAGE_ERROR` (56).
+The last published map is not updated, and subsequent offset commits **and
+fetches** return a storage error until a new coordinator successfully recovers
+the log. A complete but unacknowledged record may be recovered after an I/O
+failure, so callers must treat such failures as ambiguous rather than assuming
+the commit never happened.
+
+New entries are newline-delimited version-1 JSON envelopes with a CRC32C checksum
+over the enclosed commit record. Recovery reads one bounded record at a time
+(maximum **256 KiB**, including the newline), validates the entire file, and
+publishes only after a successful replay. Invalid JSON, missing fields, invalid
+offsets, bad checksums, unknown versions, oversized records, and incomplete tails
+stop startup. No entries are skipped; no log is truncated or automatically repaired.
+An existing offset directory whose log is missing, an unexpected additional log
+segment, or a symlinked offset directory/file is also rejected.
+
+Valid legacy newline-delimited JSON commits remain readable and are never
+rewritten during recovery or append. They do not acquire checksum protection
+retroactively, and previously discarded commit metadata cannot be recovered.
+New and legacy entries can coexist in the same file. Back up damaged logs and
+repair them explicitly rather than deleting them to bypass validation.
+
+This is a **local disk durability** guarantee, not replicated coordinator state
+or an atomic transaction with consumer processing. Group membership is rebuilt
+after restart; offsets are retained independently. Stateless/manual commits
+without group membership, offset retention/compaction, and replicated offset
+storage are not implemented. The single append log and latest-offset map can
+grow without quotas, and commits serialize disk synchronization. Losing the
+entire offset directory is indistinguishable from a never-initialized store;
+backups and independent failure domains are still required.
+
 ### Fetch behavior and limits
 
 The supported fetch layouts are **v16** and legacy **v0**, not the versions
@@ -360,6 +408,10 @@ go test -race ./internal/api/produce ./internal/metadata ./internal/replication 
 # Independent-client interoperability (no external Kafka or Ollama needed)
 go test -race ./internal/network -run 'TestFranzGo|TestIndependentCodec' -v
 go test ./internal/protocol -run='^$' -fuzz=FuzzRequestDispatch -fuzztime=30s
+
+# Offset disk-failure injection and independent-client broker-process restart
+go test -race ./internal/coordinator ./internal/api/offset_commit ./internal/api/offset_fetch ./internal/network ./app
+go test ./internal/coordinator -run='^$' -fuzz=FuzzOffsetLogReplay -fuzztime=30s
 ```
 
 ### Test Coverage
@@ -370,18 +422,18 @@ go test ./internal/protocol -run='^$' -fuzz=FuzzRequestDispatch -fuzztime=30s
 | `schema` | Validation (missing field, wrong type, not JSON), inference from JSON, integer↔number coercion |
 | `storage` | CRC32C and record validation, independent wire fixture, multiple batches, null values, headers, malformed input, bounded recovery reads, parser fuzzing |
 | `metadata` | Record offsets/indexes, corruption preservation, persistent topic/leader recovery across processes, legacy import, divergent/missing replicas, malformed catalogs, atomic DLQ creation, persistence-failure fencing |
-| `coordinator` | Single/multi-member join, sync group, heartbeat, leave + rebalance, offset commit/fetch |
+| `coordinator` | Group lifecycle; offset open/write/short-write/sync/close failures; no publication before durability; CRC/legacy/truncation replay; metadata bounds; concurrent commits and generation-lock checks |
 | `replication` | TCP follower persistence and subsequent HW acknowledgement, batches exceeding 1 MiB, failed-write fencing, ISR shrink/expand |
 | `api/api_versions` | All 13 API keys present, error propagation |
 | `api/produce` | Invalid inputs without side effects, minimum ISR, shared request deadline, whole-append waits, DLQ acknowledgement and persistence-error propagation |
 | `app` | Startup rejection of corrupt storage and invalid minimum ISR; explicit single-copy configuration |
 | `api/fetch` | Exact record/offset assertions, HW boundaries, first-batch exception, partition/global byte limits, segment/index fallbacks, offset/leader errors, long polls, concurrent append/fetch |
-| `network` | TCP produce/restart/fetch, acknowledgement failures, real follower persistence, franz-go producer/group consumer/commit/resume, independent discovery/metadata/group/pagination codecs |
+| `network` | TCP produce/restart/fetch, acknowledgement failures, follower persistence, franz-go commit/resume across separate broker test processes, offset storage-error/metadata codecs, independent discovery/group/pagination codecs |
 
 ## Limitations & Future Work
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
-- **Remaining correctness work** — Persisted commit/ISR state, offset-commit I/O error handling, failover/divergence recovery, and remaining concurrency/lifecycle issues are still outstanding; the local topic catalog is not distributed consensus
+- **Remaining correctness work** — Persisted replication commit/ISR state, replicated coordinator storage, failover/divergence recovery, and remaining concurrency/lifecycle issues are still outstanding; the local topic catalog is not distributed consensus
 - **Compatibility scope** — Only the listed versions and configured client subset are supported. More API versions, independent client implementations, timestamp offset lookup, static/cooperative groups, and administrative APIs require additional work.
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported

@@ -10,12 +10,12 @@ func BuildBody(req *protocol.OffsetCommitRequest, coord *coordinator.Coordinator
 	enc := protocol.NewEncoder()
 	enc.WriteArrayLen(len(req.Topics)) // topics array
 	for _, t := range req.Topics {
-		enc.WriteString(t.Name)                  // topic name
-		enc.WriteArrayLen(len(t.Partitions))     // partitions array
+		enc.WriteString(t.Name)              // topic name
+		enc.WriteArrayLen(len(t.Partitions)) // partitions array
 		for _, p := range t.Partitions {
 			enc.WriteInt32(p.Index) // partition index
-			errCode := coord.CommitOffset(req.GroupID, req.GenerationID, req.MemberID,
-				t.Name, p.Index, p.CommittedOffset)
+			errCode := coord.CommitOffsetWithMetadata(req.GroupID, req.GenerationID, req.MemberID,
+				t.Name, p.Index, p.CommittedOffset, p.Metadata)
 			enc.WriteInt16(errCode) // error_code
 		}
 	}

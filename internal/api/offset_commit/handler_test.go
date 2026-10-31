@@ -31,6 +31,9 @@ func joinMember(coord *coordinator.Coordinator, groupID string) (memberID string
 
 func TestOffsetCommit_HappyPath(t *testing.T) {
 	coord := coordinator.NewCoordinator()
+	if err := coord.LoadOffsets(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
 	memberID, genID := joinMember(coord, "commit-group")
 	req := &protocol.OffsetCommitRequest{
 		GroupID:      "commit-group",

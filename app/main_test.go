@@ -48,7 +48,7 @@ func TestStartupRejectsMalformedMetadata(t *testing.T) {
 	}
 }
 
-func assertRecoveryStartupFailure(t *testing.T, dir string) {
+func assertRecoveryStartupFailure(t *testing.T, dir string, expectedMessage ...string) {
 	t.Helper()
 	props := filepath.Join(dir, "server.properties")
 	if err := os.WriteFile(props, []byte("log.dirs="+dir+"\n"), 0600); err != nil {
@@ -63,7 +63,11 @@ func assertRecoveryStartupFailure(t *testing.T, dir string) {
 	if ctx.Err() != nil || !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
 		t.Fatalf("expected immediate startup failure: err=%v output=%s", err, output)
 	}
-	if !bytes.Contains(output, []byte("failed to recover partition logs")) || bytes.Contains(output, []byte("broker listening")) {
+	message := "failed to recover partition logs"
+	if len(expectedMessage) > 0 {
+		message = expectedMessage[0]
+	}
+	if !bytes.Contains(output, []byte(message)) || bytes.Contains(output, []byte("broker listening")) {
 		t.Fatalf("unexpected startup output: %s", output)
 	}
 }

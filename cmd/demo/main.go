@@ -253,6 +253,10 @@ func main() {
 		return
 	}
 	coord := coordinator.NewCoordinator()
+	if err := coord.LoadOffsets(logDir); err != nil {
+		fail(fmt.Sprintf("Recover consumer offsets: %v", err))
+		return
+	}
 	coord.RebalanceDelay = 500 * time.Millisecond // allow all members to arrive before completing join
 
 	isrMgr := replication.NewISRManager(metaMgr, 500*time.Millisecond, 10000)

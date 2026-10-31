@@ -1,89 +1,35 @@
 package coordinator
 
 import (
-	"bytes"
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ritiraj/kafka-go/internal/logger"
 	"github.com/ritiraj/kafka-go/internal/protocol"
-	"github.com/google/uuid"
 )
-
-// offsetRecord is the JSON format for persisted offset commits.
-type offsetRecord struct {
-	Group     string `json:"group"`
-	Topic     string `json:"topic"`
-	Partition int32  `json:"partition"`
-	Offset    int64  `json:"offset"`
-}
 
 // Coordinator manages all consumer groups and committed offsets.
 type Coordinator struct {
 	mu             sync.RWMutex
 	groups         map[string]*ConsumerGroup
-	offsets        map[string]map[string]map[int32]int64 // group -> topic -> partition -> offset
-	RebalanceDelay time.Duration                         // delay before completing a join round (allows more members to join)
-	MaxGroupSize   int                                   // max members per group (0 = unlimited, default 256)
-	offsetLogDir   string                                // directory for __consumer_offsets log persistence
+	offsets        offsetMap
+	RebalanceDelay time.Duration // delay before completing a join round (allows more members to join)
+	MaxGroupSize   int           // max members per group (0 = unlimited, default 256)
+	offsetLogDir   string        // directory for __consumer_offsets log persistence
+	offsetReady    bool
+	offsetErr      error
+	openOffsetLog  func(string) (offsetLogFile, error)
 }
 
 // NewCoordinator creates an empty Coordinator.
 func NewCoordinator() *Coordinator {
 	return &Coordinator{
 		groups:         make(map[string]*ConsumerGroup),
-		offsets:        make(map[string]map[string]map[int32]int64),
+		offsets:        make(offsetMap),
+		openOffsetLog:  openOffsetLogFile,
 		RebalanceDelay: 0,
 		MaxGroupSize:   256,
-	}
-}
-
-// SetLogDir sets the directory used for offset log persistence.
-// The offsets log will be stored at {logDir}/__consumer_offsets-0/00000000000000000000.log
-func (c *Coordinator) SetLogDir(dir string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.offsetLogDir = filepath.Join(dir, "__consumer_offsets-0")
-}
-
-// LoadOffsets replays the offset commit log from disk to rebuild the in-memory offset map.
-func (c *Coordinator) LoadOffsets(logDir string) {
-	c.SetLogDir(logDir)
-
-	logFile := filepath.Join(c.offsetLogDir, "00000000000000000000.log")
-	data, err := os.ReadFile(logFile)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			logger.L.Warn("failed to read offset log", "err", err)
-		}
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	dec := json.NewDecoder(bytes.NewReader(data))
-	count := 0
-	for dec.More() {
-		var rec offsetRecord
-		if err := dec.Decode(&rec); err != nil {
-			logger.L.Warn("skipping malformed offset record", "err", err)
-			continue
-		}
-		if c.offsets[rec.Group] == nil {
-			c.offsets[rec.Group] = make(map[string]map[int32]int64)
-		}
-		if c.offsets[rec.Group][rec.Topic] == nil {
-			c.offsets[rec.Group][rec.Topic] = make(map[int32]int64)
-		}
-		c.offsets[rec.Group][rec.Topic][rec.Partition] = rec.Offset
-		count++
-	}
-	if count > 0 {
-		logger.L.Info("loaded committed offsets from disk", "records", count)
 	}
 }
 
@@ -332,92 +278,6 @@ func (c *Coordinator) LeaveGroup(groupID string, memberID string) int16 {
 	}
 
 	return protocol.ErrNone
-}
-
-// CommitOffset stores a committed offset for a group/topic/partition.
-// Lock ordering: always c.mu first, then g.mu — never reversed.
-func (c *Coordinator) CommitOffset(groupID string, generationID int32, memberID string,
-	topic string, partition int32, offset int64) int16 {
-
-	g := c.FindGroup(groupID)
-	if g == nil {
-		return protocol.ErrCoordinatorNotAvailable
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Validate member and generation under g.mu while already holding c.mu.
-	g.mu.Lock()
-	if _, ok := g.Members[memberID]; !ok {
-		g.mu.Unlock()
-		return protocol.ErrUnknownMemberID
-	}
-	if generationID != g.GenerationID {
-		g.mu.Unlock()
-		return protocol.ErrIllegalGeneration
-	}
-	g.mu.Unlock()
-
-	if c.offsets[groupID] == nil {
-		c.offsets[groupID] = make(map[string]map[int32]int64)
-	}
-	if c.offsets[groupID][topic] == nil {
-		c.offsets[groupID][topic] = make(map[int32]int64)
-	}
-	c.offsets[groupID][topic][partition] = offset
-
-	// Persist to offset log (best-effort — don't fail the commit on I/O error)
-	if c.offsetLogDir != "" {
-		c.persistOffset(groupID, topic, partition, offset)
-	}
-
-	return protocol.ErrNone
-}
-
-// persistOffset appends an offset commit record to the durable log.
-// Caller must hold c.mu.
-func (c *Coordinator) persistOffset(group, topic string, partition int32, offset int64) {
-	if err := os.MkdirAll(c.offsetLogDir, 0755); err != nil {
-		logger.L.Warn("failed to create offset log dir", "err", err)
-		return
-	}
-	logFile := filepath.Join(c.offsetLogDir, "00000000000000000000.log")
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		logger.L.Warn("failed to open offset log", "err", err)
-		return
-	}
-	defer f.Close()
-	rec := offsetRecord{Group: group, Topic: topic, Partition: partition, Offset: offset}
-	data, err := json.Marshal(rec)
-	if err != nil {
-		return
-	}
-	data = append(data, '\n')
-	if _, err := f.Write(data); err != nil {
-		logger.L.Warn("failed to write offset record", "err", err)
-		return
-	}
-	if err := f.Sync(); err != nil {
-		logger.L.Warn("failed to fsync offset log", "err", err)
-	}
-}
-
-// FetchOffset returns the committed offset for a group/topic/partition.
-// Returns -1 if no offset has been committed.
-func (c *Coordinator) FetchOffset(groupID string, topic string, partition int32) (int64, int16) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if topics, ok := c.offsets[groupID]; ok {
-		if parts, ok := topics[topic]; ok {
-			if off, ok := parts[partition]; ok {
-				return off, protocol.ErrNone
-			}
-		}
-	}
-	return -1, protocol.ErrNone
 }
 
 // handleSessionExpired is called when a member's session timer fires.
