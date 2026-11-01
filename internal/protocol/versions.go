@@ -69,7 +69,15 @@ func requestDecoder(header *RequestHeader, expectedKey int16) (*Decoder, error) 
 	if header.GetAPIKey() != expectedKey || !SupportsVersion(expectedKey, header.GetAPIVersion()) {
 		return nil, fmt.Errorf("unsupported API key/version %d/%d", header.GetAPIKey(), header.GetAPIVersion())
 	}
-	d := NewDecoder(header.GetBody())
+	limits := DefaultDecodeLimits()
+	if header.decodeLimits != nil {
+		limits = *header.decodeLimits
+	}
+	d, err := NewDecoderWithLimits(header.GetBody(), limits)
+	if err != nil {
+		return nil, err
+	}
+	header.decoded = d.budget
 	clientID, err := d.ReadNullableString()
 	if err != nil {
 		return nil, fmt.Errorf("request client ID: %w", err)
@@ -99,5 +107,5 @@ func checkCompactArray(count uint64, d *Decoder) error {
 	if count == 0 || count-1 > uint64(d.Remaining()) {
 		return fmt.Errorf("invalid non-null compact array length %d", count)
 	}
-	return nil
+	return d.ChargeEntries(int64(count - 1))
 }

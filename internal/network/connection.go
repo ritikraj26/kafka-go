@@ -87,6 +87,16 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 		logger.L.Warn("non-replication API on internal listener", "api_key", header.GetAPIKey())
 		return false
 	}
+	decodeBytes := protocol.DecodeAllowance(size, admission.memoryLimits.MaxDecodedBytes)
+	decoded, err := admission.decoded.Acquire(ctx, decodeBytes)
+	if err != nil {
+		if ctx.Err() == nil && admission.logRejection() {
+			logger.L.Warn("decoder admission rejected", "err", err, "stats", admission.Stats())
+		}
+		return false
+	}
+	defer decoded.Release()
+	header.SetDecodeLimits(protocol.DecodeLimits{MaxBytes: decodeBytes, MaxEntries: admission.memoryLimits.MaxEntries})
 	var body []byte
 	var requestErr error
 	if header.GetAPIKey() == protocol.APIKeyApiVersions && header.GetErrorCode() != protocol.ErrNone {
@@ -94,7 +104,16 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 	} else {
 		request, err := protocol.ParseRequest(header)
 		if err != nil {
+			if errors.Is(err, protocol.ErrDecodeLimit) {
+				admission.mu.Lock()
+				admission.stats.DecodeLimitRejections++
+				admission.mu.Unlock()
+			}
 			logger.L.Warn("rejecting request", "api_key", header.GetAPIKey(), "version", header.GetAPIVersion(), "err", err)
+			return false
+		}
+		if !decoded.Resize(header.DecodedBytes()) {
+			logger.L.Error("decoder exceeded its reservation")
 			return false
 		}
 		if ctx.Err() != nil {
@@ -114,10 +133,13 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 				logger.L.Warn("fetch role does not match listener", "replica_id", req.ReplicaID, "replication_listener", replication)
 				return false
 			}
-			if header.GetAPIVersion() == 0 {
-				body, requestErr = fetch.BuildBodyV0Context(ctx, req, m, brokerID)
-			} else {
-				body, requestErr = fetch.BuildBodyContext(ctx, req, m, brokerID)
+			var payload *fetch.Payload
+			payload, requestErr = fetch.BuildWithMemory(ctx, req, m, brokerID, header.GetAPIVersion() != 0, fetch.MemoryPolicy{
+				Pool: admission.fetch, MaxDataBytes: admission.memoryLimits.FetchMaxBytes, MaxEntries: admission.memoryLimits.MaxEntries,
+			})
+			if payload != nil {
+				defer payload.Release()
+				body = payload.Body
 			}
 		case *protocol.DescribeTopicPartitionsRequest:
 			body = describetopics.BuildBody(req, m)
@@ -155,16 +177,11 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 	if protocol.ResponseHeaderVersion(header.GetAPIKey(), header.GetAPIVersion()) == 1 {
 		response = protocol.NewResponseV1(header.GetCorrelationID(), body)
 	}
-	data, err := response.Serialize()
-	if err != nil {
-		logger.L.Error("failed to serialize response", "err", err)
-		return false
-	}
 	if err := conn.SetWriteDeadline(time.Now().Add(connectionWriteTimeout)); err != nil {
 		logger.L.Error("failed to set response deadline", "err", err)
 		return false
 	}
-	if _, err := conn.Write(data); err != nil {
+	if _, err := response.WriteTo(conn); err != nil {
 		if ctx.Err() == nil {
 			logger.L.Warn("failed to write response", "err", err)
 		}

@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"fmt"
+
+	"github.com/ritiraj/kafka-go/internal/storage"
 )
 
 // interface for all request types
@@ -34,8 +36,9 @@ type ProduceTopic struct {
 
 // ProducePartition represents a partition in a Produce request
 type ProducePartition struct {
-	Index   int32
-	Records []byte // Raw record batch data
+	Index       int32
+	Records     []byte // Raw record batch data
+	RecordError error
 }
 
 // ProduceRequest request (api_key=0)
@@ -394,14 +397,19 @@ func ParseProduceRequest(header *RequestHeader) (*ProduceRequest, error) {
 					}
 
 					// Read records (COMPACT_BYTES)
-					records, err := decoder.ReadCompactBytes()
+					records, err := decoder.ReadCompactBytesView()
 					if err != nil {
 						return nil, fmt.Errorf("failed to read records: %w", err)
 					}
 
+					count, recordErr := storage.CountRecords(records)
+					if err := decoder.ChargeEntries(count); err != nil {
+						return nil, err
+					}
 					partitions = append(partitions, ProducePartition{
-						Index:   partitionIndex,
-						Records: records,
+						Index:       partitionIndex,
+						Records:     records,
+						RecordError: recordErr,
 					})
 
 					// Skip TAG_BUFFER for partition
@@ -787,6 +795,9 @@ func ParseDescribeTopicPartitionsRequest(header *RequestHeader) (*DescribeTopicP
 	if count == 0 || count-1 > uint64(d.Remaining()) {
 		return nil, fmt.Errorf("invalid describe-topics array")
 	}
+	if err := d.ChargeEntries(int64(count - 1)); err != nil {
+		return nil, err
+	}
 	req := &DescribeTopicPartitionsRequest{Header: header}
 	for i := uint64(1); i < count; i++ {
 		name, err := d.ReadCompactString()
@@ -849,6 +860,9 @@ func ParseMetadataRequest(header *RequestHeader) (*MetadataRequest, error) {
 	if count > 0 {
 		if count-1 > uint64(d.Remaining()/18) {
 			return nil, fmt.Errorf("invalid metadata topic count")
+		}
+		if err := d.ChargeEntries(int64(count - 1)); err != nil {
+			return nil, err
 		}
 		req.Topics = make([]MetadataTopic, 0)
 		req.TopicNames = make([]string, 0)

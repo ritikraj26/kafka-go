@@ -9,8 +9,9 @@ import (
 
 // Decoder provides BigEndian binary read helpers for parsing Kafka request buffers.
 type Decoder struct {
-	data []byte
-	pos  int
+	data   []byte
+	pos    int
+	budget *decodeBudget
 }
 
 func NewDecoder(data []byte) *Decoder {
@@ -35,6 +36,9 @@ func (d *Decoder) ReadCompactString() (string, error) {
 	strLen := length - 1 // compact encoding is length+1
 	if strLen > uint64(d.Remaining()) {
 		return "", io.ErrUnexpectedEOF
+	}
+	if err := d.chargeBytes(int(strLen)); err != nil {
+		return "", err
 	}
 
 	str := string(d.data[d.pos : d.pos+int(strLen)])
@@ -69,6 +73,9 @@ func (d *Decoder) ReadNullableString() (*string, error) {
 	if d.pos+int(length) > len(d.data) {
 		return nil, io.ErrUnexpectedEOF
 	}
+	if err := d.chargeBytes(int(length)); err != nil {
+		return nil, err
+	}
 	str := string(d.data[d.pos : d.pos+int(length)])
 	d.pos += int(length)
 	return &str, nil
@@ -77,6 +84,13 @@ func (d *Decoder) ReadNullableString() (*string, error) {
 // ReadBytes reads standard BYTES (INT32 length-prefixed, then raw bytes).
 // Used by v0 non-flexible APIs.
 func (d *Decoder) ReadBytes() ([]byte, error) {
+	return d.readBytes(false)
+}
+
+// ReadBytesView borrows the input; callers must retain its owning reservation.
+func (d *Decoder) ReadBytesView() ([]byte, error) { return d.readBytes(true) }
+
+func (d *Decoder) readBytes(view bool) ([]byte, error) {
 	length, err := d.ReadInt32()
 	if err != nil {
 		return nil, err
@@ -90,8 +104,15 @@ func (d *Decoder) ReadBytes() ([]byte, error) {
 	if d.pos+int(length) > len(d.data) {
 		return nil, io.ErrUnexpectedEOF
 	}
-	result := make([]byte, length)
-	copy(result, d.data[d.pos:d.pos+int(length)])
+	result := d.data[d.pos : d.pos+int(length) : d.pos+int(length)]
+	if !view {
+		if err := d.chargeBytes(int(length)); err != nil {
+			return nil, err
+		}
+		copied := make([]byte, len(result))
+		copy(copied, result)
+		result = copied
+	}
 	d.pos += int(length)
 	return result, nil
 }
@@ -104,6 +125,9 @@ func (d *Decoder) ReadArrayLen() (int32, error) {
 	}
 	if count < 0 || int64(count) > int64(d.Remaining()) {
 		return 0, fmt.Errorf("invalid array count %d", count)
+	}
+	if err := d.ChargeEntries(int64(count)); err != nil {
+		return 0, err
 	}
 	return count, nil
 }
@@ -124,6 +148,9 @@ func (d *Decoder) ReadCompactNullableString() (*string, error) {
 	if strLen > uint64(d.Remaining()) {
 		return nil, io.ErrUnexpectedEOF
 	}
+	if err := d.chargeBytes(int(strLen)); err != nil {
+		return nil, err
+	}
 
 	str := string(d.data[d.pos : d.pos+int(strLen)])
 	d.pos += int(strLen)
@@ -133,6 +160,12 @@ func (d *Decoder) ReadCompactNullableString() (*string, error) {
 // ReadCompactBytes reads COMPACT_BYTES (length as unsigned varint, then bytes)
 // Returns nil for null (length=0)
 func (d *Decoder) ReadCompactBytes() ([]byte, error) {
+	return d.readCompactBytes(false)
+}
+
+func (d *Decoder) ReadCompactBytesView() ([]byte, error) { return d.readCompactBytes(true) }
+
+func (d *Decoder) readCompactBytes(view bool) ([]byte, error) {
 	length, err := d.ReadUnsignedVarint()
 	if err != nil {
 		return nil, err
@@ -147,10 +180,17 @@ func (d *Decoder) ReadCompactBytes() ([]byte, error) {
 		return nil, io.ErrUnexpectedEOF
 	}
 
-	bytes := make([]byte, bytesLen)
-	copy(bytes, d.data[d.pos:d.pos+int(bytesLen)])
+	value := d.data[d.pos : d.pos+int(bytesLen) : d.pos+int(bytesLen)]
+	if !view {
+		if err := d.chargeBytes(int(bytesLen)); err != nil {
+			return nil, err
+		}
+		copied := make([]byte, len(value))
+		copy(copied, value)
+		value = copied
+	}
 	d.pos += int(bytesLen)
-	return bytes, nil
+	return value, nil
 }
 
 // ReadUnsignedVarint reads an unsigned varint

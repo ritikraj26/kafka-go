@@ -1,105 +1,106 @@
 package protocol
 
 import (
-	"bytes"
 	"encoding/binary"
+	"fmt"
 )
 
-// Encoder provides BigEndian binary write helpers for building Kafka response buffers.
 type Encoder struct {
-	buf *bytes.Buffer
+	buf   []byte
+	fixed bool
+	err   error
 }
 
-func NewEncoder() *Encoder {
-	return &Encoder{
-		buf: new(bytes.Buffer),
+func NewEncoder() *Encoder { return &Encoder{} }
+
+// NewFixedEncoder never grows beyond its reserved backing-buffer capacity.
+func NewFixedEncoder(capacity int) *Encoder {
+	if capacity < 0 {
+		return &Encoder{fixed: true, err: fmt.Errorf("negative encoder capacity")}
+	}
+	return &Encoder{buf: make([]byte, 0, capacity), fixed: true}
+}
+
+func (e *Encoder) room(n int) bool {
+	if e.err != nil {
+		return false
+	}
+	if n < 0 || (e.fixed && n > cap(e.buf)-len(e.buf)) {
+		e.err = fmt.Errorf("response exceeds reserved encoder capacity")
+		return false
+	}
+	return true
+}
+
+func (e *Encoder) WriteInt16(v int16) {
+	if e.room(2) {
+		e.buf = binary.BigEndian.AppendUint16(e.buf, uint16(v))
 	}
 }
-
-func (e *Encoder) WriteInt16(val int16) {
-	binary.Write(e.buf, binary.BigEndian, val)
+func (e *Encoder) WriteInt32(v int32) {
+	if e.room(4) {
+		e.buf = binary.BigEndian.AppendUint32(e.buf, uint32(v))
+	}
 }
-
-func (e *Encoder) WriteInt32(val int32) {
-	binary.Write(e.buf, binary.BigEndian, val)
+func (e *Encoder) WriteInt64(v int64) {
+	if e.room(8) {
+		e.buf = binary.BigEndian.AppendUint64(e.buf, uint64(v))
+	}
 }
-
-func (e *Encoder) WriteInt64(val int64) {
-	binary.Write(e.buf, binary.BigEndian, val)
+func (e *Encoder) WriteByte(v byte) error {
+	if e.room(1) {
+		e.buf = append(e.buf, v)
+	}
+	return e.err
 }
-
-func (e *Encoder) WriteByte(val byte) error {
-	return e.buf.WriteByte(val)
-}
-
-// WriteCompactString writes a COMPACT_STRING (length+1 as varint, then UTF-8 bytes)
 func (e *Encoder) WriteCompactString(s string) {
-	if s == "" {
-		e.WriteUnsignedVarint(1) // empty string is length 1 (0+1)
-		return
-	}
 	e.WriteUnsignedVarint(uint64(len(s) + 1))
-	e.buf.WriteString(s)
+	if e.room(len(s)) {
+		e.buf = append(e.buf, s...)
+	}
 }
-
-// WriteString writes a standard STRING (INT16 length-prefixed, then UTF-8 bytes).
-// Used by v0 non-flexible APIs.
 func (e *Encoder) WriteString(s string) {
-	binary.Write(e.buf, binary.BigEndian, int16(len(s)))
-	e.buf.WriteString(s)
+	e.WriteInt16(int16(len(s)))
+	if e.room(len(s)) {
+		e.buf = append(e.buf, s...)
+	}
 }
-
-// WriteNullableString writes a NULLABLE_STRING (INT16 length, -1 for null).
 func (e *Encoder) WriteNullableString(s *string) {
 	if s == nil {
-		binary.Write(e.buf, binary.BigEndian, int16(-1))
-		return
+		e.WriteInt16(-1)
+	} else {
+		e.WriteString(*s)
 	}
-	e.WriteString(*s)
 }
-
-// WriteBytes writes standard BYTES (INT32 length-prefixed, then raw bytes).
-// Used by v0 non-flexible APIs.
 func (e *Encoder) WriteBytes(data []byte) {
 	if data == nil {
-		binary.Write(e.buf, binary.BigEndian, int32(-1))
+		e.WriteInt32(-1)
 		return
 	}
-	binary.Write(e.buf, binary.BigEndian, int32(len(data)))
-	e.buf.Write(data)
+	e.WriteInt32(int32(len(data)))
+	if e.room(len(data)) {
+		e.buf = append(e.buf, data...)
+	}
 }
-
-// WriteArrayLen writes the INT32 count prefix for a standard (non-compact) array.
-func (e *Encoder) WriteArrayLen(n int) {
-	binary.Write(e.buf, binary.BigEndian, int32(n))
-}
-
-// WriteCompactBytes writes COMPACT_BYTES (length+1 as varint, then raw bytes)
+func (e *Encoder) WriteArrayLen(n int) { e.WriteInt32(int32(n)) }
 func (e *Encoder) WriteCompactBytes(data []byte) {
 	e.WriteUnsignedVarint(uint64(len(data) + 1))
-	e.buf.Write(data)
-}
-
-// WriteUnsignedVarint writes an unsigned varint
-func (e *Encoder) WriteUnsignedVarint(value uint64) {
-	for value >= 0x80 {
-		e.buf.WriteByte(byte(value) | 0x80)
-		value >>= 7
+	if e.room(len(data)) {
+		e.buf = append(e.buf, data...)
 	}
-	e.buf.WriteByte(byte(value))
 }
-
-// WriteUUID writes a 16-byte UUID
-func (e *Encoder) WriteUUID(uuid [16]byte) {
-	e.buf.Write(uuid[:])
+func (e *Encoder) WriteUnsignedVarint(v uint64) {
+	var scratch [10]byte
+	n := binary.PutUvarint(scratch[:], v)
+	if e.room(n) {
+		e.buf = append(e.buf, scratch[:n]...)
+	}
 }
-
-// WriteTagBuffer writes an empty TAG_BUFFER (0x00)
-func (e *Encoder) WriteTagBuffer() {
-	e.buf.WriteByte(0x00)
+func (e *Encoder) WriteUUID(id [16]byte) {
+	if e.room(16) {
+		e.buf = append(e.buf, id[:]...)
+	}
 }
-
-// Bytes returns the encoded bytes
-func (e *Encoder) Bytes() []byte {
-	return e.buf.Bytes()
-}
+func (e *Encoder) WriteTagBuffer() { e.WriteByte(0) }
+func (e *Encoder) Bytes() []byte   { return e.buf }
+func (e *Encoder) Err() error      { return e.err }

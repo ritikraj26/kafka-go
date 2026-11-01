@@ -29,6 +29,9 @@ type FetchOptions struct {
 	Offset                           int64
 	MaxBytes                         int
 	AllowOversizedBatch              bool
+	MaxBatches                       int
+	StrictFirstBatchLimit            bool
+	FirstBatchMaxBytes               int
 }
 
 type FetchResult struct {
@@ -37,19 +40,55 @@ type FetchResult struct {
 	Records       []byte
 }
 
-// FetchRecords holds the partition lock through a bounded read so append, election,
-// visibility and replica-progress checks all observe the same partition state.
+// FetchRecords reads an append-only log snapshot, revalidating leadership before
+// materialization. Network callers reserve memory between PlanFetch and ReadFetchPlan.
 func (p *Partition) FetchRecords(options FetchOptions) (FetchResult, error) {
 	return p.FetchRecordsContext(context.Background(), options)
 }
 
 func (p *Partition) FetchRecordsContext(ctx context.Context, options FetchOptions) (FetchResult, error) {
-	if err := ctx.Err(); err != nil {
+	if options.MaxBatches == 0 {
+		options.MaxBatches = 10000
+	}
+	plan, err := p.PlanFetch(ctx, options)
+	if plan == nil {
 		return FetchResult{}, err
+	}
+	result := FetchResult{HighWatermark: plan.HighWatermark, LogStart: plan.LogStart}
+	if err != nil {
+		return result, err
+	}
+	result.Records, err = p.ReadFetchPlan(ctx, plan)
+	return result, err
+}
+
+type batchSpan struct {
+	segment  string
+	position int64
+	size     int
+	base     int64
+	delta    int32
+}
+
+type FetchPlan struct {
+	HighWatermark, LogStart int64
+	Bytes, Batches          int
+	Limited                 bool
+	owner                   *Partition
+	options                 FetchOptions
+	epoch                   int32
+	dir                     string
+	spans                   []batchSpan
+}
+
+// PlanFetch inspects only bounded headers. No record payload is allocated here.
+func (p *Partition) PlanFetch(ctx context.Context, options FetchOptions) (*FetchPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	result := FetchResult{HighWatermark: p.HighWatermark}
+	result := &FetchPlan{HighWatermark: p.HighWatermark, owner: p, options: options, epoch: p.LeaderEpoch}
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
@@ -66,10 +105,11 @@ func (p *Partition) FetchRecordsContext(ctx context.Context, options FetchOption
 			return result, ErrUnknownEpoch
 		}
 	}
-	if options.MaxBytes < 0 || options.ReplicaID < -1 {
+	if options.MaxBytes < 0 || options.ReplicaID < -1 || options.MaxBatches < 0 {
 		return result, ErrInvalidFetch
 	}
 	dir := p.LogDirForBroker(options.BrokerID)
+	result.dir = dir
 	if dir == "" {
 		return result, fmt.Errorf("missing leader log directory")
 	}
@@ -89,13 +129,13 @@ func (p *Partition) FetchRecordsContext(ctx context.Context, options FetchOption
 		limit = p.LogEndOffset
 	}
 	if options.Offset < limit {
-		result.Records, err = readBatches(ctx, dir, segments, options, limit)
+		err = planBatches(ctx, dir, segments, options, limit, result)
 		if err != nil {
 			return result, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return FetchResult{}, err
+		return nil, err
 	}
 	if options.ReplicaID >= 0 {
 		// The offset in this request describes earlier durable receipt, not the
@@ -156,7 +196,7 @@ func indexPosition(dir string, segment logSegment, offset int64) (int64, int64, 
 	return position, base, nil
 }
 
-func readBatches(ctx context.Context, dir string, segments []logSegment, options FetchOptions, limit int64) ([]byte, error) {
+func planBatches(ctx context.Context, dir string, segments []logSegment, options FetchOptions, limit int64, plan *FetchPlan) error {
 	start := 0
 	for i, segment := range segments {
 		if segment.baseOffset > options.Offset {
@@ -166,91 +206,157 @@ func readBatches(ctx context.Context, dir string, segments []logSegment, options
 	}
 	position, next, err := indexPosition(dir, segments[start], options.Offset)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var records []byte
 	for i := start; i < len(segments) && next < limit; i++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		if i > start {
 			position = 0
 			if segments[i].baseOffset != next {
-				return nil, fmt.Errorf("noncontiguous segment %s", segments[i].name)
+				return fmt.Errorf("noncontiguous segment %s", segments[i].name)
 			}
 		}
 		path := filepath.Join(dir, segments[i].name)
 		f, err := os.Open(path)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		part, end, stopped, readErr := readSegmentBatches(ctx, f, position, next, options, limit, len(records))
+		end, stopped, readErr := planSegment(ctx, f, segments[i].name, position, next, options, limit, plan)
 		closeErr := f.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("fetch %s: %w", path, readErr)
+			return fmt.Errorf("fetch %s: %w", path, readErr)
 		}
 		if closeErr != nil {
-			return nil, closeErr
+			return closeErr
 		}
-		records = append(records, part...)
 		next = end
 		if stopped {
-			return records, nil
+			return nil
 		}
 	}
 	if next < limit {
-		return nil, fmt.Errorf("log ends before advertised readable offset %d", limit)
+		return fmt.Errorf("log ends before advertised readable offset %d", limit)
 	}
-	return records, nil
+	return nil
 }
 
-func readSegmentBatches(ctx context.Context, f *os.File, position, next int64, options FetchOptions, limit int64, alreadyRead int) ([]byte, int64, bool, error) {
-	var records []byte
+func planSegment(ctx context.Context, f *os.File, segment string, position, next int64, options FetchOptions, limit int64, plan *FetchPlan) (int64, bool, error) {
 	for next < limit {
 		if err := ctx.Err(); err != nil {
-			return nil, next, false, err
+			return next, false, err
 		}
 		var header [27]byte
 		n, err := f.ReadAt(header[:], position)
 		if err == io.EOF && n == 0 {
-			return records, next, false, nil
+			return next, false, nil
 		}
 		if err != nil {
-			return nil, next, false, err
+			return next, false, err
 		}
 		base := int64(binary.BigEndian.Uint64(header[:8]))
 		length := int64(int32(binary.BigEndian.Uint32(header[8:12])))
 		delta := int64(int32(binary.BigEndian.Uint32(header[23:27])))
 		if base != next || delta < 0 || base > math.MaxInt64-delta-1 ||
 			length < 49 || length > storage.MaxRecordBatchBytes-12 {
-			return nil, next, false, fmt.Errorf("%w: invalid batch header at byte %d", storage.ErrCorruptRecord, position)
+			return next, false, fmt.Errorf("%w: invalid batch header at byte %d", storage.ErrCorruptRecord, position)
 		}
 		end, size := base+delta+1, length+12
 		if options.ReplicaID >= 0 && base < options.Offset && end > options.Offset {
-			return nil, next, false, fmt.Errorf("%w: replica offset is not a batch boundary", ErrInvalidFetch)
+			return next, false, fmt.Errorf("%w: replica offset is not a batch boundary", ErrInvalidFetch)
 		}
 		if end > limit {
 			// A batch crossing HW must not leak records above the visibility boundary.
-			return records, next, true, nil
+			return next, true, nil
 		}
 		if end > options.Offset {
-			remaining := options.MaxBytes - alreadyRead - len(records)
-			if size > int64(remaining) && !(options.AllowOversizedBatch && alreadyRead+len(records) == 0) {
-				return records, next, true, nil
+			remaining := options.MaxBytes - plan.Bytes
+			firstAllowed := options.AllowOversizedBatch && plan.Bytes == 0 &&
+				(!options.StrictFirstBatchLimit || size <= int64(options.FirstBatchMaxBytes))
+			if plan.Batches >= options.MaxBatches || (size > int64(remaining) && !firstAllowed) {
+				plan.Limited = true
+				return next, true, nil
 			}
-			batch, err := storage.ReadRecordBatch(io.NewSectionReader(f, position, size))
-			if err != nil {
-				return nil, next, false, err
-			}
-			records = append(records, batch.Data...)
-			if alreadyRead+len(records) >= options.MaxBytes {
-				return records, end, true, nil
+			plan.spans = append(plan.spans, batchSpan{segment: segment, position: position, size: int(size), base: base, delta: int32(delta)})
+			plan.Bytes += int(size)
+			plan.Batches++
+			if plan.Bytes >= options.MaxBytes {
+				plan.Limited = true
+				return end, true, nil
 			}
 		}
 		position += size
 		next = end
 	}
-	return records, next, true, nil
+	return next, true, nil
+}
+
+// ReadFetchPlan allocates exactly the selected payload bytes after admission.
+// The append-only log may grow, but leadership and the selected headers must
+// still match. No per-record value slices are built for a fetch response.
+func (p *Partition) ReadFetchPlan(ctx context.Context, plan *FetchPlan) (data []byte, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if plan.owner != p || p.LeaderID != plan.options.BrokerID || p.LeaderEpoch != plan.epoch || !p.ReplicaAvailable(p.LeaderID) {
+		return nil, ErrNotLeader
+	}
+	expected := 0
+	for _, span := range plan.spans {
+		expected += span.size
+	}
+	if expected != plan.Bytes {
+		return nil, fmt.Errorf("fetch plan size was modified")
+	}
+	if plan.Bytes == 0 {
+		return nil, nil
+	}
+	data = make([]byte, plan.Bytes)
+	var file *os.File
+	var current string
+	defer func() {
+		if file != nil {
+			err = errors.Join(err, file.Close())
+		}
+		if err != nil {
+			data = nil
+		}
+	}()
+	position := 0
+	for _, span := range plan.spans {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if current != span.segment {
+			if file != nil {
+				closeErr := file.Close()
+				file = nil
+				if closeErr != nil {
+					return nil, closeErr
+				}
+			}
+			file, err = os.Open(filepath.Join(plan.dir, span.segment))
+			if err != nil {
+				return nil, err
+			}
+			current = span.segment
+		}
+		batch := data[position : position+span.size]
+		if _, err := file.ReadAt(batch, span.position); err != nil {
+			return nil, err
+		}
+		if int64(binary.BigEndian.Uint64(batch[:8])) != span.base || int32(binary.BigEndian.Uint32(batch[23:27])) != span.delta {
+			return nil, fmt.Errorf("%w: batch changed since fetch planning", storage.ErrCorruptRecord)
+		}
+		if err := storage.ValidateRecordBatch(batch); err != nil {
+			return nil, err
+		}
+		position += span.size
+	}
+	return data, nil
 }
 
 // ReplicaPosition is a coherent view used to schedule a follower fetch.

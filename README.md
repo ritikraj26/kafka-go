@@ -37,6 +37,7 @@ internal/
 │   ├── versions.go          Supported versions and shared header/body decoding
 │   ├── response.go          Wire-format response framing (v0 / v1 headers)
 │   ├── decoder.go           BigEndian binary reader (varints, compact strings, UUIDs)
+│   ├── decode_limits.go     Per-request allocation charges and aggregate entry limits
 │   ├── encoder.go           BigEndian binary writer (v0 non-flexible + compact formats)
 │   ├── request_types.go     Typed request structs + parsers for all 13 APIs
 │   ├── consumer_protocol.go MemberMetadata / MemberAssignment binary codec
@@ -63,6 +64,8 @@ internal/
 │   └── offsets.go           Checksummed commit log, durable publication, fail-closed replay
 ├── broker/
 │   └── broker.go            Broker registry for simulated multi-broker cluster
+├── memory/
+│   └── pool.go              Shared FIFO byte reservations with nonblocking resize
 ├── metadata/
 │   ├── metadata.go          Thread-safe topic/partition manager (RWMutex)
 │   ├── persistence.go       Atomic topic catalog (IDs, replicas, paths, leader epochs)
@@ -307,13 +310,12 @@ reported prior progress rather than assuming the response has already reached
 disk. Stale responses after an election are rejected; failed follower writes
 fence further appends to that replica until recovery.
 
-Fetch validates leadership, offsets and visibility while holding the partition
-lock through the read. Index binary search reads individual entries instead of
-loading the full index, and record reads allocate at most one validated batch
-at a time in addition to the response. Reads stop at their byte/visibility
-boundary rather than loading a complete segment and slicing raw bytes. This
-favors correctness over concurrent append throughput. The admission budget below
-limits inbound frames, not the fetched record buffers or serialized responses.
+Fetch planning and materialization each hold the partition lock; leadership and
+the selected headers are revalidated after waiting for memory capacity. No
+partition lock is held during admission waits or network delivery. Index binary
+search reads individual entries instead of loading the full index. Record buffers
+are sized from the selected batches rather than loading complete segments and
+slicing raw bytes; those buffers and the encoded fetch body use the budgets below.
 
 Long polling still uses short polling intervals. `min_bytes=0` and partition
 errors return immediately. Incremental sessions are not implemented: responses
@@ -459,7 +461,7 @@ Only replica Fetch v0 requests are accepted internally. Public connections canno
 select protected capacity or advance replica state by supplying a replica ID;
 such requests are rejected. Conversely, consumer/admin requests are rejected on
 the internal listener. Controller health probes still use the public ports.
-Tests exhaust both client quotas while an `acks=-1` produce is pending and verify
+Tests exhaust client connection, frame, decoder, and fetch budgets while an `acks=-1` produce is pending and verify
 that a follower can still replicate and complete that produce.
 
 This separation prevents **client admission pressure** from starving replication.
@@ -473,13 +475,76 @@ that individual invocation. Use a separate `NewReplicationAdmission` instance fo
 `ReplicationAddress` before starting followers. Public and protected controllers
 cannot be interchanged.
 
-**Accounting limit:** these quotas are not a total-process memory/RSS ceiling.
-Decoded objects and record copies, fetched data, response serialization, retained
-consumer-group/schema state, filesystem caches, socket buffers, listener backlog,
-and outgoing connections are not charged to the raw-frame budget. Dedicated
-response/decoded-state budgets and load-based sizing remain necessary. Leave OS
-file-descriptor headroom for listeners, replication sockets and disk operations
-when configuring the connection limit.
+### Decoder and fetch-buffer budgets
+
+The public admission controller also has independent **128 MiB decoder** and
+**512 MiB fetch-buffer** pools. They use the same bounded FIFO wait policy as raw
+frames, and their current/peak charges and wait/rejection counters are exposed
+through `Admission.Stats().Decoded` and `.Fetch`.
+
+#### Decoded requests
+
+Each wire request has a default **16 MiB allocation-charge ceiling** and
+**10,000 aggregate structured entries**. Array elements and produced records
+both consume the entry limit, so topic/partition entries reduce the number of
+records that fit in a single request. Checks occur before collection growth or
+string/byte-field copying. Excess requests are closed before dispatch, and
+`DecodeLimitRejections` records these failures.
+
+Charges are deliberately conservative: a 1 KiB base, 256 bytes per entry, and
+`2 * length + 64` for each copied string/byte field. Before parsing, the network
+layer reserves `min(per-request limit, 1024 + 128 * frame size)`; after successful
+parsing it reduces that reservation to the accumulated charge. A charge is not a
+Go heap measurement. Null and empty fields retain their distinct wire meanings.
+
+Produce record payloads borrow immutable slices of their already-admitted raw
+frame instead of making a second decoder copy. Their record counts are checked
+before value descriptors are materialized. Append/fetch/replica validation uses
+validation-only batch parsing where values are unnecessary, avoiding per-record
+value-slice allocation on those paths.
+
+#### Fetch responses
+
+Normal fetch data is capped at **16 MiB per response**, additionally respecting
+client byte limits. Fetch v16 retains its first-batch exception up to the existing
+100 MiB batch limit. Legacy v0 still honors the client's partition limit; the
+server's soft target may be exceeded by one complete first batch if it fits that
+client limit. Replies can contain fewer batches than the byte limit permits:
+the selected batch-plan count is also bounded by `MAX_REQUEST_ENTRIES`.
+
+Fetches first inspect headers under the partition lock, without reading payloads.
+A planning reservation is held while building this bounded snapshot. Before
+materializing records, the reservation is resized to cover planning charges,
+response headers, selected record buffers, and the encoded body. If growth would
+block, the plan and old reservation are discarded before waiting for a full
+reservation; requests never wait for more bytes while retaining a smaller claim.
+Empty long polls release planning capacity between polls.
+
+After admission, reads revalidate leadership/epoch and the selected batch headers,
+then verify CRCs without creating value slices. Each partition's record buffer and
+the final fixed-capacity encoder are sized before allocation. The network writes
+the frame header and existing body separately, rather than serializing another
+full-size copy. The reservation remains held through response delivery or failure.
+Fetch-budget configuration must accommodate the maximum first batch plus encoding
+and planning overhead; an impossible configuration fails startup.
+
+Protected replication has its own **8 MiB decoder pool** (1 MiB per request,
+1,024 entries), **256 MiB server fetch pool**, and a separate **256 MiB follower
+receive pool**. The follower reserves its declared response size plus a bounded
+decoder/descriptor allowance before allocation and borrows record bytes during
+disk append. Send and receive pools are separate so a sender cannot hold the very
+capacity needed by its receiver. Internal fetch data can reach the 100 MiB batch
+limit and is not constrained by the public 16 MiB soft target.
+
+**Accounting limit:** these quotas are still not a total-process memory/RSS
+ceiling. They account for nominal buffer capacities and decoder/planning charges,
+not allocator rounding or garbage awaiting collection. Retained consumer-group,
+offset and schema state, JSON schema validation/inference allocations, append
+copies, non-fetch response builders, filesystem/directory metadata, socket buffers,
+listener backlog, and OS file-descriptor headroom need additional limits and
+load-based sizing. Direct API helpers enforce per-call limits; aggregate accounting
+requires the shared network admission controller and holding returned fetch payload
+reservations until the caller finishes using them.
 
 ### Environment Variables
 
@@ -495,6 +560,11 @@ when configuring the connection limit.
 | `MAX_REQUEST_BYTES` | `104857600` | Per-frame cap, from 8 bytes to the implementation maximum of 100 MiB |
 | `MAX_INFLIGHT_REQUEST_BYTES` | `268435456` | Shared raw-frame byte budget; must be at least `MAX_REQUEST_BYTES` |
 | `ADMISSION_WAIT_MS` | `2000` | Request-capacity wait, from 1 to 30000 ms |
+| `MAX_DECODED_REQUEST_BYTES` | `16777216` | Per-request decoder-charge ceiling; 1 KiB to 100 MiB |
+| `MAX_INFLIGHT_DECODE_BYTES` | `134217728` | Shared decoder-charge budget; at least the per-request ceiling |
+| `MAX_REQUEST_ENTRIES` | `10000` | Aggregate request-entry limit and maximum selected fetch batch plans; 1 to 100000 |
+| `FETCH_MAX_BYTES` | `16777216` | Public fetch-data soft target; 1 byte to 100 MiB, with first-batch progress exception |
+| `MAX_INFLIGHT_FETCH_BYTES` | `536870912` | Shared fetch planning/record/encoding budget; validated for maximum-batch progress |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint for schema inference |
 | `OLLAMA_MODEL` | `llama3.2` | LLM model for schema inference |
 
@@ -543,6 +613,9 @@ go test -race ./app ./internal/network ./internal/coordinator ./internal/metadat
 
 # Exact admission ceilings, FIFO/cancellation, allocation order, and protected replication
 go test -race ./internal/network ./internal/protocol ./internal/replication ./app
+
+# Decoder allocation checks, fetch-buffer admission, growth and streaming
+go test -race ./internal/memory ./internal/protocol ./internal/storage ./internal/api/fetch ./internal/network
 ```
 
 ### Test Coverage
@@ -565,7 +638,7 @@ go test -race ./internal/network ./internal/protocol ./internal/replication ./ap
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
 - **Remaining correctness work** — Persisted replication commit/ISR state, replicated coordinator storage, failover/divergence recovery, remaining shared-state races outside the protected paths, and load/fault testing are still outstanding; the local topic catalog is not distributed consensus
-- **Resource limits** — Shared connection and raw-frame admission are implemented, but decoded-state/response budgets and retention are not. These limits do not bound total RSS, and cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
+- **Resource limits** — Connection, raw-frame, wire-decoder and fetch-buffer admission are implemented; retained-state quotas, non-fetch response budgets, JSON-processing limits and retention remain. These limits do not bound total RSS, and cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
 - **Compatibility scope** — Only the listed versions and configured client subset are supported. More API versions, independent client implementations, timestamp offset lookup, static/cooperative groups, and administrative APIs require additional work.
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported

@@ -288,7 +288,7 @@ func recoverSegment(path string, log *recoveredLog) error {
 	defer f.Close()
 	var position int64
 	for {
-		batch, err := storage.ReadRecordBatch(f)
+		batch, err := storage.ReadRecordBatchMetadata(f)
 		if err == io.EOF {
 			return nil
 		}

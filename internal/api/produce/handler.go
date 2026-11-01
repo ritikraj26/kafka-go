@@ -65,7 +65,12 @@ func ProcessContext(ctx context.Context, req *protocol.ProduceRequest, metaMgr *
 					if p.Index != reqPartition.Index {
 						continue
 					}
-					baseOffset, logAppendTime, errorCode = appendPartition(ctx, reqPartition.Records, reqTopic.Name, metaMgr, p, options)
+					if reqPartition.RecordError != nil {
+						errorCode = recordErrorCode(reqPartition.RecordError)
+						logger.L.Warn("invalid produce record framing", "topic", reqTopic.Name, "err", reqPartition.RecordError)
+					} else {
+						baseOffset, logAppendTime, errorCode = appendPartition(ctx, reqPartition.Records, reqTopic.Name, metaMgr, p, options)
+					}
 					if baseOffset >= 0 {
 						logStartOffset = 0
 					}

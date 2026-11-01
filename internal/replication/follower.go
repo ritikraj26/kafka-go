@@ -262,7 +262,23 @@ func (fm *FollowerManager) fetchFromLeader(ctx context.Context, leaderID int32, 
 		fm.dropConn(leaderID)
 		return
 	}
-
+	pool, err := fm.metaMgr.ReplicationResponseBudget()
+	if err != nil {
+		logger.L.Error("follower receive budget unavailable", "err", err)
+		fm.dropConn(leaderID)
+		return
+	}
+	reservation, err := pool.Acquire(ctx, int64(msgSize)+(2<<20))
+	if err != nil {
+		logger.L.Warn("follower receive admission rejected", "err", err)
+		fm.dropConn(leaderID)
+		return
+	}
+	defer reservation.Release()
+	if ctx.Err() != nil {
+		fm.dropConn(leaderID)
+		return
+	}
 	respBuf := make([]byte, msgSize)
 	if _, err := io.ReadFull(conn, respBuf); err != nil {
 		if ctx.Err() != nil {
@@ -357,10 +373,14 @@ func (fm *FollowerManager) decodeFetchV0Response(data []byte, parts []partInfo) 
 }
 
 func (fm *FollowerManager) decodeFetchV0ResponseContext(ctx context.Context, data []byte, parts []partInfo) {
-	dec := protocol.NewDecoder(data)
+	dec, err := protocol.NewDecoderWithLimits(data, protocol.DecodeLimits{MaxBytes: 1 << 20, MaxEntries: 1024})
+	if err != nil {
+		logger.L.Warn("follower: decoder initialization failed", "err", err)
+		return
+	}
 
 	// correlation_id (4 bytes)
-	_, err := dec.ReadInt32()
+	_, err = dec.ReadInt32()
 	if err != nil {
 		logger.L.Warn("follower: decode correlationID failed", "err", err)
 		return
@@ -404,7 +424,7 @@ func (fm *FollowerManager) decodeFetchV0ResponseContext(ctx context.Context, dat
 				logger.L.Warn("follower: decode watermark failed", "err", err)
 				return
 			}
-			recordSet, err := dec.ReadBytes()
+			recordSet, err := dec.ReadBytesView()
 			if err != nil {
 				logger.L.Warn("follower: decode record set failed", "err", err)
 				return

@@ -8,21 +8,23 @@ import (
 	"sync"
 
 	"github.com/ritiraj/kafka-go/internal/broker"
+	"github.com/ritiraj/kafka-go/internal/memory"
 	"github.com/ritiraj/kafka-go/internal/schema"
 )
 
 // Manager holds cluster-level information and topic metadata
 type Manager struct {
-	mu                sync.RWMutex
-	topics            map[string]*Topic // topic_name -> Topic
-	logDir            string            // Base directory for log files
-	loaded            bool
-	catalog           map[string]topicMetadata
-	persistenceErr    error
-	Schemas           *schema.Registry // AI schema registry (topic -> inferred schema)
-	Brokers           *broker.Registry // Cluster broker registry
-	ReplicationFactor int              // Default replication factor for new topics
-	MinInSyncReplicas int              // Broker-wide acks=-1 policy; configure before starting workers
+	mu                   sync.RWMutex
+	topics               map[string]*Topic // topic_name -> Topic
+	logDir               string            // Base directory for log files
+	loaded               bool
+	catalog              map[string]topicMetadata
+	persistenceErr       error
+	replicationResponses *memory.Pool
+	Schemas              *schema.Registry // AI schema registry (topic -> inferred schema)
+	Brokers              *broker.Registry // Cluster broker registry
+	ReplicationFactor    int              // Default replication factor for new topics
+	MinInSyncReplicas    int              // Broker-wide acks=-1 policy; configure before starting workers
 }
 
 // NewManager creates a new metadata manager

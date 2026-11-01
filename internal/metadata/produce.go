@@ -77,7 +77,7 @@ func (p *Partition) ProduceRecordsContext(ctx context.Context, records []byte, o
 	var batches []storage.RecordBatch
 	if len(records) > 0 {
 		var err error
-		batches, err = storage.ParseRecordBatches(records)
+		batches, err = storage.ValidateRecordBatches(records)
 		if err != nil {
 			return -1, err
 		}

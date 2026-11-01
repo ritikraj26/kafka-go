@@ -60,6 +60,15 @@ func TestReplicationProgressWithClientConnectionsAndBytesExhausted(t *testing.T)
 		if clientBudget.Stats().Connections != 0 || clientBudget.Stats().InFlightBytes != 0 || replicaBudget.Stats().Connections != 0 || replicaBudget.Stats().InFlightBytes != 0 {
 			t.Error("shutdown leaked admission reservations")
 		}
+		for _, admission := range []*Admission{clientBudget, replicaBudget} {
+			if stats := admission.Stats(); stats.Decoded.Used != 0 || stats.Fetch.Used != 0 {
+				t.Errorf("shutdown leaked decoder/fetch memory: %+v", stats)
+			}
+		}
+		receive, err := m.ReplicationResponseBudget()
+		if err != nil || receive.Stats().Used != 0 {
+			t.Errorf("follower receive reservation leaked: %v", err)
+		}
 	})
 	client := admissionClient(t, public)
 	writeProduceWithoutReading(t, client, body)
@@ -69,6 +78,18 @@ func TestReplicationProgressWithClientConnectionsAndBytesExhausted(t *testing.T)
 	}
 	rejected := admissionClient(t, public)
 	assertAdmissionClosed(t, rejected)
+	// Exhaust the additional public pools without consuming protected capacity.
+	fetchMemory, err := clientBudget.fetch.Acquire(context.Background(), clientBudget.memoryLimits.FetchBudget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fetchMemory.Release()
+	remaining := clientBudget.memoryLimits.DecodedBudget - clientBudget.Stats().Decoded.Used
+	decodeMemory, err := clientBudget.decoded.Acquire(context.Background(), remaining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decodeMemory.Release()
 	if err := fm.Start(ctx); err != nil {
 		t.Fatal(err)
 	}

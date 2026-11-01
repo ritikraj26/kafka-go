@@ -17,7 +17,7 @@ import (
 
 func testRuntimeConfig(t *testing.T) runtimeConfig {
 	t.Helper()
-	return runtimeConfig{brokerID: 2, numBrokers: 3, replicationFactor: 3, minISR: 2, lagTimeMaxMs: 10000, logDir: t.TempDir(), limits: network.DefaultLimits()}
+	return runtimeConfig{brokerID: 2, numBrokers: 3, replicationFactor: 3, minISR: 2, lagTimeMaxMs: 10000, logDir: t.TempDir(), limits: network.DefaultLimits(), memoryLimits: network.DefaultMemoryLimits()}
 }
 
 type countedListener struct {

@@ -17,6 +17,8 @@ type RequestHeader struct {
 	correlationID int32
 	clientID      *string
 	body          []byte
+	decodeLimits  *DecodeLimits
+	decoded       *decodeBudget
 }
 
 func NewRequestHeader() *RequestHeader {
@@ -87,4 +89,4 @@ func (r *RequestHeader) ReadFrame(conn io.Reader) error {
 	return nil
 }
 
-func (r *RequestHeader) ReleaseFrame() { r.body = nil; r.clientID = nil }
+func (r *RequestHeader) ReleaseFrame() { r.body = nil; r.clientID = nil; r.decoded = nil }

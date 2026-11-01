@@ -35,6 +35,14 @@ type RecordBatch struct {
 // ParseRecordBatches validates the entire record set before returning any batches.
 // Transactional, control and compressed batches are not supported.
 func ParseRecordBatches(data []byte) ([]RecordBatch, error) {
+	return parseRecordBatches(data, true)
+}
+
+func ValidateRecordBatches(data []byte) ([]RecordBatch, error) {
+	return parseRecordBatches(data, false)
+}
+
+func parseRecordBatches(data []byte, values bool) ([]RecordBatch, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: empty record set", ErrCorruptRecord)
 	}
@@ -47,7 +55,7 @@ func ParseRecordBatches(data []byte) ([]RecordBatch, error) {
 		if size > len(data) {
 			return nil, fmt.Errorf("%w: incomplete batch", ErrCorruptRecord)
 		}
-		batch, err := parseBatch(data[:size])
+		batch, err := parseBatch(data[:size], values)
 		if err != nil {
 			return nil, err
 		}
@@ -59,6 +67,12 @@ func ParseRecordBatches(data []byte) ([]RecordBatch, error) {
 
 // ReadRecordBatch reads one complete batch, returning io.EOF only at a clean boundary.
 func ReadRecordBatch(r io.Reader) (RecordBatch, error) {
+	return readRecordBatch(r, true)
+}
+
+func ReadRecordBatchMetadata(r io.Reader) (RecordBatch, error) { return readRecordBatch(r, false) }
+
+func readRecordBatch(r io.Reader, values bool) (RecordBatch, error) {
 	var prefix [12]byte
 	n, err := io.ReadFull(r, prefix[:])
 	if err == io.EOF && n == 0 {
@@ -76,7 +90,7 @@ func ReadRecordBatch(r io.Reader) (RecordBatch, error) {
 	if _, err := io.ReadFull(r, data[12:]); err != nil {
 		return RecordBatch{}, fmt.Errorf("%w: batch body: %w", ErrCorruptRecord, err)
 	}
-	return parseBatch(data)
+	return parseBatch(data, values)
 }
 
 func batchSize(data []byte) (int, error) {
@@ -90,7 +104,41 @@ func batchSize(data []byte) (int, error) {
 	return int(length) + 12, nil
 }
 
-func parseBatch(data []byte) (RecordBatch, error) {
+func ValidateRecordBatch(data []byte) error {
+	size, err := batchSize(data)
+	if err != nil {
+		return err
+	}
+	if size != len(data) {
+		return fmt.Errorf("%w: incomplete batch", ErrCorruptRecord)
+	}
+	_, err = parseBatch(data, false)
+	return err
+}
+
+// CountRecords reads only framing/count fields, before allocating per-record
+// descriptors. Framing errors are returned to Produce as corrupt-message errors.
+func CountRecords(data []byte) (int64, error) {
+	var count int64
+	for len(data) > 0 {
+		size, err := batchSize(data)
+		if err != nil {
+			return count, err
+		}
+		if size > len(data) {
+			return count, fmt.Errorf("%w: incomplete batch", ErrCorruptRecord)
+		}
+		n := int32(binary.BigEndian.Uint32(data[57:61]))
+		if n <= 0 {
+			return count, fmt.Errorf("%w: invalid record count", ErrCorruptRecord)
+		}
+		count += int64(n)
+		data = data[size:]
+	}
+	return count, nil
+}
+
+func parseBatch(data []byte, values bool) (RecordBatch, error) {
 	if data[16] != 2 {
 		return RecordBatch{}, fmt.Errorf("%w: magic %d", ErrUnsupportedFormat, data[16])
 	}
@@ -120,7 +168,7 @@ func parseBatch(data []byte) (RecordBatch, error) {
 			return RecordBatch{}, fmt.Errorf("record %d: %w", i, err)
 		}
 		// Preserve schema validation's existing treatment of null/empty values.
-		if len(value) > 0 {
+		if values && len(value) > 0 {
 			batch.Values = append(batch.Values, value)
 		}
 	}

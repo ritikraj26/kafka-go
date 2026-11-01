@@ -5,17 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"slices"
 	"sync"
 	"time"
 
+	"github.com/ritiraj/kafka-go/internal/memory"
 	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 var (
 	ErrFrameTooLarge      = errors.New("request frame exceeds admission limit")
-	ErrAdmissionTimeout   = errors.New("request admission timed out")
-	ErrAdmissionQueueFull = errors.New("request admission queue is full")
+	ErrAdmissionTimeout   = memory.ErrTimeout
+	ErrAdmissionQueueFull = memory.ErrQueueFull
 )
 
 type Limits struct {
@@ -30,20 +30,17 @@ func DefaultLimits() Limits {
 }
 
 type AdmissionStats struct {
-	Connections         int
-	InFlightBytes       int64
-	Waiting             int
-	PeakConnections     int
-	PeakInFlightBytes   int64
-	RejectedConnections uint64
-	RejectedRequests    uint64
-	TimedOutRequests    uint64
-}
-
-type admissionWaiter struct {
-	bytes   int64
-	ready   chan struct{}
-	granted bool
+	Connections           int
+	InFlightBytes         int64
+	Waiting               int
+	PeakConnections       int
+	PeakInFlightBytes     int64
+	RejectedConnections   uint64
+	RejectedRequests      uint64
+	TimedOutRequests      uint64
+	Decoded               memory.Stats
+	Fetch                 memory.Stats
+	DecodeLimitRejections uint64
 }
 
 // Admission accounts for accepted handlers and their raw request frames, not
@@ -52,18 +49,40 @@ type Admission struct {
 	mu               sync.Mutex
 	limits           Limits
 	stats            AdmissionStats
-	waiters          []*admissionWaiter
+	frames           *memory.Pool
+	decoded          *memory.Pool
+	fetch            *memory.Pool
+	memoryLimits     MemoryLimits
 	lastRejectionLog time.Time
 	replication      bool
 }
 
 func NewAdmission(limits Limits) (*Admission, error) {
+	return NewAdmissionWithMemory(limits, DefaultMemoryLimits())
+}
+
+func NewAdmissionWithMemory(limits Limits, mem MemoryLimits) (*Admission, error) {
 	if limits.MaxConnections < 1 || limits.MaxRequestBytes < 8 || limits.MaxRequestBytes > protocol.MaxRequestSize ||
 		limits.MaxInFlightBytes < limits.MaxRequestBytes || limits.AdmissionWait <= 0 || limits.AdmissionWait > connectionReadTimeout {
 		return nil, fmt.Errorf("invalid admission limits: positive connections, 8..%d request bytes, budget >= request limit, and wait <= %s required",
 			protocol.MaxRequestSize, connectionReadTimeout)
 	}
-	return &Admission{limits: limits}, nil
+	if err := mem.Validate(); err != nil {
+		return nil, err
+	}
+	frames, err := memory.NewPool(limits.MaxInFlightBytes, limits.MaxConnections, limits.AdmissionWait)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := memory.NewPool(mem.DecodedBudget, limits.MaxConnections, limits.AdmissionWait)
+	if err != nil {
+		return nil, err
+	}
+	fetch, err := memory.NewPool(mem.FetchBudget, limits.MaxConnections, limits.AdmissionWait)
+	if err != nil {
+		return nil, err
+	}
+	return &Admission{limits: limits, frames: frames, decoded: decoded, fetch: fetch, memoryLimits: mem}, nil
 }
 
 // NewReplicationAdmission reserves enough sockets for one connection per
@@ -76,7 +95,8 @@ func NewReplicationAdmission(brokers int) (*Admission, error) {
 	if pairs > math.MaxInt {
 		return nil, fmt.Errorf("replication connection count exceeds platform limit")
 	}
-	a, err := NewAdmission(Limits{MaxConnections: int(pairs), MaxRequestBytes: 64 << 10, MaxInFlightBytes: 1 << 20, AdmissionWait: 2 * time.Second})
+	a, err := NewAdmissionWithMemory(Limits{MaxConnections: int(pairs), MaxRequestBytes: 64 << 10, MaxInFlightBytes: 1 << 20, AdmissionWait: 2 * time.Second},
+		MemoryLimits{MaxDecodedBytes: 1 << 20, DecodedBudget: 8 << 20, MaxEntries: 1024, FetchMaxBytes: 100 << 20, FetchBudget: 256 << 20})
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +108,13 @@ func (a *Admission) Stats() AdmissionStats {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	stats := a.stats
-	stats.Waiting = len(a.waiters)
+	raw := a.frames.Stats()
+	stats.Waiting = raw.Waiting
+	stats.InFlightBytes, stats.PeakInFlightBytes = raw.Used, raw.Peak
+	stats.RejectedRequests += raw.Rejected
+	stats.TimedOutRequests = raw.TimedOut
+	stats.Decoded = a.decoded.Stats()
+	stats.Fetch = a.fetch.Stats()
 	return stats
 }
 
@@ -123,80 +149,12 @@ func (a *Admission) Reserve(ctx context.Context, bytes int64) (func(), error) {
 		a.mu.Unlock()
 		return nil, fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, bytes)
 	}
-	if len(a.waiters) == 0 && bytes <= a.limits.MaxInFlightBytes-a.stats.InFlightBytes {
-		a.grant(bytes)
-		a.mu.Unlock()
-		return a.release(bytes), nil
-	}
-	if len(a.waiters) >= a.limits.MaxConnections {
-		a.stats.RejectedRequests++
-		a.mu.Unlock()
-		return nil, ErrAdmissionQueueFull
-	}
-	waiter := &admissionWaiter{bytes: bytes, ready: make(chan struct{})}
-	a.waiters = append(a.waiters, waiter)
 	a.mu.Unlock()
-
-	waitCtx, cancel := context.WithTimeout(ctx, a.limits.AdmissionWait)
-	defer cancel()
-	select {
-	case <-waiter.ready:
-	case <-waitCtx.Done():
+	reservation, err := a.frames.Acquire(ctx, bytes)
+	if err != nil {
+		return nil, err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := waitCtx.Err(); err != nil {
-		if waiter.granted {
-			a.stats.InFlightBytes -= bytes
-		} else {
-			for i, w := range a.waiters {
-				if w == waiter {
-					a.waiters = slices.Delete(a.waiters, i, i+1)
-					break
-				}
-			}
-		}
-		a.drain()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		a.stats.RejectedRequests++
-		a.stats.TimedOutRequests++
-		return nil, ErrAdmissionTimeout
-	}
-	return a.release(bytes), nil
-}
-
-func (a *Admission) grant(bytes int64) {
-	a.stats.InFlightBytes += bytes
-	a.stats.PeakInFlightBytes = max(a.stats.PeakInFlightBytes, a.stats.InFlightBytes)
-}
-
-func (a *Admission) drain() {
-	for len(a.waiters) > 0 {
-		next := a.waiters[0]
-		if next.bytes > a.limits.MaxInFlightBytes-a.stats.InFlightBytes {
-			return
-		}
-		a.waiters[0] = nil
-		a.waiters = a.waiters[1:]
-		a.grant(next.bytes)
-		next.granted = true
-		close(next.ready)
-	}
-	a.waiters = nil
-}
-
-func (a *Admission) release(bytes int64) func() {
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			a.stats.InFlightBytes -= bytes
-			a.drain()
-		})
-	}
+	return reservation.Release, nil
 }
 
 // All rejections are counted; logs are sampled to avoid a connection-flood log storm.

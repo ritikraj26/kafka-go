@@ -157,7 +157,7 @@ func (p *Partition) RunUnderLock(fn func()) {
 // appends a sparse index entry, and returns the base offset on success.
 func (p *Partition) AppendRecords(records []byte, logDir string) (baseOffset int64, err error) {
 	records = bytes.Clone(records)
-	batches, err := storage.ParseRecordBatches(records)
+	batches, err := storage.ValidateRecordBatches(records)
 	if err != nil {
 		return -1, err
 	}
@@ -289,7 +289,7 @@ func (p *Partition) appendReplicaRecords(records []byte, replicaLogDir string, r
 	if len(records) == 0 {
 		return replicaLEO, nil
 	}
-	batches, err := storage.ParseRecordBatches(records)
+	batches, err := storage.ValidateRecordBatches(records)
 	if err != nil {
 		return replicaLEO, err
 	}

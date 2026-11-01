@@ -47,6 +47,7 @@ type runtimeConfig struct {
 	lagTimeMaxMs                          int64
 	logDir                                string
 	limits                                network.Limits
+	memoryLimits                          network.MemoryLimits
 }
 
 type listenFunc func(context.Context, string, string) (net.Listener, error)
@@ -60,7 +61,7 @@ func run(ctx context.Context, args []string) error {
 }
 
 func runWithConfig(parent context.Context, cfg runtimeConfig, listen listenFunc) error {
-	clientAdmission, err := network.NewAdmission(cfg.limits)
+	clientAdmission, err := network.NewAdmissionWithMemory(cfg.limits, cfg.memoryLimits)
 	if err != nil {
 		return fmt.Errorf("client admission configuration: %w", err)
 	}
@@ -267,6 +268,33 @@ func loadConfig(args []string) (runtimeConfig, error) {
 		return cfg, err
 	}
 	cfg.limits.AdmissionWait = time.Duration(wait) * time.Millisecond
+	cfg.memoryLimits = network.DefaultMemoryLimits()
+	decoded, err := envIntInRange("MAX_DECODED_REQUEST_BYTES", int(cfg.memoryLimits.MaxDecodedBytes), 1024, 100<<20)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.memoryLimits.MaxDecodedBytes = int64(decoded)
+	decodeBudget, err := envIntInRange("MAX_INFLIGHT_DECODE_BYTES", int(cfg.memoryLimits.DecodedBudget), decoded, math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.memoryLimits.DecodedBudget = int64(decodeBudget)
+	cfg.memoryLimits.MaxEntries, err = envIntInRange("MAX_REQUEST_ENTRIES", cfg.memoryLimits.MaxEntries, 1, 100000)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.memoryLimits.FetchMaxBytes, err = envIntInRange("FETCH_MAX_BYTES", cfg.memoryLimits.FetchMaxBytes, 1, 100<<20)
+	if err != nil {
+		return cfg, err
+	}
+	fetchBudget, err := envIntInRange("MAX_INFLIGHT_FETCH_BYTES", int(cfg.memoryLimits.FetchBudget), 1, math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.memoryLimits.FetchBudget = int64(fetchBudget)
+	if err := cfg.memoryLimits.Validate(); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
 }
 
