@@ -67,7 +67,7 @@ func TestSharedHeadersWithIndependentRequests(t *testing.T) {
 }
 
 func TestRequestFrameBoundaries(t *testing.T) {
-	for _, size := range []int32{-1, 0, 7, maxRequestSize + 1} {
+	for _, size := range []int32{-1, 0, 7, MaxRequestSize + 1} {
 		server, client := net.Pipe()
 		go func() { defer client.Close(); binary.Write(client, binary.BigEndian, size) }()
 		if err := NewRequestHeader().ReadFrom(server); err == nil {

@@ -7,8 +7,8 @@ import (
 	"net"
 )
 
-// maxRequestSize caps the message_size a client may declare to prevent OOM.
-const maxRequestSize = 100 * 1024 * 1024 // 100 MB
+// MaxRequestSize is the protocol implementation's upper bound for a raw frame.
+const MaxRequestSize = 100 * 1024 * 1024
 
 type RequestHeader struct {
 	messageSize   int32
@@ -51,12 +51,29 @@ func (r *RequestHeader) GetErrorCode() int16 {
 }
 
 func (r *RequestHeader) ReadFrom(conn net.Conn) error {
-	if err := binary.Read(conn, binary.BigEndian, &r.messageSize); err != nil {
-		return fmt.Errorf("failed to read message_size: %w", err)
+	if _, err := r.ReadSize(conn); err != nil {
+		return err
 	}
+	return r.ReadFrame(conn)
+}
 
-	if r.messageSize < 8 || r.messageSize > maxRequestSize {
-		return fmt.Errorf("message_size %d must be between 8 and %d", r.messageSize, maxRequestSize)
+// ReadSize consumes only the fixed four-byte prefix, before any frame allocation.
+func (r *RequestHeader) ReadSize(conn io.Reader) (int64, error) {
+	r.body = nil
+	r.clientID = nil
+	if err := binary.Read(conn, binary.BigEndian, &r.messageSize); err != nil {
+		return 0, fmt.Errorf("failed to read message_size: %w", err)
+	}
+	if r.messageSize < 8 || r.messageSize > MaxRequestSize {
+		return 0, fmt.Errorf("message_size %d must be between 8 and %d", r.messageSize, MaxRequestSize)
+	}
+	return int64(r.messageSize), nil
+}
+
+// ReadFrame is called after the network layer has reserved the declared bytes.
+func (r *RequestHeader) ReadFrame(conn io.Reader) error {
+	if r.messageSize < 8 || r.messageSize > MaxRequestSize {
+		return fmt.Errorf("invalid frame size")
 	}
 	frame := make([]byte, r.messageSize)
 	if _, err := io.ReadFull(conn, frame); err != nil {
@@ -69,3 +86,5 @@ func (r *RequestHeader) ReadFrom(conn net.Conn) error {
 	r.clientID = nil
 	return nil
 }
+
+func (r *RequestHeader) ReleaseFrame() { r.body = nil; r.clientID = nil }

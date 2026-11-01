@@ -35,6 +35,43 @@ func StartOnPort(ctx context.Context, port int32, m *metadata.Manager, c *coordi
 // Serve owns its listener and accepted connections, but not the shared metadata
 // manager or coordinator. Cancellation closes sockets and waits for every handler.
 func Serve(parent context.Context, listener net.Listener, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32) error {
+	admission, err := NewAdmission(DefaultLimits())
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	return ServeWithAdmission(parent, listener, m, c, brokerID, admission)
+}
+
+// ServeWithAdmission shares client limits across all listeners using this controller.
+func ServeWithAdmission(parent context.Context, listener net.Listener, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32, admission *Admission) error {
+	if admission != nil && admission.replication {
+		listener.Close()
+		return fmt.Errorf("public listener cannot use protected replication capacity")
+	}
+	return serve(parent, listener, m, c, brokerID, admission, false)
+}
+
+// ServeReplication accepts only replica Fetch v0 traffic on a loopback listener.
+// Its admission controller must be distinct from the public-client controller.
+func ServeReplication(parent context.Context, listener net.Listener, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32, admission *Admission) error {
+	if admission == nil || !admission.replication {
+		listener.Close()
+		return fmt.Errorf("internal listener requires a protected replication admission controller")
+	}
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || !addr.IP.IsLoopback() {
+		listener.Close()
+		return fmt.Errorf("replication listener must be bound to loopback")
+	}
+	return serve(parent, listener, m, c, brokerID, admission, true)
+}
+
+func serve(parent context.Context, listener net.Listener, m *metadata.Manager, c *coordinator.Coordinator, brokerID int32, admission *Admission, replication bool) error {
+	if admission == nil {
+		listener.Close()
+		return fmt.Errorf("admission controller is required")
+	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var mu sync.Mutex
@@ -55,7 +92,7 @@ func Serve(parent context.Context, listener net.Listener, m *metadata.Manager, c
 			}
 		}
 	}()
-	logger.L.Info("broker listening", "broker", brokerID, "address", listener.Addr())
+	logger.L.Info("broker listening", "broker", brokerID, "address", listener.Addr(), "replication", replication)
 	var serveErr error
 	for {
 		conn, err := listener.Accept()
@@ -65,10 +102,19 @@ func Serve(parent context.Context, listener net.Listener, m *metadata.Manager, c
 			}
 			break
 		}
+		release, admitted := admission.tryConnection()
+		if !admitted {
+			conn.Close()
+			if admission.logRejection() {
+				logger.L.Warn("connection admission limit reached", "broker", brokerID, "replication", replication, "stats", admission.Stats())
+			}
+			continue
+		}
 		mu.Lock()
 		if ctx.Err() != nil {
 			mu.Unlock()
 			conn.Close()
+			release()
 			break
 		}
 		active[conn] = struct{}{}
@@ -76,12 +122,13 @@ func Serve(parent context.Context, listener net.Listener, m *metadata.Manager, c
 		mu.Unlock()
 		go func() {
 			defer handlers.Done()
+			defer release()
 			defer func() {
 				mu.Lock()
 				delete(active, conn)
 				mu.Unlock()
 			}()
-			handleConnection(ctx, conn, m, c, brokerID)
+			handleLimitedConnection(ctx, conn, m, c, brokerID, admission, replication)
 		}()
 	}
 	cancel()

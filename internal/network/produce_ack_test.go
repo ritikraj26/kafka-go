@@ -218,14 +218,32 @@ func TestIntegration_AcksAllWaitsForDurableFollower(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	internal, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		listener.Close()
+		t.Fatal(err)
+	}
+	admission, err := NewReplicationAdmission(2)
+	if err != nil {
+		listener.Close()
+		internal.Close()
+		t.Fatal(err)
+	}
 	m.Brokers = broker.NewRegistry(1)
-	m.Brokers.Register(&broker.Broker{ID: 1, Host: "127.0.0.1", Port: int32(listener.Addr().(*net.TCPAddr).Port)})
+	m.Brokers.Register(&broker.Broker{ID: 1, Host: "127.0.0.1", Port: int32(listener.Addr().(*net.TCPAddr).Port), ReplicationAddress: internal.Addr().String()})
 	m.Brokers.Register(&broker.Broker{ID: 2})
 	m.Schemas.Register("events", &schema.SimpleSchema{Fields: map[string]schema.FieldType{"value": schema.TypeString}})
 	p := &testutil.CreateTopic(t, m, "events", 1).Partitions[0]
 	ctx, cancel := context.WithCancel(context.Background())
 	serverDone := make(chan struct{})
+	replicaDone := make(chan struct{})
 	coord := coordinator.NewCoordinator()
+	go func() {
+		defer close(replicaDone)
+		if err := ServeReplication(ctx, internal, m, coord, 1, admission); err != nil {
+			t.Errorf("replication server: %v", err)
+		}
+	}()
 	go func() {
 		defer close(serverDone)
 		if err := Serve(ctx, listener, m, coord, 1); err != nil {
@@ -236,6 +254,7 @@ func TestIntegration_AcksAllWaitsForDurableFollower(t *testing.T) {
 	if err := follower.Start(ctx); err != nil {
 		cancel()
 		listener.Close()
+		internal.Close()
 		coord.Close()
 		t.Fatal(err)
 	}
@@ -247,6 +266,11 @@ func TestIntegration_AcksAllWaitsForDurableFollower(t *testing.T) {
 		case <-serverDone:
 		case <-time.After(5 * time.Second):
 			t.Error("acknowledgement test server did not stop")
+		}
+		select {
+		case <-replicaDone:
+		case <-time.After(5 * time.Second):
+			t.Error("replication server did not stop")
 		}
 	})
 	conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)

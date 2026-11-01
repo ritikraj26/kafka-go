@@ -30,9 +30,10 @@ app/main.go                  Entry point — config, metadata bootstrap, signal 
 internal/
 ├── network/
 │   ├── server.go            TCP listener with graceful shutdown (context + WaitGroup)
-│   └── connection.go        Per-connection request loop & 13-API dispatch
+│   ├── connection.go        Per-connection request loop & 13-API dispatch
+│   └── admission.go         Shared connection/frame quotas and FIFO backpressure
 ├── protocol/
-│   ├── request.go           Wire-format request header (with maxRequestSize guard)
+│   ├── request.go           Separate size-prefix and admitted frame reads
 │   ├── versions.go          Supported versions and shared header/body decoding
 │   ├── response.go          Wire-format response framing (v0 / v1 headers)
 │   ├── decoder.go           BigEndian binary reader (varints, compact strings, UUIDs)
@@ -100,7 +101,7 @@ internal/
 - **Offset recovery** — Validates every saved replica log, restores record-based LEOs, verifies followers are byte-identical prefixes of the saved leader, and initially derives HW from all assigned replicas. Corrupt, incomplete, noncontiguous, or divergent logs cause startup to fail without truncating data.
 - **Concurrency** — Goroutine-per-connection with `sync.RWMutex` on metadata and per-partition mutex on writes
 - **Coordinated shutdown** — Cancels listeners, active sockets, replication/group/fetch waits, follower dials, controller probes, and HTTP inference; joins request handlers, workers, and coordinator timer callbacks
-- **Size guards** — 100 MB maximum request frame and record batch size; aggregate connection/memory limits remain future work
+- **Request admission** — By default, public listeners share a 256-connection ceiling and 256 MiB raw-frame budget; frames are reserved before allocation, with FIFO admission waits capped at 2 seconds. Replication has separate bounded loopback capacity.
 - **AI schema inference** — First message to a topic triggers schema inference via local Ollama (falls back to JSON type detection)
 - **Dead-letter queue** — Rejected values are encoded as checksummed Kafka batches in `{topic}.dlq`; a DLQ write failure is reported to the producer. Successful routing remains transparent to the producer.
 - **Structured logging** — `slog.Logger` with configurable log level via `LOG_LEVEL` env var
@@ -148,7 +149,7 @@ are not implemented. Tests configure one broker with an explicit minimum ISR of
 for one pinned Go client, not a Java/librdkafka/Sarama compatibility certification
 or a multi-node fault-tolerance test.
 
-Only advertised versions are accepted, except the documented internal Fetch v0.
+Only advertised versions are accepted, except the documented legacy Fetch v0.
 Malformed frames and unsupported non-negotiation API versions are logged and
 close the connection rather than being decoded as another version. ApiVersions
 uses version-correct arrays and always the non-flexible response header.
@@ -279,8 +280,8 @@ backups and independent failure domains are still required.
 ### Fetch behavior and limits
 
 The supported fetch layouts are **v16** and legacy **v0**, not the versions
-between them. ApiVersions advertises only v16; v0 remains available for the
-internal follower and explicitly configured legacy callers. Fetch v16 uses the
+between them. ApiVersions advertises only v16; v0 remains available for consumers
+on the public listener and followers on the internal replication listener. Fetch v16 uses the
 standard nullable client ID, validates/skips tagged fields, and defaults to
 consumer mode unless the ReplicaState tag identifies a follower.
 
@@ -311,8 +312,8 @@ lock through the read. Index binary search reads individual entries instead of
 loading the full index, and record reads allocate at most one validated batch
 at a time in addition to the response. Reads stop at their byte/visibility
 boundary rather than loading a complete segment and slicing raw bytes. This
-favors correctness over concurrent append throughput; there is no global
-connection/memory quota yet.
+favors correctness over concurrent append throughput. The admission budget below
+limits inbound frames, not the fetched record buffers or serialized responses.
 
 Long polling still uses short polling intervals. `min_bytes=0` and partition
 errors return immediately. Incremental sessions are not implemented: responses
@@ -365,7 +366,7 @@ independent failure domains, safe divergent-log recovery, or broker authenticati
 ### Startup, cancellation, and resource ownership
 
 Startup validates configuration and recovers storage before serving requests.
-It binds **all** configured broker listeners before starting their accept loops
+It binds **all** public and loopback replication listeners before starting accept loops
 or background workers. If any bind fails, already-reserved listeners are closed
 and startup returns a nonzero exit status. An unexpected accept failure stops the
 runtime rather than spinning or leaving a partially running cluster.
@@ -408,6 +409,78 @@ errors, cancel and join all servers/workers, call `Coordinator.Close()`, and cal
 requests; legacy direct-call wrappers intentionally use a background context.
 Worker `Start` methods reject invalid intervals and repeated starts.
 
+### Connection and raw-request admission
+
+The application and demo share **one client admission controller across all
+public broker listeners**. The defaults are:
+
+| Limit | Default | Scope |
+|-------|---------|-------|
+| Accepted client handlers | 256 | Includes idle connections and connections waiting for capacity |
+| One request frame | 100 MiB | Header and body, excluding the four-byte size prefix |
+| In-flight raw request frames | 256 MiB | Sum of declared sizes reserved by active requests |
+| Capacity wait | 2 seconds | FIFO; cancelled promptly during shutdown |
+
+After reading the four-byte size prefix, a handler reserves the entire declared
+frame size **before allocating or reading its payload**. The reservation stays
+held through parsing, request processing, acknowledgement waits, and response
+writes. It is released on every completion/error/cancellation path, including
+`acks=0`. Requests are processed sequentially per connection. The wait queue is
+also bounded by the connection limit.
+
+Excess connections are closed without starting another handler. Oversized frames
+are rejected immediately. Under byte pressure, payload reads pause until a whole
+reservation becomes available; the FIFO queue prevents small requests continually
+bypassing a large queued request. A capacity timeout closes the connection rather
+than inventing a Kafka success/error response before its body has been read.
+The existing 30-second frame-read deadline includes time spent waiting for
+admission; configured admission waits must not exceed it.
+
+`Admission.Stats()` exposes current connections, reserved bytes, waiter count,
+peak usage, and rejection/timeout counters. Every admission rejection is counted;
+rejection logs are sampled to at most one per second per controller. These are
+in-process counters, not a metrics HTTP endpoint or per-tenant throughput quotas.
+
+#### Protected replication capacity
+
+Each simulated broker also binds an ephemeral **127.0.0.1** replication listener.
+Its endpoint is stored in the in-memory broker registry and is never advertised
+in public Kafka metadata. Followers use this endpoint exclusively; they do not
+fall back to the public port.
+
+The internal listeners share a distinct controller with a **1 MiB raw-frame
+budget**, **64 KiB maximum frame**, a **2-second wait**, and enough accepted
+connections for one follower-to-leader connection per ordered broker pair
+(`max(1, N*(N-1))`; six for the default three brokers). Internal requests contain
+one partition, so this smaller frame limit does not reduce supported record-batch
+sizes in fetch responses.
+
+Only replica Fetch v0 requests are accepted internally. Public connections cannot
+select protected capacity or advance replica state by supplying a replica ID;
+such requests are rejected. Conversely, consumer/admin requests are rejected on
+the internal listener. Controller health probes still use the public ports.
+Tests exhaust both client quotas while an `acks=-1` produce is pending and verify
+that a follower can still replicate and complete that produce.
+
+This separation prevents **client admission pressure** from starving replication.
+It is not authentication against other processes on the same host, nor a guarantee
+against disk stalls, host-level resource exhaustion, or internal overload.
+
+For embedded multi-listener use, construct one `NewAdmission` instance and pass it
+to every public `ServeWithAdmission` call. `Serve` alone creates default limits for
+that individual invocation. Use a separate `NewReplicationAdmission` instance for
+`ServeReplication`, bind it to loopback, and populate each broker's
+`ReplicationAddress` before starting followers. Public and protected controllers
+cannot be interchanged.
+
+**Accounting limit:** these quotas are not a total-process memory/RSS ceiling.
+Decoded objects and record copies, fetched data, response serialization, retained
+consumer-group/schema state, filesystem caches, socket buffers, listener backlog,
+and outgoing connections are not charged to the raw-frame budget. Dedicated
+response/decoded-state budgets and load-based sizing remain necessary. Leave OS
+file-descriptor headroom for listeners, replication sockets and disk operations
+when configuring the connection limit.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -418,6 +491,10 @@ Worker `Start` methods reject invalid intervals and repeated starts.
 | `REPLICATION_FACTOR` | `3` | Replica count for new topics; must not exceed configured brokers |
 | `MIN_INSYNC_REPLICAS` | `2` | Minimum ISR for `acks=-1`; explicitly use `1` for single-copy acknowledgements |
 | `REPLICA_LAG_TIME_MAX_MS` | `10000` | Positive lag timeout for ISR maintenance |
+| `MAX_CONNECTIONS` | `256` | Shared accepted-client-handler ceiling across public listeners |
+| `MAX_REQUEST_BYTES` | `104857600` | Per-frame cap, from 8 bytes to the implementation maximum of 100 MiB |
+| `MAX_INFLIGHT_REQUEST_BYTES` | `268435456` | Shared raw-frame byte budget; must be at least `MAX_REQUEST_BYTES` |
+| `ADMISSION_WAIT_MS` | `2000` | Request-capacity wait, from 1 to 30000 ms |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint for schema inference |
 | `OLLAMA_MODEL` | `llama3.2` | LLM model for schema inference |
 
@@ -463,6 +540,9 @@ go test ./internal/coordinator -run='^$' -fuzz=FuzzOffsetLogReplay -fuzztime=30s
 
 # Cancellation, timer cleanup, listener failure, and startup/shutdown regressions
 go test -race ./app ./internal/network ./internal/coordinator ./internal/metadata ./internal/replication ./internal/controller ./internal/schema
+
+# Exact admission ceilings, FIFO/cancellation, allocation order, and protected replication
+go test -race ./internal/network ./internal/protocol ./internal/replication ./app
 ```
 
 ### Test Coverage
@@ -479,13 +559,13 @@ go test -race ./app ./internal/network ./internal/coordinator ./internal/metadat
 | `api/produce` | Invalid inputs without side effects, minimum ISR, shared request deadline, whole-append waits, DLQ acknowledgement and persistence-error propagation |
 | `app` | Corrupt storage/config rejection, partial-bind cleanup, all-broker cancellation, fatal listener errors, and non-default primary broker ports |
 | `api/fetch` | Exact record/offset assertions, HW boundaries, first-batch exception, partition/global byte limits, segment/index fallbacks, offset/leader errors, long polls, concurrent append/fetch |
-| `network` | TCP produce/restart/fetch, acknowledgement failures, follower persistence, franz-go commit/resume across separate broker test processes, offset storage-error/metadata codecs, independent discovery/group/pagination codecs |
+| `network` | TCP and independent-client flows; lifecycle cleanup; exact connection/frame quotas, FIFO/cancellation races, all-path reservation release, and replication progress under exhausted client capacity |
 
 ## Limitations & Future Work
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
 - **Remaining correctness work** — Persisted replication commit/ISR state, replicated coordinator storage, failover/divergence recovery, remaining shared-state races outside the protected paths, and load/fault testing are still outstanding; the local topic catalog is not distributed consensus
-- **Resource limits** — There are no global connection/in-flight-memory quotas or retention limits yet. Cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
+- **Resource limits** — Shared connection and raw-frame admission are implemented, but decoded-state/response budgets and retention are not. These limits do not bound total RSS, and cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
 - **Compatibility scope** — Only the listed versions and configured client subset are supported. More API versions, independent client implementations, timestamp offset lookup, static/cooperative groups, and administrative APIs require additional work.
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported

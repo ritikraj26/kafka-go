@@ -20,7 +20,7 @@ func TestFollowerCancellationInterruptsUnresponsiveLeader(t *testing.T) {
 	defer listener.Close()
 	m := testutil.NewMetadataManager(t)
 	m.Brokers = broker.NewRegistry(1)
-	m.Brokers.Register(&broker.Broker{ID: 1, Host: "127.0.0.1", Port: int32(listener.Addr().(*net.TCPAddr).Port)})
+	m.Brokers.Register(&broker.Broker{ID: 1, Host: "127.0.0.1", Port: int32(listener.Addr().(*net.TCPAddr).Port), ReplicationAddress: listener.Addr().String()})
 	m.Brokers.Register(&broker.Broker{ID: 2})
 	testutil.CreateTopic(t, m, "events", 1)
 	accepted := make(chan net.Conn, 1)

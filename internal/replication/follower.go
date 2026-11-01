@@ -130,7 +130,14 @@ func (fm *FollowerManager) getConn(ctx context.Context, leaderID int32) (net.Con
 	if b == nil {
 		return nil, fmt.Errorf("unknown leader broker %d", leaderID)
 	}
-	addr := net.JoinHostPort(b.Host, fmt.Sprintf("%d", b.Port))
+	addr := b.ReplicationAddress
+	if addr == "" {
+		return nil, fmt.Errorf("broker %d has no internal replication endpoint", leaderID)
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || !net.ParseIP(host).IsLoopback() {
+		return nil, fmt.Errorf("replication endpoint must use a loopback IP: %q", addr)
+	}
 	c, err := (&net.Dialer{Timeout: followerDialTimeout}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)

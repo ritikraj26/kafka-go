@@ -266,9 +266,23 @@ func main() {
 	var followers []*replication.FollowerManager
 	var servers sync.WaitGroup
 	listeners := make(map[int32]net.Listener)
+	replicaListeners := make(map[int32]net.Listener)
+	clientAdmission, err := network.NewAdmission(network.DefaultLimits())
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	replicaAdmission, err := network.NewReplicationAdmission(len(ports))
+	if err != nil {
+		fail(err.Error())
+		return
+	}
 	defer func() {
 		stop()
 		for _, listener := range listeners {
+			listener.Close()
+		}
+		for _, listener := range replicaListeners {
 			listener.Close()
 		}
 		servers.Wait()
@@ -286,6 +300,13 @@ func main() {
 			return
 		}
 		listeners[b.ID] = listener
+		internal, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+		if err != nil {
+			fail(fmt.Sprintf("Bind replication endpoint: %v", err))
+			return
+		}
+		replicaListeners[b.ID] = internal
+		b.ReplicationAddress = internal.Addr().String()
 	}
 	if err := isrMgr.Start(ctx); err != nil {
 		fail(err.Error())
@@ -305,11 +326,18 @@ func main() {
 
 		bCtx, bCancel := context.WithCancel(ctx)
 		brokerCancels[b.ID] = bCancel
-		servers.Add(1)
+		servers.Add(2)
+		go func() {
+			defer servers.Done()
+			if err := network.ServeReplication(bCtx, replicaListeners[b.ID], metaMgr, coord, b.ID, replicaAdmission); err != nil {
+				fail(fmt.Sprintf("Replication listener failed: %v", err))
+				stop()
+			}
+		}()
 		go func() {
 			defer servers.Done()
 			defer bCancel()
-			if err := network.Serve(bCtx, listeners[b.ID], metaMgr, coord, b.ID); err != nil {
+			if err := network.ServeWithAdmission(bCtx, listeners[b.ID], metaMgr, coord, b.ID, clientAdmission); err != nil {
 				fail(fmt.Sprintf("Broker %d stopped unexpectedly: %v", b.ID, err))
 				stop()
 			}

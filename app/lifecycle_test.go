@@ -11,12 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ritiraj/kafka-go/internal/network"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func testRuntimeConfig(t *testing.T) runtimeConfig {
 	t.Helper()
-	return runtimeConfig{brokerID: 2, numBrokers: 3, replicationFactor: 3, minISR: 2, lagTimeMaxMs: 10000, logDir: t.TempDir()}
+	return runtimeConfig{brokerID: 2, numBrokers: 3, replicationFactor: 3, minISR: 2, lagTimeMaxMs: 10000, logDir: t.TempDir(), limits: network.DefaultLimits()}
 }
 
 type countedListener struct {
@@ -111,7 +112,7 @@ func TestRuntimeJoinsAllBrokersOnCancellationAndListenerFailure(t *testing.T) {
 			go func() {
 				result <- runWithConfig(ctx, cfg, func(ctx context.Context, network, address string) (net.Listener, error) {
 					listener, err := net.Listen("tcp", "127.0.0.1:0")
-					if err == nil {
+					if err == nil && address != "127.0.0.1:0" {
 						bound <- listener
 						addresses <- address
 					}
@@ -153,7 +154,9 @@ func TestRuntimeJoinsAllBrokersOnCancellationAndListenerFailure(t *testing.T) {
 				t.Fatal("runtime did not join listeners and workers")
 			}
 			for _, conn := range clients {
-				if err:=conn.SetReadDeadline(time.Now().Add(time.Second)); err!=nil {t.Fatal(err)}
+				if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
 				var b [1]byte
 				if n, err := conn.Read(b[:]); n != 0 || err != io.EOF {
 					t.Fatalf("active client was not closed: n=%d err=%v", n, err)

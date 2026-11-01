@@ -4,9 +4,10 @@ import "sync"
 
 // Broker represents a single Kafka broker node.
 type Broker struct {
-	ID   int32
-	Host string
-	Port int32
+	ID                 int32
+	Host               string
+	Port               int32
+	ReplicationAddress string // Loopback-only internal endpoint; never advertised to clients.
 }
 
 // Registry tracks all known brokers in the cluster.

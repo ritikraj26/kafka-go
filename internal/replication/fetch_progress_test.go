@@ -25,7 +25,7 @@ func TestFollowerFetchPersistsBeforeAdvancingProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Brokers = broker.NewRegistry(1)
-	m.Brokers.Register(&broker.Broker{ID: 1, Host: "127.0.0.1", Port: int32(listener.Addr().(*net.TCPAddr).Port)})
+	m.Brokers.Register(&broker.Broker{ID: 1, Host: "127.0.0.1", Port: int32(listener.Addr().(*net.TCPAddr).Port), ReplicationAddress: listener.Addr().String()})
 	m.Brokers.Register(&broker.Broker{ID: 2})
 	topic := testutil.CreateTopic(t, m, "events", 1)
 	p := &topic.Partitions[0]
@@ -42,9 +42,13 @@ func TestFollowerFetchPersistsBeforeAdvancingProgress(t *testing.T) {
 	done := make(chan struct{})
 	coord := coordinator.NewCoordinator()
 	defer coord.Close()
+	admission, err := network.NewReplicationAdmission(2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
 		defer close(done)
-		if err := network.Serve(ctx, listener, m, coord, 1); err != nil {
+		if err := network.ServeReplication(ctx, listener, m, coord, 1, admission); err != nil {
 			t.Errorf("leader server: %v", err)
 		}
 	}()
