@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,11 @@ type Coordinator struct {
 	closed         bool
 	done           chan struct{}
 	closeDone      chan struct{}
+	limits         StateLimits
+	groupUsage     retainedUsage
+	offsetEntries  int
+	offsetBytes    int64
+	allTimers      sync.WaitGroup
 }
 
 // NewCoordinator creates an empty Coordinator.
@@ -37,6 +43,8 @@ func NewCoordinator() *Coordinator {
 		MaxGroupSize:   256,
 		done:           make(chan struct{}),
 		closeDone:      make(chan struct{}),
+		limits:         DefaultStateLimits(),
+		groupUsage:     retainedUsage{limit: DefaultStateLimits().GroupBytes},
 	}
 }
 
@@ -53,8 +61,20 @@ func (c *Coordinator) getOrCreateGroupContext(ctx context.Context, groupID strin
 	}
 	g, ok := c.groups[groupID]
 	if !ok {
+		c.reclaimEmptyGroups()
+		cost := groupCharge(groupID)
+		if len(c.groups) >= c.limits.MaxGroups || cost > c.limits.PerGroupBytes || !c.groupUsage.change(cost) {
+			logger.L.Warn("consumer group admission rejected", "group", groupID)
+			return nil
+		}
 		g = newConsumerGroup(groupID, c.handleSessionExpired)
-		c.groups[groupID] = g
+		g.GroupID = strings.Clone(groupID)
+		g.usage = &c.groupUsage
+		g.retained = cost
+		g.maxRetained = c.limits.PerGroupBytes
+		g.initializing = true
+		g.allTimers = &c.allTimers
+		c.groups[g.GroupID] = g
 	}
 	return g
 }
@@ -80,15 +100,25 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	if ctx.Err() != nil {
 		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
 	}
+	if groupID == "" || len(groupID) > 32767 || len(memberID) > 32767 || len(protocolType) > 32767 || sessionTimeoutMs <= 0 {
+		logger.L.Warn("invalid consumer group join", "group", groupID)
+		return &JoinGroupResult{ErrorCode: protocol.ErrInvalidRequest}
+	}
 
 	g := c.getOrCreateGroupContext(ctx, groupID)
 	if g == nil {
 		if ctx.Err() != nil {
 			return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
 		}
-		return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable}
+		select {
+		case <-c.done:
+			return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable}
+		default:
+		}
+		return &JoinGroupResult{ErrorCode: protocol.ErrThrottlingQuotaExceeded}
 	}
 	g.mu.Lock()
+	g.initializing = false
 
 	if g.State == GroupDead {
 		g.mu.Unlock()
@@ -100,7 +130,8 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	}
 
 	// Enforce max group size
-	if memberID == "" && c.MaxGroupSize > 0 && len(g.Members) >= c.MaxGroupSize {
+	_, existing := g.Members[memberID]
+	if !existing && c.MaxGroupSize > 0 && len(g.Members) >= c.MaxGroupSize {
 		g.mu.Unlock()
 		return &JoinGroupResult{ErrorCode: protocol.ErrGroupMaxSizeReached}
 	}
@@ -112,21 +143,37 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 
 	// Add or update member
 	m, exists := g.Members[memberID]
+	oldCost := int64(0)
+	var assignment []byte
+	if exists {
+		oldCost = m.retained
+		assignment = m.Assignment
+	}
+	cost := memberCharge(memberID, protocols, assignment)
+	next := g.retained - oldCost + cost + 2*int64(len(protocolType)-len(g.ProtocolType))
+	if !g.growState(next) {
+		g.mu.Unlock()
+		logger.L.Warn("consumer group state quota exceeded", "group", groupID)
+		return &JoinGroupResult{ErrorCode: protocol.ErrThrottlingQuotaExceeded, MemberID: memberID}
+	}
+	ownedProtocols := cloneProtocols(protocols)
 	if !exists {
 		m = &Member{
-			MemberID:       memberID,
+			MemberID:       strings.Clone(memberID),
 			SessionTimeout: time.Duration(sessionTimeoutMs) * time.Millisecond,
-			Protocols:      protocols,
+			Protocols:      ownedProtocols,
 		}
-		g.Members[memberID] = m
+		g.Members[m.MemberID] = m
 	} else {
-		m.Protocols = protocols
+		m.Protocols = ownedProtocols
 		m.SessionTimeout = time.Duration(sessionTimeoutMs) * time.Millisecond
 	}
+	m.retained = cost
+	g.publishState(next)
 
 	m.joinAttempt++
 	attempt := m.joinAttempt
-	g.ProtocolType = protocolType
+	g.ProtocolType = strings.Clone(protocolType)
 	g.startSessionTimer(m)
 
 	// If group is Stable or AwaitingSync, trigger rebalance
@@ -245,11 +292,30 @@ func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, gene
 
 	// If this is the leader, distribute assignments
 	if memberID == g.LeaderID && len(assignments) > 0 {
+		next := g.retained
+		seen := make(map[string]bool, len(assignments))
+		for _, a := range assignments {
+			mem := g.Members[a.MemberID]
+			if mem == nil || seen[a.MemberID] {
+				g.mu.Unlock()
+				logger.L.Warn("invalid group assignment member", "group", groupID)
+				return nil, protocol.ErrInvalidRequest
+			}
+			seen[a.MemberID] = true
+			next += 2 * int64(len(a.Assignment)-len(mem.Assignment))
+		}
+		if !g.growState(next) {
+			g.mu.Unlock()
+			logger.L.Warn("group assignment quota exceeded", "group", groupID)
+			return nil, protocol.ErrThrottlingQuotaExceeded
+		}
 		for _, a := range assignments {
 			if mem, ok := g.Members[a.MemberID]; ok {
+				mem.retained += 2 * int64(len(a.Assignment)-len(mem.Assignment))
 				mem.Assignment = bytes.Clone(a.Assignment)
 			}
 		}
+		g.publishState(next)
 
 		g.State = GroupStable
 

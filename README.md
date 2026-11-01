@@ -275,8 +275,9 @@ This is a **local disk durability** guarantee, not replicated coordinator state
 or an atomic transaction with consumer processing. Group membership is rebuilt
 after restart; offsets are retained independently. Stateless/manual commits
 without group membership, offset retention/compaction, and replicated offset
-storage are not implemented. The single append log and latest-offset map can
-grow without quotas, and commits serialize disk synchronization. Losing the
+storage are not implemented. The latest-offset map has count and byte-charge
+quotas, but the append log still grows without disk retention or compaction,
+and commits serialize disk synchronization. Losing the
 entire offset directory is indistinguishable from a never-initialized store;
 backups and independent failure domains are still required.
 
@@ -536,15 +537,64 @@ disk append. Send and receive pools are separate so a sender cannot hold the ver
 capacity needed by its receiver. Internal fetch data can reach the 100 MiB batch
 limit and is not constrained by the public 16 MiB soft target.
 
-**Accounting limit:** these quotas are still not a total-process memory/RSS
-ceiling. They account for nominal buffer capacities and decoder/planning charges,
-not allocator rounding or garbage awaiting collection. Retained consumer-group,
-offset and schema state, JSON schema validation/inference allocations, append
-copies, non-fetch response builders, filesystem/directory metadata, socket buffers,
-listener backlog, and OS file-descriptor headroom need additional limits and
-load-based sizing. Direct API helpers enforce per-call limits; aggregate accounting
-requires the shared network admission controller and holding returned fetch payload
-reservations until the caller finishes using them.
+### Retained-state and non-fetch response limits
+
+The coordinator and schema registry enforce logical byte charges as well as
+entry counts. These are deterministic admission rules, not measurements of heap
+size. Growth is checked before publishing retained state:
+
+| State | Default limits | Admission behavior |
+|-------|----------------|--------------------|
+| Consumer-group membership | 1,000 groups; 64 MiB total; 8 MiB/group; 256 members/group | Reject over-limit growth with `THROTTLING_QUOTA_EXCEEDED` (89); the member-count limit returns the group-size error |
+| Latest committed offsets | 100,000 entries; 64 MiB total | Reject over-limit growth before appending, without fencing a healthy store |
+| Schemas | 1,000 schemas; 16 MiB total; 64 KiB/schema; 1,024 fields/schema | Reject registration that exceeds a limit; replacing a schema can release capacity |
+| Optional schema inference | 8 concurrent jobs; 1 MiB/sample | Reserve a schema slot and up to 64 KiB before scheduling; skip overload with a warning |
+| Encoded non-fetch responses | 16 MiB/response; 128 MiB shared buffer pool | Close the connection on size/admission failure, without sending a partial frame |
+
+Group charges are `1024 + 2*len(groupID) + 2*len(protocolType)`, plus
+`512 + 2*(len(memberID)+len(assignment))` per member and
+`128 + 2*(len(protocolName)+len(metadata))` per advertised member protocol.
+Offset entries cost `512 + 2*(len(groupID)+len(topic))`, plus
+`64 + 2*len(metadata)` for non-null metadata. Schemas cost
+`256 + 2*len(topic)`, plus `128 + 2*(len(fieldName)+len(fieldType))` per field.
+Lengths are bytes. Stored strings, member metadata, assignments, and schemas
+are owned copies; smaller replacements and membership removal release charges.
+
+Creating a group can reclaim empty membership state, but **never deletes
+committed offsets**. Active groups are not evicted. Assignment changes are
+validated as a whole before publication. Offset recovery checks quotas at
+**every replay prefix**, not just the final latest-value map: lowering limits
+below a historical retained-state peak can stop startup even when the final
+map would fit. Recovery fails closed without truncating the log or publishing
+partial recovered state.
+
+Inference limits apply before copying a sample. If a topic has no registered
+schema, skipping optional inference does not reject an otherwise valid large
+record. Registered schemas remain enforced. Explicit registration can take
+over an in-flight inference reservation and cancel that job; stale inference
+cannot overwrite the explicit schema. Failed/cancelled jobs release reservations.
+The per-schema, field-count, job-count, and sample limits are defaults of the
+programmatic schema limits, rather than environment settings.
+
+Non-fetch encoding acquires buffer capacity lazily. Blocking JoinGroup and
+SyncGroup operations wait before encoding; `acks=0` uses no response-buffer
+capacity. Growth reserves both the old and new buffer capacities during copying
+and fails without waiting if additional capacity is unavailable. Initial
+admission uses the configured admission wait. A reservation remains held through
+delivery. Side effects can precede an encoding or delivery failure, so a failed
+response does **not** prove that a produce or offset commit was rolled back.
+Retries may still be ambiguous.
+
+**Accounting limit:** these quotas are not a total-process memory/RSS ceiling.
+They account for nominal buffer capacities and decoder/planning/retained-state
+charges, not allocator rounding or garbage awaiting collection. Temporary
+response-model snapshots, JSON schema validation/inference allocations, append
+copies, filesystem/directory metadata, socket buffers, listener backlog, and OS
+file-descriptor headroom still need additional limits and load-based sizing.
+Offset-log disk retention/compaction is also not implemented. Direct API helpers
+enforce per-call response limits; aggregate buffer accounting requires the shared
+network admission controller and holding returned fetch payload reservations
+until the caller finishes using them.
 
 ### Environment Variables
 
@@ -565,6 +615,15 @@ reservations until the caller finishes using them.
 | `MAX_REQUEST_ENTRIES` | `10000` | Aggregate request-entry limit and maximum selected fetch batch plans; 1 to 100000 |
 | `FETCH_MAX_BYTES` | `16777216` | Public fetch-data soft target; 1 byte to 100 MiB, with first-batch progress exception |
 | `MAX_INFLIGHT_FETCH_BYTES` | `536870912` | Shared fetch planning/record/encoding budget; validated for maximum-batch progress |
+| `MAX_RESPONSE_BYTES` | `16777216` | Maximum encoded non-fetch response body |
+| `MAX_INFLIGHT_RESPONSE_BYTES` | `134217728` | Shared non-fetch buffer-capacity budget; at least twice `MAX_RESPONSE_BYTES` for growth overlap |
+| `MAX_GROUPS` | `1000` | Maximum retained consumer groups; empty membership state can be reclaimed |
+| `MAX_GROUP_BYTES` | `8388608` | Per-group retained-state charge ceiling |
+| `MAX_GROUP_STATE_BYTES` | `67108864` | Global retained group-state charge ceiling |
+| `MAX_OFFSET_ENTRIES` | `100000` | Maximum retained latest-offset entries |
+| `MAX_OFFSET_STATE_BYTES` | `67108864` | Global retained offset-state charge ceiling, also enforced during replay |
+| `MAX_SCHEMAS` | `1000` | Maximum schema slots, including pending inference reservations |
+| `MAX_SCHEMA_STATE_BYTES` | `16777216` | Global schema-state charge ceiling, including pending reservations |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint for schema inference |
 | `OLLAMA_MODEL` | `llama3.2` | LLM model for schema inference |
 
@@ -638,7 +697,7 @@ go test -race ./internal/memory ./internal/protocol ./internal/storage ./interna
 
 - **In-process replication** — Multi-broker is simulated within a single process; no real network replication between separate broker instances
 - **Remaining correctness work** — Persisted replication commit/ISR state, replicated coordinator storage, failover/divergence recovery, remaining shared-state races outside the protected paths, and load/fault testing are still outstanding; the local topic catalog is not distributed consensus
-- **Resource limits** — Connection, raw-frame, wire-decoder and fetch-buffer admission are implemented; retained-state quotas, non-fetch response budgets, JSON-processing limits and retention remain. These limits do not bound total RSS, and cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
+- **Resource limits** — Connection, raw-frame, wire-decoder, fetch-buffer and non-fetch response-buffer admission, retained-state quotas, and optional inference job/sample limits are implemented. JSON-processing allocation limits, temporary response-model accounting, and disk retention remain. These limits do not bound total RSS, and cancellation cannot guarantee a fixed exit deadline on stalled filesystems.
 - **Compatibility scope** — Only the listed versions and configured client subset are supported. More API versions, independent client implementations, timestamp offset lookup, static/cooperative groups, and administrative APIs require additional work.
 - **Batch subset** — Compression, transactional/control batches, and compacted logs with noncontiguous record offsets are not supported
 - **No cooperative rebalance** — Only eager (stop-the-world) rebalance protocol is supported

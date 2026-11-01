@@ -7,8 +7,8 @@ import (
 
 // BuildBody builds a FindCoordinator v0 response.
 // Returns the local broker as the coordinator for every group.
-func BuildBody(req *protocol.FindCoordinatorRequest, reg *broker.Registry) []byte {
-	enc := protocol.NewEncoder()
+func BuildBody(req *protocol.FindCoordinatorRequest, reg *broker.Registry, encoders ...*protocol.Encoder) []byte {
+	enc := protocol.ResponseEncoder(encoders)
 	enc.WriteInt16(protocol.ErrNone) // error_code
 
 	if reg != nil {

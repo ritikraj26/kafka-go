@@ -10,8 +10,8 @@ import (
 const clusterID = "kafka-go-cluster"
 
 // BuildBody encodes Metadata v12, including topic-by-ID and missing-topic results.
-func BuildBody(req *protocol.MetadataRequest, m *metadata.Manager) []byte {
-	e := protocol.NewEncoder()
+func BuildBody(req *protocol.MetadataRequest, m *metadata.Manager, encoders ...*protocol.Encoder) []byte {
+	e := protocol.ResponseEncoder(encoders)
 	e.WriteInt32(0)
 	if m.Brokers != nil {
 		brokers := m.Brokers.All()
@@ -50,6 +50,9 @@ func BuildBody(req *protocol.MetadataRequest, m *metadata.Manager) []byte {
 	}
 	e.WriteUnsignedVarint(uint64(len(requested) + 1))
 	for _, query := range requested {
+		if e.Err() != nil {
+			return e.Bytes()
+		}
 		var topic *metadata.Topic
 		if query.ID != [16]byte{} {
 			topic = m.GetTopicByID(query.ID)

@@ -74,17 +74,18 @@ func (c *Coordinator) LoadOffsets(logDir string) error {
 	if err != nil {
 		return err
 	}
-	offsets, count, err := loadOffsetLog(dir)
+	offsets, count, err := loadOffsetLog(dir, c.limits)
 	if err != nil {
 		c.offsetErr = err
 		return fmt.Errorf("recover consumer offsets: %w", err)
 	}
 	c.offsetLogDir, c.offsets, c.offsetReady = dir, offsets, true
+	c.offsetEntries, c.offsetBytes = offsetMapUsage(offsets)
 	logger.L.Info("loaded committed offsets", "records", count)
 	return nil
 }
 
-func loadOffsetLog(dir string) (offsetMap, int, error) {
+func loadOffsetLog(dir string, limits StateLimits) (offsetMap, int, error) {
 	info, err := os.Lstat(dir)
 	fresh := os.IsNotExist(err)
 	if err != nil && !fresh {
@@ -120,7 +121,7 @@ func loadOffsetLog(dir string) (offsetMap, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	offsets, count, replayErr := replayOffsets(f)
+	offsets, count, replayErr := replayOffsetsLimited(f, limits)
 	if replayErr == nil {
 		replayErr = f.Sync()
 	}
@@ -134,9 +135,15 @@ func loadOffsetLog(dir string) (offsetMap, int, error) {
 }
 
 func replayOffsets(r io.Reader) (offsetMap, int, error) {
+	return replayOffsetsLimited(r, DefaultStateLimits())
+}
+
+func replayOffsetsLimited(r io.Reader, limits StateLimits) (offsetMap, int, error) {
 	reader := bufio.NewReaderSize(r, maxOffsetRecordBytes+1)
 	offsets := make(offsetMap)
 	count := 0
+	entries := 0
+	var retained int64
 	for {
 		line, err := reader.ReadSlice('\n')
 		if err == io.EOF && len(line) == 0 {
@@ -152,7 +159,12 @@ func replayOffsets(r io.Reader) (offsetMap, int, error) {
 		if err != nil {
 			return nil, 0, fmt.Errorf("offset record %d: %w", count+1, err)
 		}
+		nextEntries, nextBytes := nextOffsetUsage(offsets, entries, retained, record)
+		if nextEntries > limits.MaxOffsets || nextBytes > limits.OffsetBytes {
+			return nil, 0, fmt.Errorf("offset record %d exceeds retained offset quotas", count+1)
+		}
 		offsets.put(record)
+		entries, retained = nextEntries, nextBytes
 		count++
 	}
 }
@@ -249,10 +261,10 @@ func encodeOffsetRecord(record offsetRecord) ([]byte, error) {
 
 func (offsets offsetMap) put(record offsetRecord) {
 	if offsets[record.Group] == nil {
-		offsets[record.Group] = make(map[string]map[int32]committedOffset)
+		offsets[strings.Clone(record.Group)] = make(map[string]map[int32]committedOffset)
 	}
 	if offsets[record.Group][record.Topic] == nil {
-		offsets[record.Group][record.Topic] = make(map[int32]committedOffset)
+		offsets[record.Group][strings.Clone(record.Topic)] = make(map[int32]committedOffset)
 	}
 	offsets[record.Group][record.Topic][record.Partition] = committedOffset{Offset: record.Offset, Metadata: copyOffsetMetadata(record.Metadata)}
 }
@@ -261,7 +273,7 @@ func copyOffsetMetadata(value *string) *string {
 	if value == nil {
 		return nil
 	}
-	copy := *value
+	copy := strings.Clone(*value)
 	return &copy
 }
 
@@ -315,8 +327,13 @@ func (c *Coordinator) CommitOffsetWithMetadataContext(ctx context.Context, group
 		logger.L.Debug("offset commit cancelled before validation")
 		return protocol.ErrRequestTimedOut
 	}
-	record := offsetRecord{Group: groupID, Topic: topic, Partition: partition, Offset: offset, Metadata: copyOffsetMetadata(metadata)}
-	data, err := encodeOffsetRecord(record)
+	record := offsetRecord{Group: groupID, Topic: topic, Partition: partition, Offset: offset, Metadata: metadata}
+	err := validateOffsetRecord(record)
+	var data []byte
+	if err == nil {
+		record.Metadata = copyOffsetMetadata(record.Metadata)
+		data, err = encodeOffsetRecord(record)
+	}
 	if err != nil {
 		logger.L.Warn("rejecting offset commit", "group", groupID, "topic", topic, "partition", partition, "err", err)
 		if errors.Is(err, errOffsetMetadataTooLarge) {
@@ -346,12 +363,18 @@ func (c *Coordinator) CommitOffsetWithMetadataContext(ctx context.Context, group
 	if generationID != g.GenerationID {
 		return protocol.ErrIllegalGeneration
 	}
+	nextEntries, nextBytes := nextOffsetUsage(c.offsets, c.offsetEntries, c.offsetBytes, record)
+	if nextEntries > c.limits.MaxOffsets || nextBytes > c.limits.OffsetBytes {
+		logger.L.Warn("retained offset quota exceeded", "group", groupID, "topic", topic, "partition", partition)
+		return protocol.ErrThrottlingQuotaExceeded
+	}
 	if err := c.persistOffset(data); err != nil {
 		c.offsetErr = err
 		logger.L.Error("offset persistence failed; store fenced until restart", "group", groupID, "topic", topic, "partition", partition, "err", err)
 		return protocol.ErrKafkaStorageError
 	}
 	c.offsets.put(record)
+	c.offsetEntries, c.offsetBytes = nextEntries, nextBytes
 	return protocol.ErrNone
 }
 

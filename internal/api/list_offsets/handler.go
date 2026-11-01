@@ -13,12 +13,18 @@ func BuildBody(req *protocol.ListOffsetsRequest, metaMgr *metadata.Manager, loca
 	if len(localBrokerID) > 0 {
 		brokerID = localBrokerID[0]
 	}
-	enc := protocol.NewEncoder()
+	return BuildBodyEncoded(req, metaMgr, brokerID, protocol.ResponseEncoder(nil))
+}
+
+func BuildBodyEncoded(req *protocol.ListOffsetsRequest, metaMgr *metadata.Manager, brokerID int32, enc *protocol.Encoder) []byte {
 	enc.WriteArrayLen(len(req.Topics)) // topics array
 	for _, t := range req.Topics {
 		enc.WriteString(t.Name)              // topic name
 		enc.WriteArrayLen(len(t.Partitions)) // partitions array
 		for _, p := range t.Partitions {
+			if enc.Err() != nil {
+				return enc.Bytes()
+			}
 			topic := metaMgr.GetTopic(t.Name)
 			enc.WriteInt32(p.Index) // partition index
 			if topic == nil {

@@ -11,7 +11,7 @@ func BuildBody(req *protocol.SyncGroupRequest, coord *coordinator.Coordinator) [
 	return BuildBodyContext(context.Background(), req, coord)
 }
 
-func BuildBodyContext(ctx context.Context, req *protocol.SyncGroupRequest, coord *coordinator.Coordinator) []byte {
+func BuildBodyContext(ctx context.Context, req *protocol.SyncGroupRequest, coord *coordinator.Coordinator, encoders ...*protocol.Encoder) []byte {
 	// Convert assignments
 	assignments := make([]coordinator.SyncGroupAssignment, len(req.Assignments))
 	for i, a := range req.Assignments {
@@ -23,7 +23,7 @@ func BuildBodyContext(ctx context.Context, req *protocol.SyncGroupRequest, coord
 
 	data, errCode := coord.SyncGroupContext(ctx, req.GroupID, req.GenerationID, req.MemberID, assignments)
 
-	enc := protocol.NewEncoder()
+	enc := protocol.ResponseEncoder(encoders)
 	enc.WriteInt16(errCode) // error_code
 	enc.WriteBytes(data)    // member_assignment
 	return enc.Bytes()

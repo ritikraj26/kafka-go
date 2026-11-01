@@ -6,9 +6,9 @@ import (
 )
 
 // BuildBody builds a Heartbeat v0 response.
-func BuildBody(req *protocol.HeartbeatRequest, coord *coordinator.Coordinator) []byte {
+func BuildBody(req *protocol.HeartbeatRequest, coord *coordinator.Coordinator, encoders ...*protocol.Encoder) []byte {
 	errCode := coord.Heartbeat(req.GroupID, req.GenerationID, req.MemberID)
-	enc := protocol.NewEncoder()
+	enc := protocol.ResponseEncoder(encoders)
 	enc.WriteInt16(errCode) // error_code
 	return enc.Bytes()
 }

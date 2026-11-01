@@ -41,6 +41,7 @@ type AdmissionStats struct {
 	Decoded               memory.Stats
 	Fetch                 memory.Stats
 	DecodeLimitRejections uint64
+	Responses             memory.Stats
 }
 
 // Admission accounts for accepted handlers and their raw request frames, not
@@ -52,6 +53,7 @@ type Admission struct {
 	frames           *memory.Pool
 	decoded          *memory.Pool
 	fetch            *memory.Pool
+	responses        *memory.Pool
 	memoryLimits     MemoryLimits
 	lastRejectionLog time.Time
 	replication      bool
@@ -82,7 +84,11 @@ func NewAdmissionWithMemory(limits Limits, mem MemoryLimits) (*Admission, error)
 	if err != nil {
 		return nil, err
 	}
-	return &Admission{limits: limits, frames: frames, decoded: decoded, fetch: fetch, memoryLimits: mem}, nil
+	responses, err := memory.NewPool(mem.ResponseBudget, limits.MaxConnections, limits.AdmissionWait)
+	if err != nil {
+		return nil, err
+	}
+	return &Admission{limits: limits, frames: frames, decoded: decoded, fetch: fetch, responses: responses, memoryLimits: mem}, nil
 }
 
 // NewReplicationAdmission reserves enough sockets for one connection per
@@ -96,7 +102,7 @@ func NewReplicationAdmission(brokers int) (*Admission, error) {
 		return nil, fmt.Errorf("replication connection count exceeds platform limit")
 	}
 	a, err := NewAdmissionWithMemory(Limits{MaxConnections: int(pairs), MaxRequestBytes: 64 << 10, MaxInFlightBytes: 1 << 20, AdmissionWait: 2 * time.Second},
-		MemoryLimits{MaxDecodedBytes: 1 << 20, DecodedBudget: 8 << 20, MaxEntries: 1024, FetchMaxBytes: 100 << 20, FetchBudget: 256 << 20})
+		MemoryLimits{MaxDecodedBytes: 1 << 20, DecodedBudget: 8 << 20, MaxEntries: 1024, FetchMaxBytes: 100 << 20, FetchBudget: 256 << 20, ResponseMaxBytes: 64 << 10, ResponseBudget: 128 << 10})
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +121,7 @@ func (a *Admission) Stats() AdmissionStats {
 	stats.TimedOutRequests = raw.TimedOut
 	stats.Decoded = a.decoded.Stats()
 	stats.Fetch = a.fetch.Stats()
+	stats.Responses = a.responses.Stats()
 	return stats
 }
 

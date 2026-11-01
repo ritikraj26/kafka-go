@@ -26,6 +26,7 @@ const (
 	ErrFetchSessionIDNotFound       int16 = 70
 	ErrMemberIDRequired             int16 = 79
 	ErrGroupMaxSizeReached          int16 = 81
+	ErrThrottlingQuotaExceeded      int16 = 89
 	ErrUnknownTopicID               int16 = 100
 	ErrFencedLeaderEpoch            int16 = 74
 	ErrUnknownLeaderEpoch           int16 = 75

@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"sort"
 	"sync"
 	"time"
@@ -61,6 +62,7 @@ type Member struct {
 	LastHeartbeat  time.Time
 	sessionTimer   *groupTimer
 	joinAttempt    uint64
+	retained       int64
 }
 
 // MemberProtocol is a name+metadata pair from JoinGroup.
@@ -85,9 +87,13 @@ type ConsumerGroup struct {
 	pendingSyncs map[string]chan []byte
 
 	// Rebalance delay timer: when set, join completion is deferred
-	rebalanceTimer    *groupTimer
-	rebalanceSequence uint64
-	timers            sync.WaitGroup
+	rebalanceTimer        *groupTimer
+	rebalanceSequence     uint64
+	timers                sync.WaitGroup
+	allTimers             *sync.WaitGroup
+	usage                 *retainedUsage
+	retained, maxRetained int64
+	initializing          bool
 
 	// Called when a member's session expires
 	onSessionExpired func(g *ConsumerGroup, memberID string)
@@ -178,7 +184,7 @@ func (g *ConsumerGroup) completeJoinPhase() {
 				break
 			}
 		}
-		leaderMembers = append(leaderMembers, JoinGroupMember{MemberID: mid, Metadata: meta})
+		leaderMembers = append(leaderMembers, JoinGroupMember{MemberID: mid, Metadata: bytes.Clone(meta)})
 	}
 
 	// Deliver results to all pending join callers
@@ -235,6 +241,11 @@ func (g *ConsumerGroup) removeMember(memberID string) {
 		m.sessionTimer.Stop()
 	}
 	delete(g.Members, memberID)
+	g.publishState(g.retained - m.retained)
+	if g.LeaderID == memberID {
+		g.LeaderID = ""
+	}
+	g.ProtocolName = ""
 
 	// Close pending channels
 	if ch, ok := g.pendingJoins[memberID]; ok {
@@ -247,6 +258,8 @@ func (g *ConsumerGroup) removeMember(memberID string) {
 	}
 
 	if len(g.Members) == 0 {
+		g.publishState(g.retained - 2*int64(len(g.ProtocolType)))
+		g.ProtocolType = ""
 		g.rebalanceTimer.Stop()
 		g.rebalanceTimer = nil
 		g.rebalanceSequence++

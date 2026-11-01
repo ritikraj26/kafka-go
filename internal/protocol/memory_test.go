@@ -151,7 +151,7 @@ func TestFixedEncoderCannotGrow(t *testing.T) {
 	e := NewFixedEncoder(4)
 	e.WriteInt32(42)
 	e.WriteByte(1)
-	if e.Err() == nil || len(e.Bytes()) != 4 || cap(e.Bytes()) != 4 {
+	if e.Err() == nil || len(e.buf) != 4 || cap(e.buf) != 4 || e.Bytes() != nil {
 		t.Fatal("encoder grew beyond its reservation")
 	}
 }

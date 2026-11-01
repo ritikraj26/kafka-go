@@ -10,9 +10,18 @@ type groupTimer struct {
 
 func (g *ConsumerGroup) after(delay time.Duration, fn func()) *groupTimer {
 	g.timers.Add(1)
+	if g.allTimers != nil {
+		g.allTimers.Add(1)
+	}
+	done := func() {
+		g.timers.Done()
+		if g.allTimers != nil {
+			g.allTimers.Done()
+		}
+	}
 	return &groupTimer{
-		timer: time.AfterFunc(delay, func() { defer g.timers.Done(); fn() }),
-		done:  g.timers.Done,
+		timer: time.AfterFunc(delay, func() { defer done(); fn() }),
+		done:  done,
 	}
 }
 
@@ -54,11 +63,16 @@ func (c *Coordinator) Close() {
 			delete(g.pendingSyncs, id)
 		}
 		g.State = GroupDead
+		g.publishState(0)
 		g.mu.Unlock()
 	}
-	for _, g := range groups {
-		g.timers.Wait()
-	}
+	c.allTimers.Wait()
+	c.mu.Lock()
+	c.groups = make(map[string]*ConsumerGroup)
+	c.offsets = make(offsetMap)
+	c.offsetEntries = 0
+	c.offsetBytes = 0
+	c.mu.Unlock()
 	close(c.closeDone)
 }
 

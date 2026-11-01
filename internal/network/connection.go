@@ -99,8 +99,10 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 	header.SetDecodeLimits(protocol.DecodeLimits{MaxBytes: decodeBytes, MaxEntries: admission.memoryLimits.MaxEntries})
 	var body []byte
 	var requestErr error
+	encoder := protocol.NewResponseEncoder(ctx, admission.responses, admission.memoryLimits.ResponseMaxBytes)
+	defer encoder.Release()
 	if header.GetAPIKey() == protocol.APIKeyApiVersions && header.GetErrorCode() != protocol.ErrNone {
-		body = apiversions.BuildBodyVersion(0, protocol.ErrUnsupportedVersion)
+		body = apiversions.BuildBodyVersion(0, protocol.ErrUnsupportedVersion, encoder)
 	} else {
 		request, err := protocol.ParseRequest(header)
 		if err != nil {
@@ -121,10 +123,14 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 		}
 		switch req := request.(type) {
 		case *protocol.ApiVersionsRequest:
-			body = apiversions.BuildBodyVersion(header.GetAPIVersion(), protocol.ErrNone)
+			body = apiversions.BuildBodyVersion(header.GetAPIVersion(), protocol.ErrNone, encoder)
 		case *protocol.ProduceRequest:
 			var failed bool
-			body, failed = produce.ProcessContext(ctx, req, m, brokerID)
+			if req.Acks == 0 {
+				body, failed = produce.ProcessContext(ctx, req, m, brokerID, protocol.NewDiscardEncoder())
+			} else {
+				body, failed = produce.ProcessContext(ctx, req, m, brokerID, encoder)
+			}
 			if req.Acks == 0 {
 				return !failed && ctx.Err() == nil
 			}
@@ -142,31 +148,35 @@ func handleNextRequest(ctx context.Context, conn net.Conn, m *metadata.Manager, 
 				body = payload.Body
 			}
 		case *protocol.DescribeTopicPartitionsRequest:
-			body = describetopics.BuildBody(req, m)
+			body = describetopics.BuildBody(req, m, encoder)
 		case *protocol.MetadataRequest:
-			body = apimetadata.BuildBody(req, m)
+			body = apimetadata.BuildBody(req, m, encoder)
 		case *protocol.FindCoordinatorRequest:
-			body = findcoordinator.BuildBody(req, m.Brokers)
+			body = findcoordinator.BuildBody(req, m.Brokers, encoder)
 		case *protocol.JoinGroupRequest:
-			body = joingroup.BuildBodyContext(ctx, req, c)
+			body = joingroup.BuildBodyContext(ctx, req, c, encoder)
 		case *protocol.SyncGroupRequest:
-			body = syncgroup.BuildBodyContext(ctx, req, c)
+			body = syncgroup.BuildBodyContext(ctx, req, c, encoder)
 		case *protocol.HeartbeatRequest:
-			body = heartbeat.BuildBody(req, c)
+			body = heartbeat.BuildBody(req, c, encoder)
 		case *protocol.LeaveGroupRequest:
-			body = leavegroup.BuildBody(req, c)
+			body = leavegroup.BuildBody(req, c, encoder)
 		case *protocol.OffsetCommitRequest:
-			body = offsetcommit.BuildBodyContext(ctx, req, c)
+			body = offsetcommit.BuildBodyContext(ctx, req, c, encoder)
 		case *protocol.OffsetFetchRequest:
-			body = offsetfetch.BuildBody(req, c)
+			body = offsetfetch.BuildBody(req, c, encoder)
 		case *protocol.ListOffsetsRequest:
-			body = listoffsets.BuildBody(req, m, brokerID)
+			body = listoffsets.BuildBodyEncoded(req, m, brokerID, encoder)
 		default:
 			logger.L.Error("unhandled request", "api_key", header.GetAPIKey())
 			return false
 		}
 	}
 	if ctx.Err() != nil {
+		return false
+	}
+	if err := encoder.Err(); err != nil {
+		logger.L.Warn("non-fetch response rejected", "err", err, "stats", admission.Stats())
 		return false
 	}
 	if requestErr != nil {

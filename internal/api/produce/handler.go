@@ -24,7 +24,7 @@ func Process(req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBroke
 	return ProcessContext(context.Background(), req, metaMgr, localBrokerID)
 }
 
-func ProcessContext(ctx context.Context, req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32) ([]byte, bool) {
+func ProcessContext(ctx context.Context, req *protocol.ProduceRequest, metaMgr *metadata.Manager, localBrokerID int32, encoders ...*protocol.Encoder) ([]byte, bool) {
 	if ctx.Err() != nil {
 		logger.L.Debug("produce cancelled before dispatch")
 		return nil, true
@@ -43,13 +43,16 @@ func ProcessContext(ctx context.Context, req *protocol.ProduceRequest, metaMgr *
 		Deadline: time.Now().Add(time.Duration(req.TimeoutMs) * time.Millisecond),
 	}
 	failed := requestError != protocol.ErrNone
-	encoder := protocol.NewEncoder()
+	encoder := protocol.ResponseEncoder(encoders)
 	encoder.WriteUnsignedVarint(uint64(len(req.Topics) + 1))
 	for _, reqTopic := range req.Topics {
 		encoder.WriteCompactString(reqTopic.Name)
 		encoder.WriteUnsignedVarint(uint64(len(reqTopic.Partitions) + 1))
 		topic := metaMgr.GetTopic(reqTopic.Name)
 		for _, reqPartition := range reqTopic.Partitions {
+			if encoder.Err() != nil {
+				return encoder.Bytes(), true
+			}
 			if ctx.Err() != nil {
 				logger.L.Debug("produce cancelled between partitions")
 				return nil, true
@@ -182,8 +185,10 @@ func validateRecords(batches []storage.RecordBatch, topic string, metaMgr *metad
 	if len(values) == 0 {
 		return nil, false
 	}
-	if reg.Get(topic) == nil {
-		reg.InferAsync(topic, values[0])
+	if !reg.Has(topic) {
+		if err := reg.InferAsync(topic, values[0]); err != nil {
+			logger.L.Warn("schema inference not applied to this batch", "topic", topic, "err", err)
+		}
 		return nil, false
 	}
 	var failed [][]byte

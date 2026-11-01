@@ -8,7 +8,7 @@ import (
 	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
-func BuildBody(req *protocol.DescribeTopicPartitionsRequest, m *metadata.Manager) []byte {
+func BuildBody(req *protocol.DescribeTopicPartitionsRequest, m *metadata.Manager, encoders ...*protocol.Encoder) []byte {
 	names := slices.Clone(req.TopicNames)
 	if len(names) == 0 {
 		names = m.ListTopics()
@@ -54,10 +54,13 @@ func BuildBody(req *protocol.DescribeTopicPartitionsRequest, m *metadata.Manager
 			break
 		}
 	}
-	e := protocol.NewEncoder()
+	e := protocol.ResponseEncoder(encoders)
 	e.WriteInt32(0)
 	e.WriteUnsignedVarint(uint64(len(pages) + 1))
 	for _, page := range pages {
+		if e.Err() != nil {
+			return e.Bytes()
+		}
 		if page.topic == nil {
 			e.WriteInt16(protocol.ErrUnknownTopicOrPartition)
 			e.WriteCompactString(page.name)

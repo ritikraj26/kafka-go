@@ -9,21 +9,24 @@ import (
 )
 
 type MemoryLimits struct {
-	MaxDecodedBytes int64
-	DecodedBudget   int64
-	MaxEntries      int
-	FetchMaxBytes   int
-	FetchBudget     int64
+	MaxDecodedBytes  int64
+	DecodedBudget    int64
+	MaxEntries       int
+	FetchMaxBytes    int
+	FetchBudget      int64
+	ResponseMaxBytes int
+	ResponseBudget   int64
 }
 
 func DefaultMemoryLimits() MemoryLimits {
-	return MemoryLimits{MaxDecodedBytes: 16 << 20, DecodedBudget: 128 << 20, MaxEntries: 10000, FetchMaxBytes: 16 << 20, FetchBudget: 512 << 20}
+	return MemoryLimits{MaxDecodedBytes: 16 << 20, DecodedBudget: 128 << 20, MaxEntries: 10000, FetchMaxBytes: 16 << 20, FetchBudget: 512 << 20, ResponseMaxBytes: 16 << 20, ResponseBudget: 128 << 20}
 }
 
 func (m MemoryLimits) Validate() error {
 	if m.MaxDecodedBytes < 1024 || m.MaxDecodedBytes > protocol.MaxRequestSize || m.DecodedBudget < m.MaxDecodedBytes ||
-		m.MaxEntries < 1 || m.MaxEntries > 100000 || m.FetchMaxBytes < 1 || m.FetchMaxBytes > storage.MaxRecordBatchBytes {
-		return fmt.Errorf("invalid decoder/fetch limits")
+		m.MaxEntries < 1 || m.MaxEntries > 100000 || m.FetchMaxBytes < 1 || m.FetchMaxBytes > storage.MaxRecordBatchBytes ||
+		m.ResponseMaxBytes < 1 || m.ResponseMaxBytes > protocol.MaxRequestSize || m.ResponseBudget < 2*int64(m.ResponseMaxBytes) {
+		return fmt.Errorf("invalid decoder/fetch/response limits")
 	}
 	// Covers request-derived response headers and bounded planning structures,
 	// plus both record and encoded-body buffers for the first-batch exception.

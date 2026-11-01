@@ -11,13 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ritiraj/kafka-go/internal/coordinator"
 	"github.com/ritiraj/kafka-go/internal/network"
+	"github.com/ritiraj/kafka-go/internal/schema"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func testRuntimeConfig(t *testing.T) runtimeConfig {
 	t.Helper()
-	return runtimeConfig{brokerID: 2, numBrokers: 3, replicationFactor: 3, minISR: 2, lagTimeMaxMs: 10000, logDir: t.TempDir(), limits: network.DefaultLimits(), memoryLimits: network.DefaultMemoryLimits()}
+	return runtimeConfig{brokerID: 2, numBrokers: 3, replicationFactor: 3, minISR: 2, lagTimeMaxMs: 10000, logDir: t.TempDir(), limits: network.DefaultLimits(), memoryLimits: network.DefaultMemoryLimits(), stateLimits: coordinator.DefaultStateLimits(), schemaLimits: schema.DefaultLimits()}
 }
 
 type countedListener struct {

@@ -7,8 +7,8 @@ func BuildBody(errorCode int16) []byte {
 	return BuildBodyVersion(4, errorCode)
 }
 
-func BuildBodyVersion(version, errorCode int16) []byte {
-	e := protocol.NewEncoder()
+func BuildBodyVersion(version, errorCode int16, encoders ...*protocol.Encoder) []byte {
+	e := protocol.ResponseEncoder(encoders)
 	e.WriteInt16(errorCode)
 	apis := protocol.SupportedAPIs()
 	if version >= 3 {

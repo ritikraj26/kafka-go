@@ -23,6 +23,7 @@ import (
 	"github.com/ritiraj/kafka-go/internal/metadata"
 	"github.com/ritiraj/kafka-go/internal/network"
 	"github.com/ritiraj/kafka-go/internal/replication"
+	"github.com/ritiraj/kafka-go/internal/schema"
 )
 
 const (
@@ -48,6 +49,8 @@ type runtimeConfig struct {
 	logDir                                string
 	limits                                network.Limits
 	memoryLimits                          network.MemoryLimits
+	stateLimits                           coordinator.StateLimits
+	schemaLimits                          schema.Limits
 }
 
 type listenFunc func(context.Context, string, string) (net.Listener, error)
@@ -75,8 +78,19 @@ func runWithConfig(parent context.Context, cfg runtimeConfig, listen listenFunc)
 		reg.Register(&broker.Broker{ID: int32(i + 1), Host: "localhost", Port: int32(9092 + i)})
 	}
 	m := metadata.NewManager()
+	if err := m.Schemas.SetLimits(cfg.schemaLimits); err != nil {
+		cancel()
+		m.Schemas.Close()
+		return err
+	}
 	m.Brokers, m.ReplicationFactor, m.MinInSyncReplicas = reg, cfg.replicationFactor, cfg.minISR
 	c := coordinator.NewCoordinator()
+	if err := c.SetStateLimits(cfg.stateLimits); err != nil {
+		cancel()
+		m.Schemas.Close()
+		c.Close()
+		return err
+	}
 	c.RebalanceDelay = rebalanceDelay
 	isr := replication.NewISRManager(m, isrCheckInterval, cfg.lagTimeMaxMs)
 	ctrl := controller.NewController(m, reg, controllerHealthInterval)
@@ -292,9 +306,52 @@ func loadConfig(args []string) (runtimeConfig, error) {
 		return cfg, err
 	}
 	cfg.memoryLimits.FetchBudget = int64(fetchBudget)
+	cfg.memoryLimits.ResponseMaxBytes, err = envIntInRange("MAX_RESPONSE_BYTES", cfg.memoryLimits.ResponseMaxBytes, 1, 100<<20)
+	if err != nil {
+		return cfg, err
+	}
+	responseBudget, err := envIntInRange("MAX_INFLIGHT_RESPONSE_BYTES", int(cfg.memoryLimits.ResponseBudget), 2*cfg.memoryLimits.ResponseMaxBytes, math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.memoryLimits.ResponseBudget = int64(responseBudget)
 	if err := cfg.memoryLimits.Validate(); err != nil {
 		return cfg, err
 	}
+	cfg.stateLimits = coordinator.DefaultStateLimits()
+	cfg.stateLimits.MaxGroups, err = envIntInRange("MAX_GROUPS", cfg.stateLimits.MaxGroups, 1, math.MaxInt32)
+	if err != nil {
+		return cfg, err
+	}
+	perGroup, err := envIntInRange("MAX_GROUP_BYTES", int(cfg.stateLimits.PerGroupBytes), 1024, math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.stateLimits.PerGroupBytes = int64(perGroup)
+	groupBytes, err := envIntInRange("MAX_GROUP_STATE_BYTES", int(cfg.stateLimits.GroupBytes), perGroup, math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.stateLimits.GroupBytes = int64(groupBytes)
+	cfg.stateLimits.MaxOffsets, err = envIntInRange("MAX_OFFSET_ENTRIES", cfg.stateLimits.MaxOffsets, 1, math.MaxInt32)
+	if err != nil {
+		return cfg, err
+	}
+	offsetBytes, err := envIntInRange("MAX_OFFSET_STATE_BYTES", int(cfg.stateLimits.OffsetBytes), 512, math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.stateLimits.OffsetBytes = int64(offsetBytes)
+	cfg.schemaLimits = schema.DefaultLimits()
+	cfg.schemaLimits.MaxSchemas, err = envIntInRange("MAX_SCHEMAS", cfg.schemaLimits.MaxSchemas, 1, math.MaxInt32)
+	if err != nil {
+		return cfg, err
+	}
+	schemaBytes, err := envIntInRange("MAX_SCHEMA_STATE_BYTES", int(cfg.schemaLimits.MaxBytes), int(cfg.schemaLimits.MaxSchemaBytes), math.MaxInt)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.schemaLimits.MaxBytes = int64(schemaBytes)
 	return cfg, nil
 }
 

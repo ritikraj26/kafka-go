@@ -11,7 +11,7 @@ func BuildBody(req *protocol.JoinGroupRequest, coord *coordinator.Coordinator) [
 	return BuildBodyContext(context.Background(), req, coord)
 }
 
-func BuildBodyContext(ctx context.Context, req *protocol.JoinGroupRequest, coord *coordinator.Coordinator) []byte {
+func BuildBodyContext(ctx context.Context, req *protocol.JoinGroupRequest, coord *coordinator.Coordinator, encoders ...*protocol.Encoder) []byte {
 	// Convert protocol types
 	protocols := make([]coordinator.MemberProtocol, len(req.Protocols))
 	for i, p := range req.Protocols {
@@ -21,7 +21,7 @@ func BuildBodyContext(ctx context.Context, req *protocol.JoinGroupRequest, coord
 	result := coord.JoinGroupContext(ctx, req.GroupID, req.MemberID, req.SessionTimeoutMs,
 		req.ProtocolType, protocols)
 
-	enc := protocol.NewEncoder()
+	enc := protocol.ResponseEncoder(encoders)
 	enc.WriteInt16(result.ErrorCode)       // error_code
 	enc.WriteInt32(result.GenerationID)    // generation_id
 	enc.WriteString(result.ProtocolName)   // group_protocol
