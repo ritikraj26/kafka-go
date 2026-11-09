@@ -974,9 +974,8 @@ func ParseJoinGroupRequest(header *RequestHeader) (*JoinGroupRequest, error) {
 		}
 		protocols = append(protocols, GroupProtocol{Name: name, Metadata: meta})
 	}
-	if len(protocols) == 0 {
-		return nil, fmt.Errorf("JoinGroup: at least one protocol is required")
-	}
+	// An empty capability list is structurally valid. The coordinator rejects
+	// it with INCONSISTENT_GROUP_PROTOCOL instead of closing the connection.
 	if err := finishRequest(d, false); err != nil {
 		return nil, err
 	}

@@ -121,7 +121,39 @@ func (g *ConsumerGroup) sortedMemberIDs() []string {
 	return ids
 }
 
-// chooseProtocol picks the protocol supported by all members.
+// supportsProtocols checks the proposed membership before a join changes state.
+// An existing member's new capabilities replace its old list for this check.
+// Caller must hold g.mu; admission preserves a nonempty common protocol.
+func (g *ConsumerGroup) supportsProtocols(memberID, protocolType string, protocols []MemberProtocol) bool {
+	if len(g.Members) > 0 && g.ProtocolType != protocolType {
+		return false
+	}
+	for _, candidate := range protocols {
+		supported := true
+		for id, member := range g.Members {
+			if id == memberID {
+				continue
+			}
+			found := false
+			for _, offered := range member.Protocols {
+				if offered.Name == candidate.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				supported = false
+				break
+			}
+		}
+		if supported {
+			return true
+		}
+	}
+	return false
+}
+
+// chooseProtocol picks the protocol supported by all admitted members.
 // Uses sorted member iteration for deterministic selection.
 func (g *ConsumerGroup) chooseProtocol() string {
 	if len(g.Members) == 0 {

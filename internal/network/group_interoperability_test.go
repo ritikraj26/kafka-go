@@ -83,3 +83,56 @@ func TestIndependentCodecGroupLifecycle(t *testing.T) {
 		t.Fatalf("leave: %+v", left)
 	}
 }
+
+func TestIndependentCodecRejectsIncompatibleGroupProtocols(t *testing.T) {
+	address, _, _ := interopBroker(t)
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	join := kmsg.NewPtrJoinGroupRequest()
+	join.Group, join.ProtocolType, join.SessionTimeoutMillis = "negotiation", "consumer", 60000
+	join.Protocols = []kmsg.JoinGroupRequestProtocol{{Name: "range"}}
+	joined := kmsg.NewPtrJoinGroupResponse()
+	wireInterop(t, conn, join, joined, 0)
+	if joined.ErrorCode != 0 {
+		t.Fatalf("initial join: %+v", joined)
+	}
+	sync := kmsg.NewPtrSyncGroupRequest()
+	sync.Group, sync.Generation, sync.MemberID = join.Group, joined.Generation, joined.MemberID
+	sync.GroupAssignment = []kmsg.SyncGroupRequestGroupAssignment{{MemberID: joined.MemberID, MemberAssignment: []byte("assignment")}}
+	synced := kmsg.NewPtrSyncGroupResponse()
+	wireInterop(t, conn, sync, synced, 0)
+	if synced.ErrorCode != 0 {
+		t.Fatalf("initial sync: %+v", synced)
+	}
+	for _, tc := range []struct {
+		name, protocolType string
+		protocols          []kmsg.JoinGroupRequestProtocol
+	}{
+		{"disjoint assignors", "consumer", []kmsg.JoinGroupRequestProtocol{{Name: "roundrobin"}}},
+		{"different type", "other", []kmsg.JoinGroupRequestProtocol{{Name: "range"}}},
+		{"empty type", "", []kmsg.JoinGroupRequestProtocol{{Name: "range"}}},
+		{"empty protocols", "consumer", nil},
+		{"empty name", "consumer", []kmsg.JoinGroupRequestProtocol{{Name: ""}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := kmsg.NewPtrJoinGroupRequest()
+			request.Group, request.ProtocolType, request.SessionTimeoutMillis = join.Group, tc.protocolType, 60000
+			request.Protocols = tc.protocols
+			response := kmsg.NewPtrJoinGroupResponse()
+			wireInterop(t, conn, request, response, 0)
+			if response.ErrorCode != 23 { // INCONSISTENT_GROUP_PROTOCOL
+				t.Fatalf("join response=%+v, want error 23", response)
+			}
+		})
+	}
+	heartbeat := kmsg.NewPtrHeartbeatRequest()
+	heartbeat.Group, heartbeat.Generation, heartbeat.MemberID = join.Group, joined.Generation, joined.MemberID
+	alive := kmsg.NewPtrHeartbeatResponse()
+	wireInterop(t, conn, heartbeat, alive, 0)
+	if alive.ErrorCode != 0 {
+		t.Fatalf("incompatible joins disrupted the original member: %+v", alive)
+	}
+}

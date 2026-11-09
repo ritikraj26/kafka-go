@@ -15,6 +15,7 @@ const (
 	ErrNotCoordinator               int16 = 16
 	ErrInvalidRequiredAcks          int16 = 21
 	ErrIllegalGeneration            int16 = 22
+	ErrInconsistentGroupProtocol    int16 = 23
 	ErrUnknownMemberID              int16 = 25
 	ErrRebalanceInProgress          int16 = 27
 	ErrNotEnoughReplicas            int16 = 19

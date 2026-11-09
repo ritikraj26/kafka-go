@@ -104,6 +104,14 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 		logger.L.Warn("invalid consumer group join", "group", groupID)
 		return &JoinGroupResult{ErrorCode: protocol.ErrInvalidRequest}
 	}
+	if protocolType == "" || len(protocols) == 0 {
+		return &JoinGroupResult{ErrorCode: protocol.ErrInconsistentGroupProtocol, MemberID: memberID}
+	}
+	for _, p := range protocols {
+		if p.Name == "" {
+			return &JoinGroupResult{ErrorCode: protocol.ErrInconsistentGroupProtocol, MemberID: memberID}
+		}
+	}
 
 	g := c.getOrCreateGroupContext(ctx, groupID)
 	if g == nil {
@@ -127,6 +135,10 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	if ctx.Err() != nil {
 		g.mu.Unlock()
 		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
+	}
+	if !g.supportsProtocols(memberID, protocolType, protocols) {
+		g.mu.Unlock()
+		return &JoinGroupResult{ErrorCode: protocol.ErrInconsistentGroupProtocol, MemberID: memberID}
 	}
 
 	// Enforce max group size
