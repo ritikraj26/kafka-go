@@ -44,6 +44,8 @@ func (c *Coordinator) SetStateLimits(limits StateLimits) error {
 	if err := limits.Validate(); err != nil {
 		return err
 	}
+	c.offsetMu.Lock()
+	defer c.offsetMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.offsetReady || len(c.groups) > 0 {
@@ -60,6 +62,8 @@ type StateStats struct {
 }
 
 func (c *Coordinator) StateStats() StateStats {
+	c.offsetMu.RLock()
+	defer c.offsetMu.RUnlock()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	c.groupUsage.mu.Lock()
@@ -94,10 +98,13 @@ func (g *ConsumerGroup) publishState(next int64) {
 	g.retained = next
 }
 
-// Called with c.mu held, preserving c.mu -> g.mu -> usage.mu lock order.
+// Called with c.mu held. Skip busy groups so admission never holds the registry
+// lock while waiting behind a group's durable offset write.
 func (c *Coordinator) reclaimEmptyGroups() {
 	for id, g := range c.groups {
-		g.mu.Lock()
+		if !g.mu.TryLock() {
+			continue
+		}
 		if !g.initializing && g.State == GroupEmpty && len(g.Members) == 0 && len(g.pendingJoins) == 0 && len(g.pendingSyncs) == 0 {
 			g.State = GroupDead
 			g.stopRebalanceTimers()

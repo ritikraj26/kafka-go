@@ -69,10 +69,12 @@ func (c *Coordinator) Close() {
 	c.allTimers.Wait()
 	c.mu.Lock()
 	c.groups = make(map[string]*ConsumerGroup)
+	c.mu.Unlock()
+	c.offsetMu.Lock()
 	c.offsets = make(offsetMap)
 	c.offsetEntries = 0
 	c.offsetBytes = 0
-	c.mu.Unlock()
+	c.offsetMu.Unlock()
 	close(c.closeDone)
 }
 

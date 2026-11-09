@@ -159,9 +159,9 @@ func TestOffsetIOFailuresFenceStoreWithoutPublishing(t *testing.T) {
 			if code := commitTestOffset(c, member, 20, nil); code != protocol.ErrKafkaStorageError {
 				t.Fatalf("I/O failure returned %d", code)
 			}
-			c.mu.RLock()
+			c.offsetMu.RLock()
 			published := c.offsets["group"]["events"][0].Offset
-			c.mu.RUnlock()
+			c.offsetMu.RUnlock()
 			if published != 10 {
 				t.Fatal("failed commit replaced last published offset")
 			}
@@ -339,10 +339,14 @@ func TestCommitHoldsGenerationLockUntilSync(t *testing.T) {
 		g.mu.Unlock()
 		t.Fatal("generation could change before persistence completed")
 	}
-	if c.mu.TryRLock() {
-		c.mu.RUnlock()
+	if c.offsetMu.TryRLock() {
+		c.offsetMu.RUnlock()
 		t.Fatal("fetch could observe an incomplete commit")
 	}
+	if !c.mu.TryRLock() {
+		t.Fatal("offset sync blocked the coordinator registry")
+	}
+	c.mu.RUnlock()
 	unblock()
 	if code := <-result; code != 0 {
 		t.Fatal(code)

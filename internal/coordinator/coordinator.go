@@ -16,13 +16,16 @@ import (
 type Coordinator struct {
 	mu             sync.RWMutex
 	groups         map[string]*ConsumerGroup
-	offsets        offsetMap
 	RebalanceDelay time.Duration // delay before completing a join round (allows more members to join)
 	// Phase budgets are independent of member sessions. Configure these and
 	// RebalanceDelay before creating groups; each group retains its settings.
-	JoinTimeout   time.Duration
-	SyncTimeout   time.Duration
-	MaxGroupSize  int    // max members per group (0 = unlimited, default 256)
+	JoinTimeout  time.Duration
+	SyncTimeout  time.Duration
+	MaxGroupSize int // max members per group (0 = unlimited, default 256)
+	// offsetMu protects the offset store and serializes durable writes. Acquire
+	// it before mu or a group mutex; never hold mu while waiting for disk I/O.
+	offsetMu      sync.RWMutex
+	offsets       offsetMap
 	offsetLogDir  string // directory for __consumer_offsets log persistence
 	offsetReady   bool
 	offsetErr     error

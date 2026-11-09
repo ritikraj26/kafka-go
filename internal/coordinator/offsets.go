@@ -62,9 +62,14 @@ type offsetLogFile interface {
 // Recovery publishes nothing until the entire log validates. On failure, files
 // are preserved and this coordinator cannot retry initialization in place.
 func (c *Coordinator) LoadOffsets(logDir string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed || c.offsetReady || c.offsetErr != nil {
+	c.offsetMu.Lock()
+	defer c.offsetMu.Unlock()
+	select {
+	case <-c.done:
+		return fmt.Errorf("offset store is already initialized or fenced; restart with a new coordinator")
+	default:
+	}
+	if c.offsetReady || c.offsetErr != nil {
 		return fmt.Errorf("offset store is already initialized or fenced; restart with a new coordinator")
 	}
 	if logDir == "" {
@@ -316,8 +321,10 @@ func (c *Coordinator) CommitOffset(groupID string, generationID int32, memberID,
 	return c.CommitOffsetWithMetadata(groupID, generationID, memberID, topic, partition, offset, nil)
 }
 
-// CommitOffsetWithMetadata holds c.mu then g.mu through persistence. Membership
-// cannot change between validation and the durable append; memory is published last.
+// CommitOffsetWithMetadata holds offsetMu then g.mu through persistence. The
+// coordinator registry stays available to other groups while disk I/O runs.
+// Membership cannot change between validation and the durable append; memory
+// is published last.
 func (c *Coordinator) CommitOffsetWithMetadata(groupID string, generationID int32, memberID, topic string, partition int32, offset int64, metadata *string) int16 {
 	return c.CommitOffsetWithMetadataContext(context.Background(), groupID, generationID, memberID, topic, partition, offset, metadata)
 }
@@ -341,13 +348,18 @@ func (c *Coordinator) CommitOffsetWithMetadataContext(ctx context.Context, group
 		}
 		return protocol.ErrInvalidRequest
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Wait for the shared journal before locking this group, so a queued commit
+	// cannot block its group's heartbeats behind another group's disk I/O.
+	c.offsetMu.Lock()
+	defer c.offsetMu.Unlock()
+	if ctx.Err() != nil {
+		return protocol.ErrRequestTimedOut
+	}
 	if code := c.offsetStoreError(); code != protocol.ErrNone {
 		logger.L.Warn("offset commit unavailable", "group", groupID, "error_code", code)
 		return code
 	}
-	g := c.groups[groupID]
+	g := c.FindGroup(groupID)
 	if g == nil {
 		return protocol.ErrCoordinatorNotAvailable
 	}
@@ -356,6 +368,9 @@ func (c *Coordinator) CommitOffsetWithMetadataContext(ctx context.Context, group
 	if ctx.Err() != nil {
 		logger.L.Debug("offset commit cancelled before persistence")
 		return protocol.ErrRequestTimedOut
+	}
+	if code := c.offsetStoreError(); code != protocol.ErrNone {
+		return code
 	}
 	if _, exists := g.Members[memberID]; !exists {
 		return protocol.ErrUnknownMemberID
@@ -378,9 +393,13 @@ func (c *Coordinator) CommitOffsetWithMetadataContext(ctx context.Context, group
 	return protocol.ErrNone
 }
 
+// Caller must hold offsetMu. Shutdown is observed through done without taking
+// the coordinator registry lock or reading its separately protected closed flag.
 func (c *Coordinator) offsetStoreError() int16 {
-	if c.closed {
+	select {
+	case <-c.done:
 		return protocol.ErrCoordinatorNotAvailable
+	default:
 	}
 	if c.offsetErr != nil {
 		return protocol.ErrKafkaStorageError
@@ -402,8 +421,8 @@ func (c *Coordinator) FetchOffsetWithMetadata(groupID, topic string, partition i
 		logger.L.Warn("invalid offset fetch", "group", groupID, "topic", topic, "partition", partition)
 		return -1, nil, protocol.ErrInvalidRequest
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.offsetMu.RLock()
+	defer c.offsetMu.RUnlock()
 	if code := c.offsetStoreError(); code != protocol.ErrNone {
 		logger.L.Warn("offset fetch unavailable", "group", groupID, "error_code", code)
 		return -1, nil, code

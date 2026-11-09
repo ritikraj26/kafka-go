@@ -243,9 +243,13 @@ application and demo initialize it explicitly. An uninitialized coordinator
 returns `COORDINATOR_NOT_AVAILABLE` (15), not an in-memory commit success.
 
 For each commit, the coordinator validates the input, member and generation,
-holds the coordinator/group locks through the append, then writes, syncs, and
-closes the file before publishing the offset in memory. A stale member or
-generation cannot change during that validation/write window. Commit metadata
+holds the offset-store and committing group's locks through the append, then
+writes, syncs, and closes the file before publishing the offset in memory.
+The global coordinator lock is released before disk I/O, so unrelated groups
+can process heartbeats and membership changes during a slow sync. Commits wait
+for the shared offset writer before locking their group and revalidate membership
+after that wait. A stale member or generation cannot change during the
+validation/write window. Commit metadata
 is limited to **4096 UTF-8 bytes**, with `OFFSET_METADATA_TOO_LARGE` (12) on
 overflow. Null and empty metadata remain distinct through OffsetFetch and restart.
 
