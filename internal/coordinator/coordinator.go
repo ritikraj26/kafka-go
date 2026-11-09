@@ -167,6 +167,16 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 		g.mu.Unlock()
 		return &JoinGroupResult{ErrorCode: protocol.ErrInconsistentGroupProtocol, MemberID: memberID}
 	}
+	if m := g.Members[memberID]; m != nil && g.State == GroupAwaitingSync && m.matchesProtocols(protocols) {
+		// A lost Join response can be retried while assignments are pending.
+		// Supersede old request cleanup without starting another group round or
+		// extending its deadline. Keep this round's admitted session timeout.
+		m.joinAttempt++
+		g.startSessionTimer(m)
+		result := g.joinGroupResult(memberID)
+		g.mu.Unlock()
+		return result
+	}
 
 	// Enforce max group size
 	_, existing := g.Members[memberID]
@@ -404,7 +414,7 @@ func (c *Coordinator) Heartbeat(groupID string, generationID int32, memberID str
 
 	g.resetSessionTimer(memberID)
 
-	if g.State == GroupJoining || g.State == GroupAwaitingSync {
+	if g.State == GroupJoining {
 		return protocol.ErrRebalanceInProgress
 	}
 

@@ -93,7 +93,16 @@ internal/
 - **Record-based offsets** — Assigns base offsets and leader epochs without modifying producer buffers; advances offsets by the number of records across every batch in a request. Index offsets are relative to their segment.
 - **Log segment rolling** — Active segment rolls to a new `%020d.log` / `%020d.index` pair when the file exceeds `MaxSegmentBytes` (default 1 GB); `SeekToOffset` selects the correct segment before binary-searching its index
 - **Persistent topic metadata** — Atomically saves topic UUIDs, partition replicas, leader IDs/epochs, and relative log paths in `broker-metadata.json`; recovers topics in both supported log layouts, including empty topics
-- **Consumer groups** — Full eager-rebalance protocol: FindCoordinator → JoinGroup → SyncGroup → Heartbeat → LeaveGroup with session timeout expiry and automatic rebalance triggers. New members join with an empty member ID and reuse the broker-assigned ID for later requests. Unknown or expired IDs return `UNKNOWN_MEMBER_ID` (25); Join cancellation is scoped to the exact member instance and request attempt.
+- **Consumer groups** — Full eager-rebalance protocol: FindCoordinator → JoinGroup →
+  SyncGroup → Heartbeat → LeaveGroup with session timeout expiry and automatic
+  rebalance triggers. New members join with an empty member ID and reuse the
+  broker-assigned ID for later requests. Unknown or expired IDs return
+  `UNKNOWN_MEMBER_ID` (25); Join cancellation is scoped to the exact member
+  instance and request attempt. Valid heartbeats succeed during `AwaitingSync`.
+  In that phase, retries with matching ordered protocols and subscription
+  metadata return the current Join response, including the member list only for
+  the leader, without restarting the phase deadline or interrupting pending Sync
+  requests. Changed subscriptions still trigger a rebalance.
 - **Offset management** — OffsetCommit publishes offsets and nullable metadata only after a complete append/fsync/close; storage failures fence the offset store. Streaming recovery validates checksummed records and preserves valid legacy entries. ListOffsets provides earliest/latest offset discovery.
 - **Simulated replication** — Configurable multi-broker cluster (in-process) with round-robin replica assignment, follower fetch simulation, and high watermark advancement
 - **LeaderEpoch validation** — Fetch requests carrying a `current_leader_epoch` are fenced: stale epoch → `ErrFencedLeaderEpoch (74)`, epoch newer than the leader's → `ErrUnknownLeaderEpoch (75)`; wrong broker or unassigned replica → `ErrNotLeaderOrFollower (6)`. Epoch `-1` (Fetch v0 / old clients) skips epoch validation.

@@ -71,6 +71,21 @@ type MemberProtocol struct {
 	Metadata []byte
 }
 
+// Protocol order expresses preference, and metadata is an opaque subscription.
+// Both must match before treating a Join as a retry of the current round.
+func (m *Member) matchesProtocols(protocols []MemberProtocol) bool {
+	if len(m.Protocols) != len(protocols) {
+		return false
+	}
+	for i, p := range protocols {
+		stored := m.Protocols[i]
+		if stored.Name != p.Name || (stored.Metadata == nil) != (p.Metadata == nil) || !bytes.Equal(stored.Metadata, p.Metadata) {
+			return false
+		}
+	}
+	return true
+}
+
 // ConsumerGroup manages the state machine for one group.
 type ConsumerGroup struct {
 	mu           sync.Mutex
@@ -215,39 +230,43 @@ func (g *ConsumerGroup) completeJoinPhase() {
 		g.startSessionTimer(member)
 	}
 
-	// Build members list for the leader (sorted for deterministic response)
-	sortedIDs := g.sortedMemberIDs()
-	leaderMembers := make([]JoinGroupMember, 0, len(g.Members))
-	for _, mid := range sortedIDs {
-		m := g.Members[mid]
-		var meta []byte
-		for _, p := range m.Protocols {
-			if p.Name == g.ProtocolName {
-				meta = p.Metadata
-				break
-			}
-		}
-		leaderMembers = append(leaderMembers, JoinGroupMember{MemberID: mid, Metadata: bytes.Clone(meta)})
-	}
-
 	// Deliver results to all pending join callers
 	for mid, ch := range g.pendingJoins {
-		result := &JoinGroupResult{
-			ErrorCode:    0, // ErrNone
-			GenerationID: g.GenerationID,
-			ProtocolName: g.ProtocolName,
-			LeaderID:     g.LeaderID,
-			MemberID:     mid,
-		}
-		if mid == g.LeaderID {
-			result.Members = leaderMembers
-		}
+		result := g.joinGroupResult(mid)
 		select {
 		case ch <- result:
 		default:
 		}
 	}
 	g.pendingJoins = make(map[string]chan *JoinGroupResult)
+}
+
+// joinGroupResult snapshots the current generation for an admitted member.
+// Caller must hold g.mu. Only the leader receives the sorted member metadata;
+// owned copies keep callers from changing the group's retained subscription.
+func (g *ConsumerGroup) joinGroupResult(memberID string) *JoinGroupResult {
+	result := &JoinGroupResult{
+		ErrorCode:    0, // ErrNone
+		GenerationID: g.GenerationID,
+		ProtocolName: g.ProtocolName,
+		LeaderID:     g.LeaderID,
+		MemberID:     memberID,
+	}
+	if memberID != g.LeaderID {
+		return result
+	}
+	result.Members = make([]JoinGroupMember, 0, len(g.Members))
+	for _, id := range g.sortedMemberIDs() {
+		var metadata []byte
+		for _, p := range g.Members[id].Protocols {
+			if p.Name == g.ProtocolName {
+				metadata = p.Metadata
+				break
+			}
+		}
+		result.Members = append(result.Members, JoinGroupMember{MemberID: id, Metadata: bytes.Clone(metadata)})
+	}
+	return result
 }
 
 // startSessionTimer starts the session expiry timer for a member.

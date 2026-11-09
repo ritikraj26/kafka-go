@@ -1,6 +1,7 @@
 package joingroup
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 	"time"
@@ -62,24 +63,27 @@ func TestJoinGroup_ExistingMember(t *testing.T) {
 		MemberID:         "",
 		SessionTimeoutMs: 30000,
 		ProtocolType:     "consumer",
-		Protocols:        []protocol.GroupProtocol{{Name: "range", Metadata: nil}},
+		Protocols:        []protocol.GroupProtocol{{Name: "range", Metadata: []byte("subscription")}},
 	}
 	// First join to get a member ID
 	body1 := BuildBody(req, coord)
-	_, _, _, memberID := parseJoinGroupResponse(t, body1)
+	_, generation, leaderID, memberID := parseJoinGroupResponse(t, body1)
 
 	// Rejoin with the same member ID
 	req.MemberID = memberID
 	body2 := BuildBody(req, coord)
-	errCode, genID, _, returnedID := parseJoinGroupResponse(t, body2)
+	errCode, genID, returnedLeader, returnedID := parseJoinGroupResponse(t, body2)
 	if errCode != protocol.ErrNone {
 		t.Fatalf("rejoin error_code = %d, want 0", errCode)
 	}
 	if returnedID != memberID {
 		t.Errorf("member_id = %q, want %q (same after rejoin)", returnedID, memberID)
 	}
-	if genID < 1 {
-		t.Errorf("generation_id = %d, want >= 1", genID)
+	if genID != generation || returnedLeader != leaderID {
+		t.Errorf("unchanged retry changed generation/leader: got (%d, %q), want (%d, %q)", genID, returnedLeader, generation, leaderID)
+	}
+	if !bytes.Equal(body1, body2) {
+		t.Error("unchanged retry changed the Join response or leader metadata")
 	}
 }
 
@@ -108,7 +112,7 @@ func TestJoinGroup_UnknownMemberIDRequiresFreshAdmission(t *testing.T) {
 	}
 	req.MemberID = memberID
 	errCode, rejoinedGeneration, _, rejoinedID := parseJoinGroupResponse(t, BuildBody(req, coord))
-	if errCode != protocol.ErrNone || rejoinedID != memberID || rejoinedGeneration != generation+1 {
+	if errCode != protocol.ErrNone || rejoinedID != memberID || rejoinedGeneration != generation {
 		t.Fatalf("assigned member rejoin: error=%d generation=%d member=%q", errCode, rejoinedGeneration, rejoinedID)
 	}
 }

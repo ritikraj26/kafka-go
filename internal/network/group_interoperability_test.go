@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -33,6 +34,21 @@ func TestIndependentCodecGroupLifecycle(t *testing.T) {
 	if joined.ErrorCode != 0 || joined.MemberID == "" || joined.LeaderID != joined.MemberID {
 		t.Fatalf("join: %+v", joined)
 	}
+	// A member may heartbeat while the leader computes assignments, or retry a
+	// Join whose response was lost. Neither should restart this generation.
+	heartbeat := kmsg.NewPtrHeartbeatRequest()
+	heartbeat.Group, heartbeat.Generation, heartbeat.MemberID = join.Group, joined.Generation, joined.MemberID
+	alive := kmsg.NewPtrHeartbeatResponse()
+	wireInterop(t, conn, heartbeat, alive, 0)
+	if alive.ErrorCode != 0 {
+		t.Fatalf("heartbeat before sync: %+v", alive)
+	}
+	join.MemberID = joined.MemberID
+	retried := kmsg.NewPtrJoinGroupResponse()
+	wireInterop(t, conn, join, retried, 0)
+	if !reflect.DeepEqual(retried, joined) {
+		t.Fatalf("unchanged join retry: got %+v, want %+v", retried, joined)
+	}
 
 	sync := kmsg.NewPtrSyncGroupRequest()
 	sync.Group, sync.Generation, sync.MemberID = join.Group, joined.Generation, joined.MemberID
@@ -44,9 +60,6 @@ func TestIndependentCodecGroupLifecycle(t *testing.T) {
 		t.Fatalf("sync: %+v", synced)
 	}
 
-	heartbeat := kmsg.NewPtrHeartbeatRequest()
-	heartbeat.Group, heartbeat.Generation, heartbeat.MemberID = join.Group, joined.Generation, joined.MemberID
-	alive := kmsg.NewPtrHeartbeatResponse()
 	wireInterop(t, conn, heartbeat, alive, 0)
 	if alive.ErrorCode != 0 {
 		t.Fatalf("heartbeat: %+v", alive)
