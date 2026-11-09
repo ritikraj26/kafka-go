@@ -55,13 +55,11 @@ func TestCancelledJoinCleansMembershipAndTimers(t *testing.T) {
 }
 
 func TestCancelledSyncCanBeRetried(t *testing.T) {
-	c := NewCoordinator()
-	defer c.Close()
-	join := c.JoinGroup("g", "", 3600000, "consumer", []MemberProtocol{{Name: "range"}})
+	c, generation := newSyncAssignmentGroup(t, DefaultStateLimits())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan int16, 1)
-	go func() { _, code := c.SyncGroupContext(ctx, "g", join.GenerationID, join.MemberID, nil); result <- code }()
+	go func() { _, code := c.SyncGroupContext(ctx, "g", generation, "b", nil); result <- code }()
 	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return len(g.pendingSyncs) == 1 })
 	cancel()
 	select {
@@ -78,10 +76,15 @@ func TestCancelledSyncCanBeRetried(t *testing.T) {
 	if pending != 0 {
 		t.Fatal("cancelled sync remained pending")
 	}
-	data, code := c.SyncGroup("g", join.GenerationID, join.MemberID, []SyncGroupAssignment{{MemberID: join.MemberID, Assignment: []byte("assigned")}})
-	if code != 0 || string(data) != "assigned" {
+	retried := waitSyncAssignment(t, c, generation)
+	data, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{
+		{MemberID: "a", Assignment: []byte("leader")},
+		{MemberID: "b", Assignment: []byte("assigned")},
+	})
+	if code != 0 || string(data) != "leader" {
 		t.Fatalf("sync retry failed: %d", code)
 	}
+	receiveSyncAssignment(t, retried, []byte("assigned"))
 }
 
 func TestOldJoinCancellationDoesNotRemoveNewAttempt(t *testing.T) {

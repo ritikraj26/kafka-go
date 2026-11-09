@@ -290,30 +290,36 @@ func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, gene
 
 	g.resetSessionTimer(memberID)
 
-	// If this is the leader, distribute assignments
-	if memberID == g.LeaderID && len(assignments) > 0 {
-		next := g.retained
-		seen := make(map[string]bool, len(assignments))
+	// The leader publishes a complete snapshot for this generation. Members
+	// omitted from the request receive empty assignments, never their old ones.
+	if memberID == g.LeaderID {
+		replacement := make(map[string][]byte, len(assignments))
 		for _, a := range assignments {
-			mem := g.Members[a.MemberID]
-			if mem == nil || seen[a.MemberID] {
+			_, duplicate := replacement[a.MemberID]
+			if g.Members[a.MemberID] == nil || duplicate {
 				g.mu.Unlock()
 				logger.L.Warn("invalid group assignment member", "group", groupID)
 				return nil, protocol.ErrInvalidRequest
 			}
-			seen[a.MemberID] = true
-			next += 2 * int64(len(a.Assignment)-len(mem.Assignment))
+			replacement[a.MemberID] = a.Assignment
+		}
+		next := g.retained
+		for id, mem := range g.Members {
+			next += 2 * int64(len(replacement[id])-len(mem.Assignment))
 		}
 		if !g.growState(next) {
 			g.mu.Unlock()
 			logger.L.Warn("group assignment quota exceeded", "group", groupID)
 			return nil, protocol.ErrThrottlingQuotaExceeded
 		}
-		for _, a := range assignments {
-			if mem, ok := g.Members[a.MemberID]; ok {
-				mem.retained += 2 * int64(len(a.Assignment)-len(mem.Assignment))
-				mem.Assignment = bytes.Clone(a.Assignment)
+		for id, mem := range g.Members {
+			assignment := bytes.Clone(replacement[id])
+			if assignment == nil {
+				// nil on a pending sync channel signals rebalance failure.
+				assignment = []byte{}
 			}
+			mem.retained += 2 * int64(len(assignment)-len(mem.Assignment))
+			mem.Assignment = assignment
 		}
 		g.publishState(next)
 
