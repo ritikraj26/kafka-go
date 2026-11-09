@@ -78,11 +78,13 @@ func (c *Coordinator) Close() {
 	close(c.closeDone)
 }
 
-func (c *Coordinator) cancelJoin(g *ConsumerGroup, memberID string, attempt uint64) {
+func (c *Coordinator) cancelJoin(g *ConsumerGroup, member *Member, attempt uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if m := g.Members[memberID]; m != nil && m.joinAttempt == attempt {
-		g.removeMember(memberID)
+	// An attempt counter belongs to one member instance. It can repeat after
+	// removal, so delayed cleanup must also match the original membership.
+	if m := g.Members[member.MemberID]; m == member && m.joinAttempt == attempt {
+		g.removeMember(member.MemberID)
 		if len(g.Members) > 0 {
 			g.triggerRebalance()
 		}

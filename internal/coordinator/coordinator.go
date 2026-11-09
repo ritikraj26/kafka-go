@@ -124,7 +124,14 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 		}
 	}
 
-	g := c.getOrCreateGroupContext(ctx, groupID)
+	// Only an empty ID requests a new membership. A supplied ID must already
+	// belong to this group; delayed joins must not recreate expired members.
+	var g *ConsumerGroup
+	if memberID == "" {
+		g = c.getOrCreateGroupContext(ctx, groupID)
+	} else {
+		g = c.FindGroup(groupID)
+	}
 	if g == nil {
 		if ctx.Err() != nil {
 			return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
@@ -134,10 +141,15 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 			return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable}
 		default:
 		}
+		if memberID != "" {
+			return &JoinGroupResult{ErrorCode: protocol.ErrUnknownMemberID, MemberID: memberID}
+		}
 		return &JoinGroupResult{ErrorCode: protocol.ErrThrottlingQuotaExceeded}
 	}
 	g.mu.Lock()
-	g.initializing = false
+	if memberID == "" {
+		g.initializing = false
+	}
 
 	if g.State == GroupDead {
 		g.mu.Unlock()
@@ -146,6 +158,10 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	if ctx.Err() != nil {
 		g.mu.Unlock()
 		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut}
+	}
+	if memberID != "" && g.Members[memberID] == nil {
+		g.mu.Unlock()
+		return &JoinGroupResult{ErrorCode: protocol.ErrUnknownMemberID, MemberID: memberID}
 	}
 	if !g.supportsProtocols(memberID, protocolType, protocols) {
 		g.mu.Unlock()
@@ -217,7 +233,7 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	// The shared join deadline bounds this wait independently of heartbeats.
 	select {
 	case <-ctx.Done():
-		c.cancelJoin(g, memberID, attempt)
+		c.cancelJoin(g, m, attempt)
 		return &JoinGroupResult{ErrorCode: protocol.ErrRequestTimedOut, MemberID: memberID}
 	case <-c.done:
 		return &JoinGroupResult{ErrorCode: protocol.ErrCoordinatorNotAvailable, MemberID: memberID}

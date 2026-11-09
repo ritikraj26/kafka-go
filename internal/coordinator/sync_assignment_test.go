@@ -21,7 +21,7 @@ func newSyncAssignmentGroup(t *testing.T, limits StateLimits) (*Coordinator, int
 		t.Fatal(err)
 	}
 	t.Cleanup(c.Close)
-	first := c.JoinGroup("g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+	first := c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	if first.ErrorCode != protocol.ErrNone {
 		t.Fatalf("initial join error=%d", first.ErrorCode)
 	}
@@ -30,16 +30,17 @@ func newSyncAssignmentGroup(t *testing.T, limits StateLimits) (*Coordinator, int
 
 func rejoinSyncAssignmentGroup(t *testing.T, c *Coordinator) int32 {
 	t.Helper()
+	aID, bID := syncAssignmentMemberIDs(t, c)
 	joined := make(chan *JoinGroupResult, 1)
-	go func() {
-		joined <- c.JoinGroup("g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
-	}()
-	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["b"] != nil })
-	a := c.JoinGroup("g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+	go func(memberID string) {
+		joined <- c.JoinGroup("g", memberID, 60000, "consumer", []MemberProtocol{{Name: "range"}})
+	}(bID)
+	bID = waitPendingJoinMember(t, c, aID)
+	a := c.JoinGroup("g", aID, 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	select {
 	case b := <-joined:
 		if a.ErrorCode != protocol.ErrNone || b.ErrorCode != protocol.ErrNone ||
-			a.GenerationID != b.GenerationID || a.LeaderID != "a" || b.LeaderID != "a" {
+			a.GenerationID != b.GenerationID || a.LeaderID != aID || b.LeaderID != aID || b.MemberID != bID {
 			t.Fatalf("unexpected join results: a=%+v b=%+v", a, b)
 		}
 	case <-time.After(time.Second):
@@ -48,14 +49,58 @@ func rejoinSyncAssignmentGroup(t *testing.T, c *Coordinator) int32 {
 	return a.GenerationID
 }
 
+// The first member stays leader across these assignment fixtures. The second
+// member starts with an empty ID and receives its identity from the coordinator.
+func syncAssignmentMemberIDs(t *testing.T, c *Coordinator) (a, b string) {
+	t.Helper()
+	g := c.FindGroup("g")
+	if g == nil {
+		t.Fatal("assignment group is missing")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	a = g.LeaderID
+	if a == "" || g.Members[a] == nil {
+		t.Fatal("assignment group has no leader")
+	}
+	for id := range g.Members {
+		if id != a {
+			if b != "" {
+				t.Fatal("assignment fixture has more than two members")
+			}
+			b = id
+		}
+	}
+	return a, b
+}
+
+// Tables use role labels; resolve them to IDs obtained through real admission.
+func assignmentMemberIDs(assignments []SyncGroupAssignment, a, b string) []SyncGroupAssignment {
+	if assignments == nil {
+		return nil
+	}
+	result := make([]SyncGroupAssignment, len(assignments))
+	for i, assignment := range assignments {
+		result[i] = assignment
+		switch assignment.MemberID {
+		case "a":
+			result[i].MemberID = a
+		case "b":
+			result[i].MemberID = b
+		}
+	}
+	return result
+}
+
 func waitSyncAssignment(t *testing.T, c *Coordinator, generation int32) <-chan assignmentSyncResult {
 	t.Helper()
+	_, bID := syncAssignmentMemberIDs(t, c)
 	result := make(chan assignmentSyncResult, 1)
 	go func() {
-		data, code := c.SyncGroup("g", generation, "b", nil)
+		data, code := c.SyncGroup("g", generation, bID, nil)
 		result <- assignmentSyncResult{data, code}
 	}()
-	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingSyncs["b"] != nil })
+	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingSyncs[bID] != nil })
 	return result
 }
 
@@ -73,11 +118,12 @@ func receiveSyncAssignment(t *testing.T, result <-chan assignmentSyncResult, wan
 
 func assertSyncAssignmentState(t *testing.T, c *Coordinator, state GroupState, a, b []byte) {
 	t.Helper()
+	aID, bID := syncAssignmentMemberIDs(t, c)
 	g := c.FindGroup("g")
 	g.mu.Lock()
 	protocols := []MemberProtocol{{Name: "range"}}
 	wantRetained := groupCharge("g") + 2*int64(len("consumer"))
-	for id, want := range map[string][]byte{"a": a, "b": b} {
+	for id, want := range map[string][]byte{aID: a, bID: b} {
 		m := g.Members[id]
 		if !bytes.Equal(m.Assignment, want) {
 			t.Errorf("member %s assignment=%q, want %q", id, m.Assignment, want)
@@ -112,9 +158,10 @@ func TestSyncGroupReplacesAssignmentsForEveryMember(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, generation := newSyncAssignmentGroup(t, DefaultStateLimits())
-			if _, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{
-				{MemberID: "a", Assignment: []byte("P0")},
-				{MemberID: "b", Assignment: []byte("P1")},
+			aID, bID := syncAssignmentMemberIDs(t, c)
+			if _, code := c.SyncGroup("g", generation, aID, []SyncGroupAssignment{
+				{MemberID: aID, Assignment: []byte("P0")},
+				{MemberID: bID, Assignment: []byte("P1")},
 			}); code != protocol.ErrNone {
 				t.Fatalf("initial sync error=%d", code)
 			}
@@ -122,13 +169,13 @@ func TestSyncGroupReplacesAssignmentsForEveryMember(t *testing.T) {
 			follower := waitSyncAssignment(t, c, generation)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			data, code := c.SyncGroupContext(ctx, "g", generation, "a", tc.assignments)
+			data, code := c.SyncGroupContext(ctx, "g", generation, aID, assignmentMemberIDs(tc.assignments, aID, bID))
 			if code != protocol.ErrNone || data == nil || !bytes.Equal(data, tc.a) {
 				t.Fatalf("leader sync=(%q, %d), want (%q, success)", data, code, tc.a)
 			}
 			receiveSyncAssignment(t, follower, tc.b)
 			assertSyncAssignmentState(t, c, GroupStable, tc.a, tc.b)
-			for id, want := range map[string][]byte{"a": tc.a, "b": tc.b} {
+			for id, want := range map[string][]byte{aID: tc.a, bID: tc.b} {
 				cached, code := c.SyncGroup("g", generation, id, nil)
 				if code != protocol.ErrNone || cached == nil || !bytes.Equal(cached, want) {
 					t.Fatalf("cached assignment for %s=(%q, %d), want (%q, success)", id, cached, code, want)
@@ -152,21 +199,22 @@ func TestSyncGroupRejectedSnapshotIsAtomic(t *testing.T) {
 			limits := DefaultStateLimits()
 			limits.PerGroupBytes, limits.GroupBytes = 4096, 4096
 			c, generation := newSyncAssignmentGroup(t, limits)
+			aID, bID := syncAssignmentMemberIDs(t, c)
 			oldA, oldB := []byte("old-a"), []byte("old-b")
-			if _, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{
-				{MemberID: "a", Assignment: oldA}, {MemberID: "b", Assignment: oldB},
+			if _, code := c.SyncGroup("g", generation, aID, []SyncGroupAssignment{
+				{MemberID: aID, Assignment: oldA}, {MemberID: bID, Assignment: oldB},
 			}); code != protocol.ErrNone {
 				t.Fatal(code)
 			}
 			generation = rejoinSyncAssignmentGroup(t, c)
 			follower := waitSyncAssignment(t, c, generation)
-			if _, code := c.SyncGroup("g", generation, "a", tc.assignments); code != tc.code {
+			if _, code := c.SyncGroup("g", generation, aID, assignmentMemberIDs(tc.assignments, aID, bID)); code != tc.code {
 				t.Fatalf("invalid snapshot error=%d, want %d", code, tc.code)
 			}
 			assertSyncAssignmentState(t, c, GroupAwaitingSync, oldA, oldB)
 			g := c.FindGroup("g")
 			g.mu.Lock()
-			pending := g.pendingSyncs["b"] != nil
+			pending := g.pendingSyncs[bID] != nil
 			g.mu.Unlock()
 			if !pending {
 				t.Fatal("rejected snapshot removed the waiting follower")
@@ -177,8 +225,8 @@ func TestSyncGroupRejectedSnapshotIsAtomic(t *testing.T) {
 			default:
 			}
 			newA, newB := []byte("new-a"), []byte("new-b")
-			data, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{
-				{MemberID: "a", Assignment: newA}, {MemberID: "b", Assignment: newB},
+			data, code := c.SyncGroup("g", generation, aID, []SyncGroupAssignment{
+				{MemberID: aID, Assignment: newA}, {MemberID: bID, Assignment: newB},
 			})
 			if code != protocol.ErrNone || !bytes.Equal(data, newA) {
 				t.Fatalf("retry sync=(%q, %d)", data, code)
@@ -192,20 +240,22 @@ func TestSyncGroupRejectedSnapshotIsAtomic(t *testing.T) {
 
 func TestSyncGroupSnapshotQuotaIncludesReleasedAssignments(t *testing.T) {
 	protocols := []MemberProtocol{{Name: "range"}}
-	base := groupCharge("g") + 2*int64(len("consumer")) + memberCharge("a", protocols, nil) + memberCharge("b", protocols, nil)
+	const uuidLengthID = "00000000-0000-0000-0000-000000000000"
+	base := groupCharge("g") + 2*int64(len("consumer")) + 2*memberCharge(uuidLengthID, protocols, nil)
 	limits := DefaultStateLimits()
 	limits.PerGroupBytes = base + 2*(128+512)
 	limits.GroupBytes = limits.PerGroupBytes
 	c, generation := newSyncAssignmentGroup(t, limits)
-	if _, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{
-		{MemberID: "a", Assignment: bytes.Repeat([]byte("a"), 128)},
-		{MemberID: "b", Assignment: bytes.Repeat([]byte("b"), 512)},
+	aID, bID := syncAssignmentMemberIDs(t, c)
+	if _, code := c.SyncGroup("g", generation, aID, []SyncGroupAssignment{
+		{MemberID: aID, Assignment: bytes.Repeat([]byte("a"), 128)},
+		{MemberID: bID, Assignment: bytes.Repeat([]byte("b"), 512)},
 	}); code != protocol.ErrNone {
 		t.Fatal(code)
 	}
 	generation = rejoinSyncAssignmentGroup(t, c)
 	next := bytes.Repeat([]byte("c"), 640)
-	if _, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{{MemberID: "a", Assignment: next}}); code != protocol.ErrNone {
+	if _, code := c.SyncGroup("g", generation, aID, []SyncGroupAssignment{{MemberID: aID, Assignment: next}}); code != protocol.ErrNone {
 		t.Fatalf("snapshot did not reuse bytes released by omitted member: %d", code)
 	}
 	assertSyncAssignmentState(t, c, GroupStable, next, nil)

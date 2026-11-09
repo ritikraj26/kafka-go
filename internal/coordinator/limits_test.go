@@ -52,7 +52,7 @@ func TestCloseJoinsCallbacksForReclaimedGroups(t *testing.T) {
 	limits := DefaultStateLimits()
 	limits.MaxGroups = 1
 	c := quotaCoordinator(t, limits)
-	first := c.JoinGroup("first", "member", 30000, "consumer", []MemberProtocol{{Name: "range"}})
+	first := c.JoinGroup("first", "", 30000, "consumer", []MemberProtocol{{Name: "range"}})
 	if first.ErrorCode != 0 {
 		t.Fatal(first.ErrorCode)
 	}
@@ -73,10 +73,10 @@ func TestCloseJoinsCallbacksForReclaimedGroups(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("callback did not start")
 	}
-	if code := c.LeaveGroup("first", "member"); code != 0 {
+	if code := c.LeaveGroup("first", first.MemberID); code != 0 {
 		t.Fatal(code)
 	}
-	second := c.JoinGroup("second", "member", 30000, "consumer", []MemberProtocol{{Name: "range"}})
+	second := c.JoinGroup("second", "", 30000, "consumer", []MemberProtocol{{Name: "range"}})
 	if second.ErrorCode != 0 || c.FindGroup("first") != nil {
 		t.Fatal("empty group with a running callback was not reclaimed")
 	}
@@ -112,36 +112,36 @@ func TestGroupQuotaUpdatesAreAtomicAndOwned(t *testing.T) {
 	limits.GroupBytes = 4096
 	c := quotaCoordinator(t, limits)
 	input := bytes.Repeat([]byte("x"), 128)
-	member := c.JoinGroup("g", "member", 30000, "consumer", []MemberProtocol{{Name: "range", Metadata: input}})
+	member := c.JoinGroup("g", "", 30000, "consumer", []MemberProtocol{{Name: "range", Metadata: input}})
 	if member.ErrorCode != 0 {
 		t.Fatal(member.ErrorCode)
 	}
 	before := c.StateStats().GroupBytes
 	input[0] = 'z'
-	if result := c.JoinGroup("g", "member", 30000, "consumer", []MemberProtocol{{Name: "range", Metadata: make([]byte, 5000)}}); result.ErrorCode != protocol.ErrThrottlingQuotaExceeded {
+	if result := c.JoinGroup("g", member.MemberID, 30000, "consumer", []MemberProtocol{{Name: "range", Metadata: make([]byte, 5000)}}); result.ErrorCode != protocol.ErrThrottlingQuotaExceeded {
 		t.Fatal("oversized update was accepted")
 	}
 	g := c.FindGroup("g")
 	g.mu.Lock()
-	if g.Members["member"].Protocols[0].Metadata[0] != 'x' {
+	if g.Members[member.MemberID].Protocols[0].Metadata[0] != 'x' {
 		t.Error("input mutation or rejected update changed retained metadata")
 	}
 	g.mu.Unlock()
 	if c.StateStats().GroupBytes != before {
 		t.Fatal("rejected update changed quota accounting")
 	}
-	if _, code := c.SyncGroup("g", member.GenerationID, "member", []SyncGroupAssignment{{MemberID: "member", Assignment: make([]byte, 5000)}}); code != protocol.ErrThrottlingQuotaExceeded {
+	if _, code := c.SyncGroup("g", member.GenerationID, member.MemberID, []SyncGroupAssignment{{MemberID: member.MemberID, Assignment: make([]byte, 5000)}}); code != protocol.ErrThrottlingQuotaExceeded {
 		t.Fatal("oversized assignment accepted")
 	}
 	g.mu.Lock()
-	if g.State != GroupAwaitingSync || len(g.Members["member"].Assignment) != 0 {
+	if g.State != GroupAwaitingSync || len(g.Members[member.MemberID].Assignment) != 0 {
 		t.Error("failed assignment partially changed state")
 	}
 	g.mu.Unlock()
-	if _, code := c.SyncGroup("g", member.GenerationID, "member", []SyncGroupAssignment{{MemberID: "member", Assignment: []byte("ok")}}); code != 0 {
+	if _, code := c.SyncGroup("g", member.GenerationID, member.MemberID, []SyncGroupAssignment{{MemberID: member.MemberID, Assignment: []byte("ok")}}); code != 0 {
 		t.Fatal(code)
 	}
-	c.LeaveGroup("g", "member")
+	c.LeaveGroup("g", member.MemberID)
 	if c.StateStats().GroupBytes != groupCharge("g") {
 		t.Fatal("member removal did not release its charged state")
 	}
@@ -151,14 +151,17 @@ func TestGroupQuotaUpdatesAreAtomicAndOwned(t *testing.T) {
 	}
 }
 
-func TestExplicitMemberIDsCannotBypassGroupSize(t *testing.T) {
+func TestNewMembersCannotBypassGroupSize(t *testing.T) {
 	c := quotaCoordinator(t, DefaultStateLimits())
 	c.MaxGroupSize = 1
-	if result := c.JoinGroup("g", "one", 30000, "consumer", []MemberProtocol{{Name: "range"}}); result.ErrorCode != 0 {
+	if result := c.JoinGroup("g", "", 30000, "consumer", []MemberProtocol{{Name: "range"}}); result.ErrorCode != 0 {
 		t.Fatal(result.ErrorCode)
 	}
-	if result := c.JoinGroup("g", "two", 30000, "consumer", []MemberProtocol{{Name: "range"}}); result.ErrorCode != protocol.ErrGroupMaxSizeReached {
-		t.Fatal("explicit member ID bypassed the member count limit")
+	if result := c.JoinGroup("g", "", 30000, "consumer", []MemberProtocol{{Name: "range"}}); result.ErrorCode != protocol.ErrGroupMaxSizeReached {
+		t.Fatal("new member bypassed the member count limit")
+	}
+	if result := c.JoinGroup("g", "unknown", 30000, "consumer", []MemberProtocol{{Name: "range"}}); result.ErrorCode != protocol.ErrUnknownMemberID {
+		t.Fatal("unrecognized member ID was admitted into the full group")
 	}
 }
 

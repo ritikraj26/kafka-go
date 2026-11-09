@@ -56,10 +56,11 @@ func TestCancelledJoinCleansMembershipAndTimers(t *testing.T) {
 
 func TestCancelledSyncCanBeRetried(t *testing.T) {
 	c, generation := newSyncAssignmentGroup(t, DefaultStateLimits())
+	a, b := syncAssignmentMemberIDs(t, c)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan int16, 1)
-	go func() { _, code := c.SyncGroupContext(ctx, "g", generation, "b", nil); result <- code }()
+	go func() { _, code := c.SyncGroupContext(ctx, "g", generation, b, nil); result <- code }()
 	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return len(g.pendingSyncs) == 1 })
 	cancel()
 	select {
@@ -77,9 +78,9 @@ func TestCancelledSyncCanBeRetried(t *testing.T) {
 		t.Fatal("cancelled sync remained pending")
 	}
 	retried := waitSyncAssignment(t, c, generation)
-	data, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{
-		{MemberID: "a", Assignment: []byte("leader")},
-		{MemberID: "b", Assignment: []byte("assigned")},
+	data, code := c.SyncGroup("g", generation, a, []SyncGroupAssignment{
+		{MemberID: a, Assignment: []byte("leader")},
+		{MemberID: b, Assignment: []byte("assigned")},
 	})
 	if code != 0 || string(data) != "leader" {
 		t.Fatalf("sync retry failed: %d", code)
@@ -97,13 +98,14 @@ func TestOldJoinCancellationDoesNotRemoveNewAttempt(t *testing.T) {
 	defer cancelSecond()
 	a, b := make(chan *JoinGroupResult, 1), make(chan *JoinGroupResult, 1)
 	go func() {
-		a <- c.JoinGroupContext(first, "g", "member", 3600000, "consumer", []MemberProtocol{{Name: "range"}})
+		a <- c.JoinGroupContext(first, "g", "", 3600000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
 	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return len(g.pendingJoins) == 1 })
+	memberID := waitPendingJoinMember(t, c, "")
 	go func() {
-		b <- c.JoinGroupContext(second, "g", "member", 3600000, "consumer", []MemberProtocol{{Name: "range"}})
+		b <- c.JoinGroupContext(second, "g", memberID, 3600000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
-	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.Members["member"].joinAttempt == 2 })
+	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.Members[memberID].joinAttempt == 2 })
 	cancelFirst()
 	select {
 	case result := <-a:

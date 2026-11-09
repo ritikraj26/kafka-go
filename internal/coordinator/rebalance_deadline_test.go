@@ -18,11 +18,26 @@ func newDeadlineCoordinator(t *testing.T) *Coordinator {
 
 func deadlinePair(t *testing.T, c *Coordinator) int32 {
 	t.Helper()
-	first := c.JoinGroup("g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+	first := c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	if first.ErrorCode != protocol.ErrNone {
 		t.Fatalf("initial join error=%d", first.ErrorCode)
 	}
 	return rejoinSyncAssignmentGroup(t, c)
+}
+
+func waitPendingJoinMember(t *testing.T, c *Coordinator, except string) string {
+	t.Helper()
+	var memberID string
+	waitGroupState(t, c, func(g *ConsumerGroup) bool {
+		for id := range g.pendingJoins {
+			if id != except {
+				memberID = id
+				return true
+			}
+		}
+		return false
+	})
+	return memberID
 }
 
 func receiveDeadlineJoin(t *testing.T, result <-chan *JoinGroupResult) *JoinGroupResult {
@@ -42,18 +57,20 @@ func receiveDeadlineJoin(t *testing.T, result <-chan *JoinGroupResult) *JoinGrou
 func TestJoinDeadlineIsNotExtendedByHeartbeats(t *testing.T) {
 	c := newDeadlineCoordinator(t)
 	c.JoinTimeout = 120 * time.Millisecond
-	first := c.JoinGroup("g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+	first := c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	if first.ErrorCode != protocol.ErrNone {
 		t.Fatal(first.ErrorCode)
 	}
-	if _, code := c.SyncGroup("g", first.GenerationID, "a", nil); code != protocol.ErrNone {
+	a := first.MemberID
+	if _, code := c.SyncGroup("g", first.GenerationID, a, nil); code != protocol.ErrNone {
 		t.Fatal(code)
 	}
 	joined := make(chan *JoinGroupResult, 1)
 	go func() {
-		joined <- c.JoinGroup("g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+		joined <- c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
-	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["b"] != nil })
+	b := waitPendingJoinMember(t, c, a)
+	g := c.FindGroup("g")
 	g.mu.Lock()
 	deadline, sequence := g.phaseDeadline, g.phaseSequence
 	g.mu.Unlock()
@@ -66,7 +83,7 @@ func TestJoinDeadlineIsNotExtendedByHeartbeats(t *testing.T) {
 		select {
 		case <-ticker.C:
 			// A remains responsive but never participates in JoinGroup.
-			c.Heartbeat("g", first.GenerationID, "a")
+			c.Heartbeat("g", first.GenerationID, a)
 			heartbeats++
 			g.mu.Lock()
 			changed := g.State == GroupJoining && (g.phaseSequence != sequence || !g.phaseDeadline.Equal(deadline))
@@ -75,12 +92,12 @@ func TestJoinDeadlineIsNotExtendedByHeartbeats(t *testing.T) {
 				t.Fatal("a heartbeat extended the join phase")
 			}
 		case result := <-joined:
-			if heartbeats == 0 || result.ErrorCode != protocol.ErrNone || result.LeaderID != "b" || result.GenerationID != first.GenerationID+1 {
+			if heartbeats == 0 || result.ErrorCode != protocol.ErrNone || result.LeaderID != b || result.GenerationID != first.GenerationID+1 {
 				t.Fatalf("join did not recover from the missing participant: heartbeats=%d result=%+v", heartbeats, result)
 			}
 			g.mu.Lock()
 			defer g.mu.Unlock()
-			if g.Members["a"] != nil || g.Members["b"] == nil || g.State != GroupAwaitingSync {
+			if g.Members[a] != nil || g.Members[b] == nil || g.State != GroupAwaitingSync {
 				t.Fatalf("join expiry left state=%s members=%v", g.State, g.sortedMemberIDs())
 			}
 			return
@@ -94,6 +111,7 @@ func TestSyncDeadlineFencesLeaderDespiteHeartbeats(t *testing.T) {
 	c := newDeadlineCoordinator(t)
 	c.SyncTimeout = 150 * time.Millisecond
 	generation := deadlinePair(t, c)
+	a, b := syncAssignmentMemberIDs(t, c)
 	follower := waitSyncAssignment(t, c, generation)
 	g := c.FindGroup("g")
 	g.mu.Lock()
@@ -108,8 +126,8 @@ func TestSyncDeadlineFencesLeaderDespiteHeartbeats(t *testing.T) {
 		select {
 		case <-ticker.C:
 			// Both members heartbeat, but A never supplies an assignment snapshot.
-			c.Heartbeat("g", generation, "a")
-			c.Heartbeat("g", generation, "b")
+			c.Heartbeat("g", generation, a)
+			c.Heartbeat("g", generation, b)
 			heartbeats++
 			g.mu.Lock()
 			changed := g.State == GroupAwaitingSync && (g.phaseSequence != sequence || !g.phaseDeadline.Equal(deadline))
@@ -122,19 +140,19 @@ func TestSyncDeadlineFencesLeaderDespiteHeartbeats(t *testing.T) {
 				t.Fatalf("sync expiry result=%+v heartbeats=%d", result, heartbeats)
 			}
 			g.mu.Lock()
-			recovered := g.State == GroupJoining && g.Members["a"] == nil && g.Members["b"] != nil && len(g.pendingSyncs) == 0
+			recovered := g.State == GroupJoining && g.Members[a] == nil && g.Members[b] != nil && len(g.pendingSyncs) == 0
 			g.mu.Unlock()
 			if !recovered {
 				t.Fatal("sync expiry did not remove the stalled leader and begin a new join")
 			}
-			if _, code := c.SyncGroup("g", generation, "a", nil); code != protocol.ErrUnknownMemberID {
+			if _, code := c.SyncGroup("g", generation, a, nil); code != protocol.ErrUnknownMemberID {
 				t.Fatalf("expired leader sync error=%d", code)
 			}
-			joined := c.JoinGroup("g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
-			if joined.ErrorCode != protocol.ErrNone || joined.LeaderID != "b" || joined.GenerationID != generation+1 {
+			joined := c.JoinGroup("g", b, 60000, "consumer", []MemberProtocol{{Name: "range"}})
+			if joined.ErrorCode != protocol.ErrNone || joined.LeaderID != b || joined.GenerationID != generation+1 {
 				t.Fatalf("survivor could not become leader: %+v", joined)
 			}
-			if data, code := c.SyncGroup("g", joined.GenerationID, "b", []SyncGroupAssignment{{MemberID: "b", Assignment: []byte("P0")}}); code != protocol.ErrNone || string(data) != "P0" {
+			if data, code := c.SyncGroup("g", joined.GenerationID, b, []SyncGroupAssignment{{MemberID: b, Assignment: []byte("P0")}}); code != protocol.ErrNone || string(data) != "P0" {
 				t.Fatalf("new leader sync=(%q, %d)", data, code)
 			}
 			return
@@ -147,6 +165,7 @@ func TestSyncDeadlineFencesLeaderDespiteHeartbeats(t *testing.T) {
 func TestPhaseExpiryRejectsStaleStateGenerationAndSequence(t *testing.T) {
 	c := newDeadlineCoordinator(t)
 	generation := deadlinePair(t, c)
+	a, _ := syncAssignmentMemberIDs(t, c)
 	g := c.FindGroup("g")
 	g.mu.Lock()
 	sequence, deadline := g.phaseSequence, g.phaseDeadline
@@ -166,7 +185,7 @@ func TestPhaseExpiryRejectsStaleStateGenerationAndSequence(t *testing.T) {
 		}
 	}
 	g.mu.Unlock()
-	if _, code := c.SyncGroup("g", generation, "a", nil); code != protocol.ErrNone {
+	if _, code := c.SyncGroup("g", generation, a, nil); code != protocol.ErrNone {
 		t.Fatal(code)
 	}
 	g.mu.Lock()
@@ -180,14 +199,15 @@ func TestPhaseExpiryRejectsStaleStateGenerationAndSequence(t *testing.T) {
 func TestJoinDeadlineSurvivesRepeatedRebalanceTriggers(t *testing.T) {
 	c := newDeadlineCoordinator(t)
 	generation := deadlinePair(t, c)
-	if _, code := c.SyncGroup("g", generation, "a", nil); code != protocol.ErrNone {
+	a, b := syncAssignmentMemberIDs(t, c)
+	if _, code := c.SyncGroup("g", generation, a, nil); code != protocol.ErrNone {
 		t.Fatal(code)
 	}
 	joined := make(chan *JoinGroupResult, 1)
 	go func() {
-		joined <- c.JoinGroup("g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+		joined <- c.JoinGroup("g", b, 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
-	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["b"] != nil })
+	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins[b] != nil })
 	g.mu.Lock()
 	sequence, deadline := g.phaseSequence, g.phaseDeadline
 	g.triggerRebalance()
@@ -199,13 +219,13 @@ func TestJoinDeadlineSurvivesRepeatedRebalanceTriggers(t *testing.T) {
 	g.expirePhase(GroupJoining, generation, sequence)
 	newSequence := g.phaseSequence
 	g.expirePhase(GroupJoining, generation, sequence)
-	if g.State != GroupAwaitingSync || g.GenerationID != generation+1 || g.phaseSequence != newSequence || len(g.Members) != 1 || g.Members["b"] == nil {
+	if g.State != GroupAwaitingSync || g.GenerationID != generation+1 || g.phaseSequence != newSequence || len(g.Members) != 1 || g.Members[b] == nil {
 		g.mu.Unlock()
 		t.Fatal("join expiry or its stale callback changed the surviving generation")
 	}
 	g.mu.Unlock()
 	result := receiveDeadlineJoin(t, joined)
-	if result.LeaderID != "b" || result.GenerationID != generation+1 {
+	if result.LeaderID != b || result.GenerationID != generation+1 {
 		t.Fatalf("unexpected survivor join: %+v", result)
 	}
 }
@@ -217,9 +237,10 @@ func TestOldPhaseCallbackCannotExpireSameGenerationAfterGroupBecomesEmpty(t *tes
 	defer cancel()
 	first := make(chan *JoinGroupResult, 1)
 	go func() {
-		first <- c.JoinGroupContext(ctx, "g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+		first <- c.JoinGroupContext(ctx, "g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
-	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["a"] != nil })
+	waitPendingJoinMember(t, c, "")
+	g := c.FindGroup("g")
 	g.mu.Lock()
 	generation, sequence := g.GenerationID, g.phaseSequence
 	g.mu.Unlock()
@@ -240,16 +261,17 @@ func TestOldPhaseCallbackCannotExpireSameGenerationAfterGroupBecomesEmpty(t *tes
 	}
 	second := make(chan *JoinGroupResult, 1)
 	go func() {
-		second <- c.JoinGroup("g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+		second <- c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
-	current := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["b"] != nil })
+	b := waitPendingJoinMember(t, c, "")
+	current := c.FindGroup("g")
 	if current != g {
 		t.Fatal("the existing empty group was unexpectedly replaced")
 	}
 	g.mu.Lock()
 	newSequence, deadline := g.phaseSequence, g.phaseDeadline
 	g.expirePhase(GroupJoining, generation, sequence)
-	if g.State != GroupJoining || g.GenerationID != generation || g.phaseSequence != newSequence || !g.phaseDeadline.Equal(deadline) || g.pendingJoins["b"] == nil || len(g.Members) != 1 {
+	if g.State != GroupJoining || g.GenerationID != generation || g.phaseSequence != newSequence || !g.phaseDeadline.Equal(deadline) || g.pendingJoins[b] == nil || len(g.Members) != 1 {
 		g.mu.Unlock()
 		t.Fatal("an old callback expired a new phase with the same state and generation")
 	}
@@ -265,18 +287,19 @@ func TestJoinCollectionCallbackRequiresEveryMemberToHaveJoined(t *testing.T) {
 	defer cancel()
 	joined := make(chan *JoinGroupResult, 2)
 	go func() {
-		joined <- c.JoinGroupContext(ctx, "g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+		joined <- c.JoinGroupContext(ctx, "g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
 	g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.rebalanceTimer != nil })
+	a := waitPendingJoinMember(t, c, "")
 	go func() {
-		joined <- c.JoinGroupContext(ctx, "g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+		joined <- c.JoinGroupContext(ctx, "g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 	}()
-	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["b"] != nil })
+	waitPendingJoinMember(t, c, a)
 	g.mu.Lock()
 	// Model a queued collection callback whose membership eligibility has changed.
 	// The callback must recheck eligibility after acquiring the group lock.
-	waiter := g.pendingJoins["a"]
-	delete(g.pendingJoins, "a")
+	waiter := g.pendingJoins[a]
+	delete(g.pendingJoins, a)
 	g.rebalanceTimer.timer.Reset(time.Millisecond)
 	g.mu.Unlock()
 	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.rebalanceTimer == nil })
@@ -285,7 +308,7 @@ func TestJoinCollectionCallbackRequiresEveryMemberToHaveJoined(t *testing.T) {
 		g.mu.Unlock()
 		t.Fatal("a collection callback completed a generation with a missing JoinGroup")
 	}
-	g.pendingJoins["a"] = waiter
+	g.pendingJoins[a] = waiter
 	g.mu.Unlock()
 	select {
 	case result := <-joined:
@@ -300,40 +323,42 @@ func TestPendingRebalanceRPCsOutliveTheirSessionTimeout(t *testing.T) {
 		c.RebalanceDelay = time.Hour
 		joined := make(chan *JoinGroupResult, 1)
 		go func() {
-			joined <- c.JoinGroup("g", "a", 20, "consumer", []MemberProtocol{{Name: "range"}})
+			joined <- c.JoinGroup("g", "", 20, "consumer", []MemberProtocol{{Name: "range"}})
 		}()
-		g := waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingJoins["a"] != nil })
+		a := waitPendingJoinMember(t, c, "")
+		g := c.FindGroup("g")
 		select {
 		case result := <-joined:
 			t.Fatalf("pending join used its session timeout: %+v", result)
 		case <-time.After(60 * time.Millisecond):
 		}
 		g.mu.Lock()
-		if g.Members["a"] == nil || g.pendingJoins["a"] == nil {
+		if g.Members[a] == nil || g.pendingJoins[a] == nil {
 			g.mu.Unlock()
 			t.Fatal("session expiry removed a participant waiting in JoinGroup")
 		}
-		lastHeartbeat := g.Members["a"].LastHeartbeat
+		lastHeartbeat := g.Members[a].LastHeartbeat
 		// The short session has served its purpose; allow scheduling delays
 		// while checking completion and the newly refreshed session.
-		g.Members["a"].SessionTimeout = time.Hour
+		g.Members[a].SessionTimeout = time.Hour
 		g.completeJoinPhase()
-		refreshed := g.Members["a"].LastHeartbeat.After(lastHeartbeat)
+		refreshed := g.Members[a].LastHeartbeat.After(lastHeartbeat)
 		g.mu.Unlock()
 		if !refreshed {
 			t.Fatal("join completion did not refresh the participant's session")
 		}
 		result := receiveDeadlineJoin(t, joined)
-		if _, code := c.SyncGroup("g", result.GenerationID, "a", nil); code != protocol.ErrNone {
+		if _, code := c.SyncGroup("g", result.GenerationID, a, nil); code != protocol.ErrNone {
 			t.Fatal(code)
 		}
 	})
 	t.Run("sync", func(t *testing.T) {
 		c := newDeadlineCoordinator(t)
 		generation := deadlinePair(t, c)
+		a, b := syncAssignmentMemberIDs(t, c)
 		g := c.FindGroup("g")
 		g.mu.Lock()
-		g.Members["b"].SessionTimeout = 20 * time.Millisecond
+		g.Members[b].SessionTimeout = 20 * time.Millisecond
 		g.mu.Unlock()
 		follower := waitSyncAssignment(t, c, generation)
 		select {
@@ -342,22 +367,22 @@ func TestPendingRebalanceRPCsOutliveTheirSessionTimeout(t *testing.T) {
 		case <-time.After(60 * time.Millisecond):
 		}
 		g.mu.Lock()
-		waiting := g.Members["b"] != nil && g.pendingSyncs["b"] != nil
+		waiting := g.Members[b] != nil && g.pendingSyncs[b] != nil
 		var lastHeartbeat time.Time
 		if waiting {
-			lastHeartbeat = g.Members["b"].LastHeartbeat
-			g.Members["b"].SessionTimeout = time.Hour
+			lastHeartbeat = g.Members[b].LastHeartbeat
+			g.Members[b].SessionTimeout = time.Hour
 		}
 		g.mu.Unlock()
 		if !waiting {
 			t.Fatal("session expiry removed a participant waiting in SyncGroup")
 		}
-		if _, code := c.SyncGroup("g", generation, "a", []SyncGroupAssignment{{MemberID: "b", Assignment: []byte("P1")}}); code != protocol.ErrNone {
+		if _, code := c.SyncGroup("g", generation, a, []SyncGroupAssignment{{MemberID: b, Assignment: []byte("P1")}}); code != protocol.ErrNone {
 			t.Fatal(code)
 		}
 		receiveSyncAssignment(t, follower, []byte("P1"))
 		g.mu.Lock()
-		refreshed := g.Members["b"].LastHeartbeat.After(lastHeartbeat)
+		refreshed := g.Members[b].LastHeartbeat.After(lastHeartbeat)
 		g.mu.Unlock()
 		if !refreshed {
 			t.Fatal("sync completion did not refresh the participant's session")
@@ -403,7 +428,7 @@ func TestPhaseExpiryWithNoSurvivorsReleasesMembershipState(t *testing.T) {
 	for _, state := range []GroupState{GroupJoining, GroupAwaitingSync} {
 		t.Run(state.String(), func(t *testing.T) {
 			c := newDeadlineCoordinator(t)
-			joined := c.JoinGroup("g", "a", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+			joined := c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
 			if joined.ErrorCode != protocol.ErrNone {
 				t.Fatal(joined.ErrorCode)
 			}
@@ -421,11 +446,11 @@ func TestPhaseExpiryWithNoSurvivorsReleasesMembershipState(t *testing.T) {
 			if got := c.StateStats().GroupBytes; got != groupCharge("g") {
 				t.Fatalf("group bytes after expiry=%d, want %d", got, groupCharge("g"))
 			}
-			joined = c.JoinGroup("g", "b", 60000, "consumer", []MemberProtocol{{Name: "range"}})
-			if joined.ErrorCode != protocol.ErrNone || joined.LeaderID != "b" {
+			joined = c.JoinGroup("g", "", 60000, "consumer", []MemberProtocol{{Name: "range"}})
+			if joined.ErrorCode != protocol.ErrNone || joined.LeaderID != joined.MemberID {
 				t.Fatalf("empty group could not be reused: %+v", joined)
 			}
-			if _, code := c.SyncGroup("g", joined.GenerationID, "b", nil); code != protocol.ErrNone {
+			if _, code := c.SyncGroup("g", joined.GenerationID, joined.MemberID, nil); code != protocol.ErrNone {
 				t.Fatalf("reused group sync error=%d", code)
 			}
 		})
@@ -435,19 +460,20 @@ func TestPhaseExpiryWithNoSurvivorsReleasesMembershipState(t *testing.T) {
 func TestCanceledSyncResumesOriginalExpiredSession(t *testing.T) {
 	c := newDeadlineCoordinator(t)
 	generation := deadlinePair(t, c)
+	_, b := syncAssignmentMemberIDs(t, c)
 	g := c.FindGroup("g")
 	g.mu.Lock()
-	member := g.Members["b"]
+	member := g.Members[b]
 	member.SessionTimeout = 20 * time.Millisecond
 	g.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan int16, 1)
 	go func() {
-		_, code := c.SyncGroupContext(ctx, "g", generation, "b", nil)
+		_, code := c.SyncGroupContext(ctx, "g", generation, b, nil)
 		result <- code
 	}()
-	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingSyncs["b"] != nil })
+	waitGroupState(t, c, func(g *ConsumerGroup) bool { return g.pendingSyncs[b] != nil })
 	g.mu.Lock()
 	lastHeartbeat := member.LastHeartbeat
 	g.mu.Unlock()
@@ -472,6 +498,6 @@ func TestCanceledSyncResumesOriginalExpiredSession(t *testing.T) {
 		t.Fatal("canceling SyncGroup refreshed the original liveness deadline")
 	}
 	waitGroupState(t, c, func(g *ConsumerGroup) bool {
-		return g.Members["b"] == nil && g.State == GroupJoining && g.phaseTimer != nil && !g.phaseDeadline.IsZero()
+		return g.Members[b] == nil && g.State == GroupJoining && g.phaseTimer != nil && !g.phaseDeadline.IsZero()
 	})
 }

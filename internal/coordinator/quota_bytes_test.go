@@ -3,32 +3,38 @@ package coordinator
 import (
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/ritiraj/kafka-go/internal/protocol"
 )
 
 func TestGlobalGroupByteCeilingAndReuse(t *testing.T) {
 	protocols := []MemberProtocol{{Name: "range"}}
-	one := groupCharge("a") + memberCharge("m", protocols, nil) + 2*int64(len("consumer"))
+	one := groupCharge("a") + memberCharge(uuid.Nil.String(), protocols, nil) + 2*int64(len("consumer"))
 	limits := DefaultStateLimits()
 	limits.PerGroupBytes = one * 2
 	limits.GroupBytes = one * 2
 	c := quotaCoordinator(t, limits)
+	members := make(map[string]string)
+	var actualCharge int64
 	for _, name := range []string{"a", "b"} {
-		if result := c.JoinGroup(name, "m", 30000, "consumer", protocols); result.ErrorCode != 0 {
+		result := c.JoinGroup(name, "", 30000, "consumer", protocols)
+		if result.ErrorCode != 0 {
 			t.Fatal(result.ErrorCode)
 		}
+		members[name] = result.MemberID
+		actualCharge += groupCharge(name) + memberCharge(result.MemberID, protocols, nil) + 2*int64(len("consumer"))
 	}
-	if c.StateStats().GroupBytes != limits.GroupBytes {
+	if actualCharge != limits.GroupBytes || c.StateStats().GroupBytes != actualCharge {
 		t.Fatal("global group-byte threshold was not exact")
 	}
-	if result := c.JoinGroup("a", "m", 30000, "consumer", []MemberProtocol{{Name: "range", Metadata: []byte{1}}}); result.ErrorCode != protocol.ErrThrottlingQuotaExceeded {
+	if result := c.JoinGroup("a", members["a"], 30000, "consumer", []MemberProtocol{{Name: "range", Metadata: []byte{1}}}); result.ErrorCode != protocol.ErrThrottlingQuotaExceeded {
 		t.Fatal("group update exceeded the global byte ceiling")
 	}
 	if c.StateStats().GroupBytes != limits.GroupBytes {
 		t.Fatal("rejected update changed global charges")
 	}
-	c.LeaveGroup("a", "m")
-	if result := c.JoinGroup("c", "m", 30000, "consumer", protocols); result.ErrorCode != 0 {
+	c.LeaveGroup("a", members["a"])
+	if result := c.JoinGroup("c", "", 30000, "consumer", protocols); result.ErrorCode != 0 {
 		t.Fatal("released bytes were not reusable")
 	}
 	if c.StateStats().GroupBytes != limits.GroupBytes {

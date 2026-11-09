@@ -33,6 +33,7 @@ func parseJoinGroupResponse(t *testing.T, body []byte) (errCode int16, genID int
 
 func TestJoinGroup_NewMember(t *testing.T) {
 	coord := coordinator.NewCoordinator()
+	t.Cleanup(coord.Close)
 	req := &protocol.JoinGroupRequest{
 		GroupID:          "grp",
 		MemberID:         "",
@@ -55,6 +56,7 @@ func TestJoinGroup_NewMember(t *testing.T) {
 
 func TestJoinGroup_ExistingMember(t *testing.T) {
 	coord := coordinator.NewCoordinator()
+	t.Cleanup(coord.Close)
 	req := &protocol.JoinGroupRequest{
 		GroupID:          "grp",
 		MemberID:         "",
@@ -81,8 +83,39 @@ func TestJoinGroup_ExistingMember(t *testing.T) {
 	}
 }
 
+func TestJoinGroup_UnknownMemberIDRequiresFreshAdmission(t *testing.T) {
+	coord := coordinator.NewCoordinator()
+	t.Cleanup(coord.Close)
+	req := &protocol.JoinGroupRequest{
+		GroupID:          "grp",
+		MemberID:         "expired-member",
+		SessionTimeoutMs: 30000,
+		ProtocolType:     "consumer",
+		Protocols:        []protocol.GroupProtocol{{Name: "range"}},
+	}
+	errCode, genID, leaderID, _ := parseJoinGroupResponse(t, BuildBody(req, coord))
+	if errCode != protocol.ErrUnknownMemberID || genID != 0 || leaderID != "" {
+		t.Fatalf("unknown member response: error=%d generation=%d leader=%q", errCode, genID, leaderID)
+	}
+	if stats := coord.StateStats(); stats.Groups != 0 || stats.GroupBytes != 0 {
+		t.Fatalf("unknown member created retained group state: %+v", stats)
+	}
+
+	req.MemberID = ""
+	errCode, generation, _, memberID := parseJoinGroupResponse(t, BuildBody(req, coord))
+	if errCode != protocol.ErrNone || memberID == "" || memberID == "expired-member" {
+		t.Fatalf("fresh admission: error=%d member=%q", errCode, memberID)
+	}
+	req.MemberID = memberID
+	errCode, rejoinedGeneration, _, rejoinedID := parseJoinGroupResponse(t, BuildBody(req, coord))
+	if errCode != protocol.ErrNone || rejoinedID != memberID || rejoinedGeneration != generation+1 {
+		t.Fatalf("assigned member rejoin: error=%d generation=%d member=%q", errCode, rejoinedGeneration, rejoinedID)
+	}
+}
+
 func TestJoinGroup_TwoMembersLeaderAssigned(t *testing.T) {
 	coord := coordinator.NewCoordinator()
+	t.Cleanup(coord.Close)
 	// RebalanceDelay holds the join round open so both goroutines can arrive
 	// before the round closes. Without it, the first member completes the
 	// round immediately (solo) and the second starts a new generation alone.
