@@ -100,8 +100,7 @@ func (c *Coordinator) reclaimEmptyGroups() {
 		g.mu.Lock()
 		if !g.initializing && g.State == GroupEmpty && len(g.Members) == 0 && len(g.pendingJoins) == 0 && len(g.pendingSyncs) == 0 {
 			g.State = GroupDead
-			g.rebalanceTimer.Stop()
-			g.rebalanceTimer = nil
+			g.stopRebalanceTimers()
 			g.publishState(0)
 			delete(c.groups, id)
 		}

@@ -18,19 +18,23 @@ type Coordinator struct {
 	groups         map[string]*ConsumerGroup
 	offsets        offsetMap
 	RebalanceDelay time.Duration // delay before completing a join round (allows more members to join)
-	MaxGroupSize   int           // max members per group (0 = unlimited, default 256)
-	offsetLogDir   string        // directory for __consumer_offsets log persistence
-	offsetReady    bool
-	offsetErr      error
-	openOffsetLog  func(string) (offsetLogFile, error)
-	closed         bool
-	done           chan struct{}
-	closeDone      chan struct{}
-	limits         StateLimits
-	groupUsage     retainedUsage
-	offsetEntries  int
-	offsetBytes    int64
-	allTimers      sync.WaitGroup
+	// Phase budgets are independent of member sessions. Configure these and
+	// RebalanceDelay before creating groups; each group retains its settings.
+	JoinTimeout   time.Duration
+	SyncTimeout   time.Duration
+	MaxGroupSize  int    // max members per group (0 = unlimited, default 256)
+	offsetLogDir  string // directory for __consumer_offsets log persistence
+	offsetReady   bool
+	offsetErr     error
+	openOffsetLog func(string) (offsetLogFile, error)
+	closed        bool
+	done          chan struct{}
+	closeDone     chan struct{}
+	limits        StateLimits
+	groupUsage    retainedUsage
+	offsetEntries int
+	offsetBytes   int64
+	allTimers     sync.WaitGroup
 }
 
 // NewCoordinator creates an empty Coordinator.
@@ -40,6 +44,8 @@ func NewCoordinator() *Coordinator {
 		offsets:        make(offsetMap),
 		openOffsetLog:  openOffsetLogFile,
 		RebalanceDelay: 0,
+		JoinTimeout:    defaultRebalancePhaseTimeout,
+		SyncTimeout:    defaultRebalancePhaseTimeout,
 		MaxGroupSize:   256,
 		done:           make(chan struct{}),
 		closeDone:      make(chan struct{}),
@@ -74,6 +80,8 @@ func (c *Coordinator) getOrCreateGroupContext(ctx context.Context, groupID strin
 		g.maxRetained = c.limits.PerGroupBytes
 		g.initializing = true
 		g.allTimers = &c.allTimers
+		g.rebalanceDelay = c.RebalanceDelay
+		g.joinTimeout, g.syncTimeout = c.JoinTimeout, c.SyncTimeout
 		c.groups[g.GroupID] = g
 	}
 	return g
@@ -188,13 +196,8 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	g.ProtocolType = strings.Clone(protocolType)
 	g.startSessionTimer(m)
 
-	// If group is Stable or AwaitingSync, trigger rebalance
-	if g.State == GroupStable || g.State == GroupAwaitingSync {
+	if g.State != GroupJoining {
 		g.triggerRebalance()
-	}
-
-	if g.State == GroupEmpty || g.State == GroupJoining {
-		g.State = GroupJoining
 	}
 
 	// Create a channel to wait for the join to complete
@@ -204,39 +207,11 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 	}
 	g.pendingJoins[memberID] = ch
 
-	// Check if all members have rejoined (pendingJoins == Members count)
-	allPresent := len(g.pendingJoins) == len(g.Members)
-
-	if allPresent {
-		if c.RebalanceDelay > 0 && g.rebalanceTimer == nil {
-			// Start a timer — complete join after delay (allows more members to arrive)
-			delay := c.RebalanceDelay
-			g.rebalanceSequence++
-			sequence := g.rebalanceSequence
-			g.rebalanceTimer = g.after(delay, func() {
-				g.mu.Lock()
-				defer g.mu.Unlock()
-				if g.rebalanceSequence != sequence {
-					return
-				}
-				g.rebalanceTimer = nil
-				if g.State == GroupJoining && len(g.pendingJoins) > 0 {
-					g.completeJoinPhase()
-				}
-			})
-		} else if c.RebalanceDelay <= 0 {
-			// No delay — complete immediately
-			g.completeJoinPhase()
-		}
-		// If timer is already running and a new member arrived completing the set,
-		// let the timer fire naturally (it will complete with all members)
-	}
+	g.maybeCompleteJoin()
 
 	g.mu.Unlock()
 
-	// Wait for result (with timeout)
-	timeout := time.NewTimer(time.Duration(sessionTimeoutMs) * time.Millisecond)
-	defer timeout.Stop()
+	// The shared join deadline bounds this wait independently of heartbeats.
 	select {
 	case <-ctx.Done():
 		c.cancelJoin(g, memberID, attempt)
@@ -248,10 +223,6 @@ func (c *Coordinator) JoinGroupContext(ctx context.Context, groupID string, memb
 			return &JoinGroupResult{ErrorCode: protocol.ErrRebalanceInProgress, MemberID: memberID}
 		}
 		return result
-	case <-timeout.C:
-		// Timeout — remove member and return error
-		c.cancelJoin(g, memberID, attempt)
-		return &JoinGroupResult{ErrorCode: protocol.ErrRebalanceInProgress, MemberID: memberID}
 	}
 }
 
@@ -336,6 +307,10 @@ func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, gene
 		g.publishState(next)
 
 		g.State = GroupStable
+		g.stopRebalanceTimers()
+		for _, member := range g.Members {
+			g.startSessionTimer(member)
+		}
 
 		// Deliver assignments to all pending sync followers
 		for mid, ch := range g.pendingSyncs {
@@ -354,9 +329,7 @@ func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, gene
 		return assignment, protocol.ErrNone
 	}
 
-	// Follower — wait for leader to send assignments
-	// Use this member's session timeout instead of a hardcoded value.
-	syncTimeout := m.SessionTimeout
+	// Follower waits on the shared assignment deadline, not its session timeout.
 	ch := make(chan []byte, 1)
 	if previous := g.pendingSyncs[memberID]; previous != nil {
 		close(previous)
@@ -368,11 +341,12 @@ func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, gene
 		defer g.mu.Unlock()
 		if g.pendingSyncs[memberID] == ch {
 			delete(g.pendingSyncs, memberID)
+			if g.State == GroupAwaitingSync && g.Members[memberID] == m {
+				g.resumeSessionTimer(m)
+			}
 		}
 	}()
 
-	timer := time.NewTimer(syncTimeout)
-	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return nil, protocol.ErrRequestTimedOut
@@ -383,8 +357,6 @@ func (c *Coordinator) SyncGroupContext(ctx context.Context, groupID string, gene
 			return nil, protocol.ErrRebalanceInProgress
 		}
 		return bytes.Clone(data), protocol.ErrNone
-	case <-timer.C:
-		return nil, protocol.ErrRebalanceInProgress
 	}
 }
 
@@ -449,6 +421,12 @@ func (c *Coordinator) handleSessionExpired(g *ConsumerGroup, memberID string) {
 	defer g.mu.Unlock()
 	m := g.Members[memberID]
 	if g.State == GroupDead || m == nil || time.Since(m.LastHeartbeat) < m.SessionTimeout {
+		return
+	}
+	// A member already participating in the current phase is bounded by that
+	// phase's deadline. It may be unable to heartbeat while its RPC is blocked.
+	if (g.State == GroupJoining && g.pendingJoins[memberID] != nil) ||
+		(g.State == GroupAwaitingSync && g.pendingSyncs[memberID] != nil) {
 		return
 	}
 	logger.L.Warn("session expired", "group", g.GroupID, "member", memberID)

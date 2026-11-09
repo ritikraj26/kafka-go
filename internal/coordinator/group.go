@@ -89,6 +89,12 @@ type ConsumerGroup struct {
 	// Rebalance delay timer: when set, join completion is deferred
 	rebalanceTimer        *groupTimer
 	rebalanceSequence     uint64
+	rebalanceDelay        time.Duration
+	joinTimeout           time.Duration
+	syncTimeout           time.Duration
+	phaseTimer            *groupTimer
+	phaseSequence         uint64
+	phaseDeadline         time.Time
 	timers                sync.WaitGroup
 	allTimers             *sync.WaitGroup
 	usage                 *retainedUsage
@@ -189,9 +195,10 @@ func (g *ConsumerGroup) chooseProtocol() string {
 // increments the generation, selects protocol, picks leader, and
 // delivers JoinGroupResult to all waiting callers.
 func (g *ConsumerGroup) completeJoinPhase() {
-	if g.State == GroupDead || len(g.Members) == 0 {
+	if g.State != GroupJoining || len(g.Members) == 0 || len(g.pendingJoins) != len(g.Members) {
 		return
 	}
+	g.stopJoinCollection()
 	g.GenerationID++
 	g.ProtocolName = g.chooseProtocol()
 
@@ -203,6 +210,10 @@ func (g *ConsumerGroup) completeJoinPhase() {
 	}
 
 	g.State = GroupAwaitingSync
+	g.startPhaseDeadline(GroupAwaitingSync)
+	for _, member := range g.Members {
+		g.startSessionTimer(member)
+	}
 
 	// Build members list for the leader (sorted for deterministic response)
 	sortedIDs := g.sortedMemberIDs()
@@ -241,12 +252,22 @@ func (g *ConsumerGroup) completeJoinPhase() {
 
 // startSessionTimer starts the session expiry timer for a member.
 func (g *ConsumerGroup) startSessionTimer(m *Member) {
+	m.LastHeartbeat = time.Now()
+	g.scheduleSessionTimer(m, m.SessionTimeout)
+}
+
+// resumeSessionTimer restores the original liveness deadline after a blocked
+// sync is canceled. It does not count cancellation as a fresh heartbeat.
+func (g *ConsumerGroup) resumeSessionTimer(m *Member) {
+	g.scheduleSessionTimer(m, max(0, m.SessionTimeout-time.Since(m.LastHeartbeat)))
+}
+
+func (g *ConsumerGroup) scheduleSessionTimer(m *Member, delay time.Duration) {
 	if m.sessionTimer != nil {
 		m.sessionTimer.Stop()
 	}
-	m.LastHeartbeat = time.Now()
 	memberID := m.MemberID // capture for closure
-	m.sessionTimer = g.after(m.SessionTimeout, func() {
+	m.sessionTimer = g.after(delay, func() {
 		if g.onSessionExpired != nil {
 			g.onSessionExpired(g, memberID)
 		}
@@ -292,9 +313,7 @@ func (g *ConsumerGroup) removeMember(memberID string) {
 	if len(g.Members) == 0 {
 		g.publishState(g.retained - 2*int64(len(g.ProtocolType)))
 		g.ProtocolType = ""
-		g.rebalanceTimer.Stop()
-		g.rebalanceTimer = nil
-		g.rebalanceSequence++
+		g.stopRebalanceTimers()
 		g.State = GroupEmpty
 		g.LeaderID = ""
 	}
@@ -307,16 +326,24 @@ func (g *ConsumerGroup) triggerRebalance() {
 		return
 	}
 	logger.L.Info("triggering rebalance", "group", g.GroupID, "generation", g.GenerationID)
-	g.State = GroupJoining
+	if g.State != GroupJoining {
+		g.stopJoinCollection()
+		g.State = GroupJoining
+		g.startPhaseDeadline(GroupJoining)
+	}
 
 	// Fail pending syncs
 	for mid, ch := range g.pendingSyncs {
+		if member := g.Members[mid]; member != nil {
+			g.startSessionTimer(member)
+		}
 		select {
 		case ch <- nil: // nil signals error
 		default:
 		}
 		delete(g.pendingSyncs, mid)
 	}
+	g.maybeCompleteJoin()
 }
 
 // MemberCount returns the number of members.

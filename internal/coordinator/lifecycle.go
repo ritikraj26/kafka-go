@@ -49,8 +49,8 @@ func (c *Coordinator) Close() {
 	c.mu.Unlock()
 	for _, g := range groups {
 		g.mu.Lock()
-		g.rebalanceTimer.Stop()
-		g.rebalanceTimer = nil
+		g.State = GroupDead
+		g.stopRebalanceTimers()
 		for id := range g.Members {
 			g.removeMember(id)
 		}
