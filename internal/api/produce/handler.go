@@ -179,8 +179,10 @@ func recordErrorCode(err error) int16 {
 func validateRecords(batches []storage.RecordBatch, topic string, metaMgr *metadata.Manager) ([][]byte, bool) {
 	reg := metaMgr.Schemas
 	var values [][]byte
+	var recordCount int64
 	for _, batch := range batches {
 		values = append(values, batch.Values...)
+		recordCount += int64(batch.RecordsCount)
 	}
 	if len(values) == 0 {
 		return nil, false
@@ -198,7 +200,9 @@ func validateRecords(batches []storage.RecordBatch, topic string, metaMgr *metad
 			failed = append(failed, value)
 		}
 	}
-	return failed, len(failed) == len(values)
+	// Null and empty values bypass schema validation but still belong to the
+	// batch. They prevent an otherwise invalid batch from being DLQ-only.
+	return failed, int64(len(failed)) == recordCount
 }
 
 func routeToDLQ(ctx context.Context, sourceTopic string, values [][]byte, metaMgr *metadata.Manager, options metadata.ProduceOptions) error {

@@ -1,6 +1,7 @@
 package produce
 
 import (
+	"bytes"
 	"encoding/binary"
 	"hash/crc32"
 	"os"
@@ -254,6 +255,99 @@ func TestDLQWritesValidBatches(t *testing.T) {
 	if len(batches) != 1 || batches[0].RecordsCount != 2 || len(batches[0].Values) != 2 ||
 		string(batches[0].Values[0]) != `{"value":1}` || string(batches[0].Values[1]) != `{"value":2}` {
 		t.Fatal("DLQ did not preserve rejected values in a valid batch")
+	}
+}
+
+func TestProduceSchemaRoutingPreservesAcceptedRecords(t *testing.T) {
+	const invalidValue = `{"value":12}`
+	invalid := storage.Record{Key: []byte("invalid"), Value: []byte(invalidValue)}
+	tombstone := storage.Record{Key: []byte("deleted-account"), Value: nil}
+	empty := storage.Record{Key: []byte("empty-value"), Value: []byte{}}
+	valid := storage.Record{Key: []byte("valid"), Value: []byte(`{"value":"accepted"}`)}
+
+	for _, tc := range []struct {
+		name    string
+		batches [][]storage.Record
+		wantDLQ []string
+		dlqOnly bool
+	}{
+		{name: "null after invalid", batches: [][]storage.Record{{invalid, tombstone}}, wantDLQ: []string{invalidValue}},
+		{name: "null before invalid", batches: [][]storage.Record{{tombstone, invalid}}, wantDLQ: []string{invalidValue}},
+		{name: "empty after invalid", batches: [][]storage.Record{{invalid, empty}}, wantDLQ: []string{invalidValue}},
+		{name: "empty before invalid", batches: [][]storage.Record{{empty, invalid}}, wantDLQ: []string{invalidValue}},
+		{name: "exempt values in later batch", batches: [][]storage.Record{{invalid}, {tombstone, empty}}, wantDLQ: []string{invalidValue}},
+		{name: "exempt values in earlier batch", batches: [][]storage.Record{{tombstone, empty}, {invalid}}, wantDLQ: []string{invalidValue}},
+		{name: "only exempt values", batches: [][]storage.Record{{tombstone, empty}}},
+		{name: "ordinary partial failure", batches: [][]storage.Record{{invalid, valid}}, wantDLQ: []string{invalidValue}},
+		{name: "all records invalid", batches: [][]storage.Record{{invalid}, {invalid}}, wantDLQ: []string{invalidValue, invalidValue}, dlqOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, p := produceManager(t)
+			var data, wantStored []byte
+			var wantOffset int64
+			for _, records := range tc.batches {
+				batch, err := storage.EncodeRecordBatch(0, records)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = append(data, batch...)
+				// Only the broker-assigned batch base offset changes. Comparing
+				// complete bytes also checks keys, null/empty values and ordering.
+				expected := bytes.Clone(batch)
+				binary.BigEndian.PutUint64(expected[:8], uint64(wantOffset))
+				wantStored = append(wantStored, expected...)
+				wantOffset += int64(len(records))
+			}
+			if tc.dlqOnly {
+				wantStored, wantOffset = nil, 0
+			}
+
+			body, failed := Process(produceRequest(data), m, 1)
+			if code := responseError(t, body); code != protocol.ErrNone || failed {
+				t.Fatalf("produce response=%d failed=%v", code, failed)
+			}
+			if got := p.GetLogEndOffset(); got != wantOffset {
+				t.Fatalf("source log end offset=%d, want %d", got, wantOffset)
+			}
+			stored, err := metadata.ReadPartitionLog(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(stored, wantStored) {
+				t.Fatal("source log did not preserve the complete accepted batch data")
+			}
+
+			dlq := m.GetTopic("orders.dlq")
+			if len(tc.wantDLQ) == 0 {
+				if dlq != nil {
+					t.Fatal("schema-exempt values created a DLQ")
+				}
+				return
+			}
+			if dlq == nil {
+				t.Fatal("invalid values were not routed to a DLQ")
+			}
+			dp := &dlq.Partitions[0]
+			if got := dp.GetLogEndOffset(); got != int64(len(tc.wantDLQ)) {
+				t.Fatalf("DLQ log end offset=%d, want %d", got, len(tc.wantDLQ))
+			}
+			dlqData, err := metadata.ReadPartitionLog(dp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dlqBatches, err := storage.ParseRecordBatches(dlqData)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(dlqBatches) != 1 || len(dlqBatches[0].Values) != len(tc.wantDLQ) {
+				t.Fatal("unexpected DLQ batch or value count")
+			}
+			for i, want := range tc.wantDLQ {
+				if got := string(dlqBatches[0].Values[i]); got != want {
+					t.Fatalf("DLQ value %d=%q, want %q", i, got, want)
+				}
+			}
+		})
 	}
 }
 
