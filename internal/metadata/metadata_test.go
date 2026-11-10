@@ -215,7 +215,7 @@ func TestRecoverNextOffset_MultiSegment(t *testing.T) {
 	}
 }
 
-// TestSeekToOffset verifies binary search across a synthetic 3-entry index.
+// TestSeekToOffset verifies indexed seeks against real batch boundaries.
 func TestSeekToOffset(t *testing.T) {
 	dir := t.TempDir()
 	p := &Partition{LeaderID: 1, BrokerLogDirs: map[int32]string{1: dir}}
@@ -224,8 +224,26 @@ func TestSeekToOffset(t *testing.T) {
 	//   offset 0  → file position 0
 	//   offset 5  → file position 100
 	//   offset 10 → file position 200
-	// Also create the corresponding .log file so listSegments finds the segment.
-	if err := os.WriteFile(filepath.Join(dir, "00000000000000000000.log"), []byte{}, 0644); err != nil {
+	// Store real 100-byte batches at the indexed positions. Index hints must
+	// correspond to contiguous batch boundaries in the authoritative log.
+	records := make([]storage.Record, 5)
+	records[0].Value = []byte("abcd")
+	var logData []byte
+	for _, base := range []int64{0, 5, 10} {
+		batchRecords := records
+		if base == 10 {
+			batchRecords = []storage.Record{{Value: bytes.Repeat([]byte("a"), 32)}}
+		}
+		batch, err := storage.EncodeRecordBatch(base, batchRecords)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(batch) != 100 {
+			t.Fatalf("fixture batch size=%d, want 100", len(batch))
+		}
+		logData = append(logData, batch...)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "00000000000000000000.log"), logData, 0644); err != nil {
 		t.Fatalf("setup log: %v", err)
 	}
 	idx := filepath.Join(dir, "00000000000000000000.index")

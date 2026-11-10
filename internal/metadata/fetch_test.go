@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -32,19 +33,20 @@ func TestFetchLogStartAndReadFailure(t *testing.T) {
 	}
 }
 
-func TestFetchRejectsInvalidIndex(t *testing.T) {
+func TestFetchFallsBackFromInvalidIndex(t *testing.T) {
 	for _, data := range [][]byte{{0}, {0, 0, 0, 1, 0, 0, 0, 0}, {0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff}} {
 		dir := t.TempDir()
 		p := &Partition{LeaderID: 1, ISRNodes: []int32{1}, BrokerLogDirs: map[int32]string{1: dir}}
 		if _, err := p.AppendRecords(testRecordBatch(t, "a", "b"), dir); err != nil {
 			t.Fatal(err)
 		}
+		want := readLogFile(t, dir)
 		if err := os.WriteFile(filepath.Join(dir, "00000000000000000000.index"), data, 0600); err != nil {
 			t.Fatal(err)
 		}
 		options := FetchOptions{BrokerID: 1, ReplicaID: -1, LeaderEpoch: -1, Offset: 1, MaxBytes: 1024}
-		if result, err := p.FetchRecords(options); err == nil || len(result.Records) != 0 {
-			t.Fatalf("invalid index returned records: %v", err)
+		if result, err := p.FetchRecords(options); err != nil || !bytes.Equal(result.Records, want) {
+			t.Fatalf("invalid index blocked valid log data: %v", err)
 		}
 	}
 }

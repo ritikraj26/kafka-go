@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/ritiraj/kafka-go/internal/storage"
@@ -154,48 +153,6 @@ func (p *Partition) PlanFetch(ctx context.Context, options FetchOptions) (*Fetch
 	return result, nil
 }
 
-// indexPosition reads only the index entries needed by binary search.
-func indexPosition(dir string, segment logSegment, offset int64) (int64, int64, error) {
-	path := filepath.Join(dir, strings.TrimSuffix(segment.name, ".log")+".index")
-	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return 0, segment.baseOffset, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return 0, 0, err
-	}
-	if info.Size()%8 != 0 {
-		return 0, 0, fmt.Errorf("incomplete offset index: %s", path)
-	}
-	lo, hi := int64(0), info.Size()/8-1
-	position, base := int64(0), segment.baseOffset
-	var entry [8]byte
-	for lo <= hi {
-		mid := lo + (hi-lo)/2
-		if _, err := f.ReadAt(entry[:], mid*8); err != nil {
-			return 0, 0, err
-		}
-		relative := int64(int32(binary.BigEndian.Uint32(entry[:4])))
-		pos := int64(int32(binary.BigEndian.Uint32(entry[4:])))
-		if relative < 0 || pos < 0 || segment.baseOffset > math.MaxInt64-relative {
-			return 0, 0, fmt.Errorf("invalid offset index entry: %s", path)
-		}
-		candidate := segment.baseOffset + relative
-		if candidate <= offset {
-			position, base = pos, candidate
-			lo = mid + 1
-		} else {
-			hi = mid - 1
-		}
-	}
-	return position, base, nil
-}
-
 func planBatches(ctx context.Context, dir string, segments []logSegment, options FetchOptions, limit int64, plan *FetchPlan) error {
 	start := 0
 	for i, segment := range segments {
@@ -204,7 +161,7 @@ func planBatches(ctx context.Context, dir string, segments []logSegment, options
 		}
 		start = i
 	}
-	position, next, err := indexPosition(dir, segments[start], options.Offset)
+	position, next, err := safeIndexPosition(ctx, dir, segments[start], options.Offset, &plan.owner.indexCheckpoint)
 	if err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -47,6 +48,8 @@ type Partition struct {
 	hwCond          *sync.Cond // signalled when HighWatermark advances
 	appendErr       error      // Fence leader writes after an ambiguous disk failure
 	logIO           *segmentIO // nil uses the operating system's file operations
+	indexIO         *indexIO
+	indexCheckpoint indexCheckpoint
 	replicaErrors   map[int32]error
 	pendingProduces map[*pendingProduce]struct{}
 	changed         chan struct{}
@@ -203,7 +206,7 @@ func (p *Partition) appendRecords(records []byte, batches []storage.RecordBatch,
 	}
 	indexPath := strings.TrimSuffix(writtenFile, ".log") + ".index"
 	for _, batch := range batches {
-		if indexErr := appendIndexEntry(indexPath, int32(batch.BaseOffset-segmentBase), int32(filePosBefore)); indexErr != nil {
+		if indexErr := appendIndexEntry(indexPath, int32(batch.BaseOffset-segmentBase), int32(filePosBefore), p.indexIO); indexErr != nil {
 			logger.L.Warn("failed to write index entry", "err", indexErr)
 			break
 		}
@@ -225,28 +228,13 @@ func (p *Partition) appendRecords(records []byte, batches []storage.RecordBatch,
 	return baseOffset, nil
 }
 
-// appendIndexEntry appends an 8-byte entry to the given sparse offset index file.
-// Format: relativeOffset INT32 (big-endian) + filePosition INT32 (big-endian)
-func appendIndexEntry(indexFilePath string, relativeOffset int32, filePos int32) error {
-	f, err := os.OpenFile(indexFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	entry := make([]byte, 8)
-	binary.BigEndian.PutUint32(entry[0:4], uint32(relativeOffset))
-	binary.BigEndian.PutUint32(entry[4:8], uint32(filePos))
-	if _, err = f.Write(entry); err != nil {
-		return err
-	}
-	return f.Sync()
-}
-
 // SeekToOffset finds the segment file and byte position for targetOffset.
 // It selects the last segment whose base offset <= targetOffset, then
 // binary-searches that segment's sparse index for the closest byte position.
 // Returns (segmentFileName, byteOffset, error).
 func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	dir := p.LogDirForBroker(p.LeaderID)
 	if len(logDir) > 0 && logDir[0] != "" {
 		dir = logDir[0]
@@ -270,7 +258,7 @@ func (p *Partition) SeekToOffset(targetOffset int64, logDir ...string) (string, 
 		}
 	}
 
-	position, _, err := indexPosition(dir, chosen, targetOffset)
+	position, _, err := safeIndexPosition(context.Background(), dir, chosen, targetOffset, &p.indexCheckpoint)
 	return chosen.name, position, err
 }
 
