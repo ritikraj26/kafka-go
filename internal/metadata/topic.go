@@ -46,6 +46,7 @@ type Partition struct {
 	mu              sync.Mutex
 	hwCond          *sync.Cond // signalled when HighWatermark advances
 	appendErr       error      // Fence leader writes after an ambiguous disk failure
+	logIO           *segmentIO // nil uses the operating system's file operations
 	replicaErrors   map[int32]error
 	pendingProduces map[*pendingProduce]struct{}
 	changed         chan struct{}
@@ -187,7 +188,7 @@ func (p *Partition) appendRecords(records []byte, batches []storage.RecordBatch,
 		nextOffset += count
 	}
 
-	writtenFile, filePosBefore, writeErr := writeRecords(logDir, records, baseOffset, nextOffset-1)
+	writtenFile, filePosBefore, writeErr := writeRecords(logDir, records, baseOffset, nextOffset-1, p.logIO)
 	if writeErr != nil {
 		p.appendErr = writeErr
 		p.signalChange()
@@ -300,7 +301,7 @@ func (p *Partition) appendReplicaRecords(records []byte, replicaLogDir string, r
 		}
 		next += int64(batch.RecordsCount)
 	}
-	_, _, err = writeRecords(replicaLogDir, records, replicaLEO, next-1)
+	_, _, err = writeRecords(replicaLogDir, records, replicaLEO, next-1, p.logIO)
 	if err != nil {
 		return replicaLEO, err
 	}
@@ -379,16 +380,50 @@ func segmentNameForOffset(baseOffset int64) string {
 	return fmt.Sprintf("%020d.log", baseOffset)
 }
 
+type segmentFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Close() error
+}
+
+// segmentIO permits per-partition fault injection without global file hooks.
+// Missing operations use the real filesystem.
+type segmentIO struct {
+	openFile      func(string, int, os.FileMode) (segmentFile, error)
+	syncDirectory func(string) error
+}
+
+func (fs *segmentIO) open(name string, flags int, mode os.FileMode) (segmentFile, error) {
+	if fs != nil && fs.openFile != nil {
+		return fs.openFile(name, flags, mode)
+	}
+	return os.OpenFile(name, flags, mode)
+}
+
+func (fs *segmentIO) syncParent(dir string) error {
+	if fs != nil && fs.syncDirectory != nil {
+		return fs.syncDirectory(dir)
+	}
+	return storage.SyncDirectory(dir)
+}
+
 // writeRecords appends raw record batch bytes to the partition's active log segment.
 // Rolls to a new segment if the active file exceeds MaxSegmentBytes.
+// New segment directory entries are synced before the append can succeed.
 // Returns (logFilePath, filePosBefore, error). filePosBefore is the byte offset
 // at which these records were written — used to build the sparse index entry.
-func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64) (logFilePath string, filePosBefore int64, err error) {
+func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64, fs *segmentIO) (logFilePath string, filePosBefore int64, err error) {
 	if logDir == "" {
 		return "", 0, fmt.Errorf("missing partition log directory")
 	}
-	if err = os.MkdirAll(logDir, 0755); err != nil {
-		return "", 0, fmt.Errorf("failed to create log directory: %w", err)
+	if info, statErr := os.Stat(logDir); os.IsNotExist(statErr) {
+		if err = storage.MakeDirectory(logDir); err != nil {
+			return "", 0, fmt.Errorf("failed to create durable log directory: %w", err)
+		}
+	} else if statErr != nil {
+		return "", 0, statErr
+	} else if !info.IsDir() {
+		return "", 0, fmt.Errorf("partition log path is not a directory: %s", logDir)
 	}
 
 	segs, err := listSegments(logDir)
@@ -401,11 +436,14 @@ func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64) (
 	}
 	segName := active.name
 	logFile := filepath.Join(logDir, segName)
+	createSegment := len(segs) == 0
 
 	// Capture size before the write (used as the sparse index byte position).
 	if fi, statErr := os.Stat(logFile); statErr == nil {
 		filePosBefore = fi.Size()
-	} else if !os.IsNotExist(statErr) {
+	} else if os.IsNotExist(statErr) {
+		createSegment = true
+	} else {
 		return "", 0, statErr
 	}
 
@@ -416,13 +454,24 @@ func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64) (
 		logger.L.Info("rolling log segment", "dir", logDir, "oldSegment", segName, "newSegment", newName)
 		logFile = filepath.Join(logDir, newName)
 		filePosBefore = 0
+		createSegment = true
 	}
 
-	f, openErr := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	flags := os.O_APPEND | os.O_WRONLY
+	if createSegment {
+		// Detect name collisions instead of appending to an unexpected segment.
+		flags |= os.O_CREATE | os.O_EXCL
+	}
+	f, openErr := fs.open(logFile, flags, 0644)
 	if openErr != nil {
 		return "", 0, fmt.Errorf("failed to open log file: %w", openErr)
 	}
-	defer f.Close()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 	if n, writeErr := f.Write(records); writeErr != nil {
 		return "", 0, fmt.Errorf("failed to write records: %w", writeErr)
 	} else if n != len(records) {
@@ -430,6 +479,18 @@ func writeRecords(logDir string, records []byte, nextOffset, lastOffset int64) (
 	}
 	if syncErr := f.Sync(); syncErr != nil {
 		return "", 0, fmt.Errorf("failed to fsync log file: %w", syncErr)
+	}
+	closeErr := f.Close()
+	closed = true
+	if closeErr != nil {
+		return "", 0, fmt.Errorf("failed to close log file: %w", closeErr)
+	}
+	if createSegment {
+		// File sync does not make its new directory entry durable. Callers must
+		// not publish offsets or acknowledge this append until both are synced.
+		if syncErr := fs.syncParent(logDir); syncErr != nil {
+			return "", 0, fmt.Errorf("failed to fsync log directory: %w", syncErr)
+		}
 	}
 	return logFile, filePosBefore, nil
 }
